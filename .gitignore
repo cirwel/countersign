@@ -1,0 +1,4 @@
+node_modules/
+countersign.local.json
+*.local.*
+.DS_Store

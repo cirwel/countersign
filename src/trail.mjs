@@ -1,0 +1,108 @@
+// Canonical trail format and commitment chain (countersign.trail.v1).
+// Pure functions, no I/O beyond reading a trail file. See SPEC.md.
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+
+export const SCHEMA = 'countersign.trail.v1';
+export const RECORD_KEYS = ['checkpoint_id', 'prev_checkpoint_id', 'provenance', 'recorded_at', 'report_excerpt', 'seq'];
+const ANCHOR_MAGIC = Buffer.from('CSGN');
+const ANCHOR_VERSION = 1;
+export const ANCHOR_LENGTH = 4 + 1 + 8 + 8 + 32 + 32;
+
+const sha256 = (...parts) => {
+    const h = crypto.createHash('sha256');
+    for (const p of parts) h.update(p);
+    return h.digest();
+};
+
+/** Deterministic JSON: object keys sorted by code point, no insignificant whitespace, UTF-8. */
+export function canonical(value) {
+    if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value);
+    if (typeof value === 'number') {
+        if (!Number.isSafeInteger(value)) throw new Error('only safe integers are allowed in a trail');
+        return String(value);
+    }
+    if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';
+    if (typeof value === 'object') {
+        const keys = Object.keys(value).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+        return '{' + keys.map((k) => JSON.stringify(k) + ':' + canonical(value[k])).join(',') + '}';
+    }
+    throw new Error(`unsupported value type ${typeof value}`);
+}
+
+export function checkHeader(header) {
+    if (header?.schema !== SCHEMA) throw new Error(`trail header schema must be ${SCHEMA}`);
+    for (const k of ['agent_uuid', 'token_id', 'registry']) if (header[k] === undefined) throw new Error(`trail header lacks ${k}`);
+    if (!/^[0-9]+$/.test(String(header.token_id))) throw new Error('token_id must be a decimal string');
+    return header;
+}
+
+export function checkRecord(record, expectedSeq, prevId) {
+    const keys = Object.keys(record).sort();
+    if (keys.join() !== RECORD_KEYS.join()) throw new Error(`seq ${expectedSeq}: record keys must be exactly ${RECORD_KEYS.join(', ')}`);
+    if (record.seq !== expectedSeq) throw new Error(`expected seq ${expectedSeq}, found ${record.seq}`);
+    if (record.prev_checkpoint_id !== prevId) throw new Error(`seq ${expectedSeq}: prev_checkpoint_id does not link to the previous record`);
+    return record;
+}
+
+/** h_0 commits to the schema and the header, so a trail cannot be replayed under another agent or registry entry. */
+export const genesisHash = (header) => sha256(SCHEMA + '\n', canonical(checkHeader(header)));
+/** h_i = SHA-256(h_{i-1} || SHA-256(canonical(record_i))) */
+export const stepHash = (prev, record) => sha256(prev, sha256(canonical(record)));
+
+/**
+ * Walks a trail and returns the commitment after every record in `wanted` (a Set of seq numbers),
+ * plus the last one. Validates sequence numbers and prev links as it goes.
+ */
+export function commitments(header, records, wanted = new Set()) {
+    let h = genesisHash(header);
+    let prevId = null;
+    let seq = 0;
+    const at = new Map();
+    for (const record of records) {
+        seq += 1;
+        checkRecord(record, seq, prevId);
+        h = stepHash(h, record);
+        prevId = record.checkpoint_id;
+        if (wanted.has(seq)) at.set(seq, h);
+    }
+    return { last: h, count: seq, at };
+}
+
+export function readTrail(file) {
+    const lines = fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.length > 0);
+    if (lines.length === 0) throw new Error('empty trail file');
+    const header = checkHeader(JSON.parse(lines[0]));
+    return { header, records: lines.slice(1).map((l) => JSON.parse(l)) };
+}
+
+export function writeTrail(file, header, records) {
+    const out = [canonical(checkHeader(header)), ...records.map(canonical)].join('\n') + '\n';
+    fs.writeFileSync(file, out);
+}
+
+const u64 = (n) => {
+    const b = Buffer.alloc(8);
+    b.writeBigUInt64BE(BigInt(n));
+    return b;
+};
+
+/** 85-byte register-data payload: "CSGN" | version | token_id u64 | to_seq u64 | commitment | previous anchor tx hash (zeros if none). */
+export function encodeAnchor({ tokenId, toSeq, commitment, prevAnchorTx }) {
+    const prev = prevAnchorTx ? Buffer.from(prevAnchorTx, 'hex') : Buffer.alloc(32);
+    if (commitment.length !== 32 || prev.length !== 32) throw new Error('commitment and previous anchor must be 32 bytes');
+    return Buffer.concat([ANCHOR_MAGIC, Buffer.from([ANCHOR_VERSION]), u64(tokenId), u64(toSeq), commitment, prev]);
+}
+
+export function decodeAnchor(bytes) {
+    const b = Buffer.from(bytes);
+    if (b.length !== ANCHOR_LENGTH || !b.subarray(0, 4).equals(ANCHOR_MAGIC)) throw new Error('not a countersign anchor');
+    if (b[4] !== ANCHOR_VERSION) throw new Error(`unsupported anchor version ${b[4]}`);
+    const prev = b.subarray(53, 85);
+    return {
+        tokenId: b.readBigUInt64BE(5).toString(),
+        toSeq: Number(b.readBigUInt64BE(13)),
+        commitment: b.subarray(21, 53).toString('hex'),
+        prevAnchorTx: prev.every((x) => x === 0) ? null : prev.toString('hex'),
+    };
+}

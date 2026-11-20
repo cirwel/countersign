@@ -1,0 +1,13 @@
+{
+  "name": "countersign",
+  "version": "0.1.0",
+  "description": "Ties an AI agent's Concordium Agent Registry entry to a hash-chained commitment of its recorded check-ins.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": { "countersign": "src/cli.mjs" },
+  "engines": { "node": ">=20" },
+  "scripts": { "test": "node --test test/" },
+  "dependencies": {
+    "@concordium/web-sdk": "12.0.3"
+  }
+}
