@@ -74,3 +74,34 @@ test('the published Watcher trail is well formed', () => {
     assert.ok(count > 1000);
     assert.equal(h.agent_uuid, '907e3195-c649-49db-b753-1edc1a105f33');
 });
+
+test('a trail file must be byte-for-byte canonical', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const { writeTrail } = await import('../src/trail.mjs');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'countersign-test-'));
+    const good = path.join(dir, 'good.jsonl');
+    writeTrail(good, header, records());
+    assert.equal(readTrail(good).records.length, 3);
+    const text = fs.readFileSync(good, 'utf8');
+    const variants = {
+        'duplicate key': text.replace('"report_excerpt":"two"', '"report_excerpt":"evil","report_excerpt":"two"'),
+        'number respelled': text.replace('"seq":2', '"seq":2.0'),
+        'carriage returns': text.replace(/\n/g, '\r\n'),
+        'blank line': text.replace('\n', '\n\n'),
+        'no final newline': text.slice(0, -1),
+        'extra whitespace': text.replace('"seq":2', '"seq": 2'),
+    };
+    for (const [name, body] of Object.entries(variants)) {
+        const f = path.join(dir, 'bad.jsonl');
+        fs.writeFileSync(f, body);
+        assert.throws(() => readTrail(f), undefined, name);
+    }
+    fs.rmSync(dir, { recursive: true });
+});
+
+test('object keys are ordered by code point, not UTF-16 code unit', () => {
+    // U+FF5E sorts before U+1F600 by code point but after it by UTF-16 code unit.
+    assert.equal(canonical({ '\u{1F600}': 1, '～': 2 }), '{"～":2,"\u{1F600}":1}');
+});

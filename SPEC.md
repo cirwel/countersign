@@ -65,9 +65,10 @@ Given a badge (a CIS-8004 token address) and a trail file, a verifier must:
 1. accept only the registry instance it has pinned;
 2. confirm the entry is registered and active and that its Agent Card matches the on-chain hash;
 3. confirm the trail header's `token_id` and `registry` match the badge, and that `unitares.agent_uuid` on chain equals the header's `agent_uuid`;
-4. read `countersign.anchor` and follow the previous-anchor hashes back to the first anchor;
-5. confirm every anchor transaction is finalized, was sent by the entry's current owner account, and names the same token id;
-6. recompute `h` from the trail file and confirm it equals the anchored value at every anchor's sequence number.
+4. list every value `countersign.anchor` has held, in order, from the registry's `MetadataSet` events, and confirm the last one equals the current value;
+5. confirm every listed anchor transaction is finalized, was sent by the entry's current owner account, and names the same token id;
+6. confirm the anchors form one chain: the first has no previous anchor, each later one names the anchor listed immediately before it, and the last sequence number covered strictly increases;
+7. recompute `h` from the trail file and confirm it equals the anchored value at every anchor's sequence number.
 
 Records after the latest anchor's sequence number are outside the commitment.
 
