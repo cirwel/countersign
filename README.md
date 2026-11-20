@@ -26,6 +26,7 @@ Anchors so far:
 | 1..1617 | [`b71c9294…`](https://ccdexplorer.io/testnet/transaction/b71c9294303b7bb59b5ec985c2717c89af5e8e47de42f0d7edf7d2d687e7483e) |
 | 1..1619 | [`bc267531…`](https://ccdexplorer.io/testnet/transaction/bc267531b36609a919caa84234a8741cab31c658a28f258ebe211c5b9e69d281) |
 | 1..1621 | [`08d82155…`](https://ccdexplorer.io/testnet/transaction/08d8215581c60910597b30313ca076333d1f06e92791ff12c661a1be41e93fb6) |
+| 1..1808 | [`e1a8cae4…`](https://ccdexplorer.io/testnet/transaction/e1a8cae4c7eab23ce6f1836245eff38b319257972c77755aa54031b0bb45b9f8) |
 
 The registry entry's `countersign.anchor` metadata always names the latest one, and each anchor names the one before it. Later anchors are not listed here; `verify` finds them.
 
