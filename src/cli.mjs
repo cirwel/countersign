@@ -53,7 +53,8 @@ async function anchorPointer(tokenId) {
 
 /**
  * Every value the entry's anchor pointer has ever held, oldest first, read from the registry's MetadataSet events.
- * Event layout: 0xf3 | token id (length byte + little-endian id) | key length u32 LE | key | value length u32 LE | value | timestamp.
+ * Event layout: 0xf3 | token id (length byte + little-endian id) | key length u32 LE | key | value length u32 LE | value | timestamp u64.
+ * The server returns events oldest first; that order is kept within a block.
  */
 async function anchorPointerHistory(tokenId) {
     const LIMIT = 1000;
@@ -64,15 +65,21 @@ async function anchorPointerHistory(tokenId) {
     const out = [];
     for (const e of events) {
         if (e.event_name !== 'MetadataSet') continue;
-        const b = Buffer.from(e.payload.raw_hex, 'hex');
-        if (b[0] !== 0xf3 || !b.subarray(1, 10).equals(idBytes)) throw new Error('unexpected MetadataSet event layout');
+        const raw = e.payload?.raw_hex;
+        if (typeof raw !== 'string' || raw.length % 2 !== 0 || !/^[0-9a-f]*$/.test(raw)) throw new Error('registry event payload is not hex');
+        if (!Number.isInteger(e.block_height)) throw new Error('registry event has no block height');
+        const b = Buffer.from(raw, 'hex');
+        if (b.length < 18 || b[0] !== 0xf3 || !b.subarray(1, 10).equals(idBytes)) throw new Error('unexpected MetadataSet event layout');
         const klen = b.readUInt32LE(10);
-        const key = b.subarray(14, 14 + klen).toString('utf8');
+        if (b.length < 18 + klen) throw new Error('unexpected MetadataSet event layout');
         const vlen = b.readUInt32LE(14 + klen);
+        // The deployed contract appends an 8-byte timestamp after the value; anything else is not a layout this verifier knows.
+        if (b.length !== 18 + klen + vlen + 8) throw new Error('unexpected MetadataSet event layout');
+        const key = b.subarray(14, 14 + klen).toString('utf8');
         const value = b.subarray(18 + klen, 18 + klen + vlen).toString('utf8');
-        if (key === ANCHOR_KEY) out.push({ txHash: value, setIn: e.tx_hash, height: e.block_height, index: e.event_index });
+        if (key === ANCHOR_KEY) out.push({ txHash: value, setIn: e.tx_hash, height: e.block_height });
     }
-    return out.sort((x, y) => x.height - y.height || x.index - y.index);
+    return out.map((p, i) => ({ ...p, i })).sort((x, y) => x.height - y.height || x.i - y.i);
 }
 
 /** Reads every anchor the entry has pointed at. Throws if a pointer was ever set to something that is not an anchor. */
@@ -199,7 +206,9 @@ const commands = {
 
     /** Anyone: check a badge and a trail file against the chain. Needs no keys. */
     async verify({ badge, trail }) {
+        process.exitCode = 1; // only a completed, fully passing run resets this
         const checks = [];
+        let covered = 0;
         const check = (name, ok, detail = '') => {
             checks.push(ok);
             console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  ' + detail : ''}`);
@@ -258,15 +267,15 @@ const commands = {
             const got = computed.at.get(a.toSeq)?.toString('hex');
             check(`records 1..${a.toSeq} match the commitment anchored ${a.blockTime}`, got === a.commitment, got ? EXPLORER_TX(a.txHash) : `trail has only ${computed.count} records`);
         }
-        const covered = anchors.at(-1)?.toSeq ?? 0;
+        covered = anchors.at(-1)?.toSeq ?? 0;
         if (computed.count > covered) console.log(`note  records ${covered + 1}..${computed.count} are newer than the latest anchor and are not covered by it`);
-        return finish(checks);
+        return finish(checks, covered);
     },
 };
 
-function finish(checks) {
-    const ok = checks.length > 0 && checks.every(Boolean);
-    console.log(ok ? '\nVERIFIED: the trail matches what was anchored.' : '\nNOT VERIFIED.');
+function finish(checks, covered = 0) {
+    const ok = checks.length > 0 && checks.every(Boolean) && covered > 0;
+    console.log(ok ? `\nVERIFIED: records 1..${covered} match what was anchored.` : '\nNOT VERIFIED.');
     process.exitCode = ok ? 0 : 1;
 }
 

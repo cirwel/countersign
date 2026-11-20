@@ -39,20 +39,30 @@ export function canonical(value) {
 }
 
 const HEADER_KEYS = ['agent_uuid', 'registry', 'schema', 'source', 'token_id'];
+const TIME_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$/;
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+/** Exact key-set match, compared element by element (a joined-string comparison could be fooled by a key containing a comma). */
+const hasExactlyKeys = (obj, keys) => {
+    const have = Object.keys(obj).sort();
+    return have.length === keys.length && have.every((k, i) => k === keys[i]);
+};
 
 export function checkHeader(header) {
-    if (header?.schema !== SCHEMA) throw new Error(`trail header schema must be ${SCHEMA}`);
-    if (Object.keys(header).sort().join() !== HEADER_KEYS.join()) throw new Error(`trail header keys must be exactly ${HEADER_KEYS.join(', ')}`);
+    if (!isPlainObject(header) || header.schema !== SCHEMA) throw new Error(`trail header schema must be ${SCHEMA}`);
+    if (!hasExactlyKeys(header, HEADER_KEYS)) throw new Error(`trail header keys must be exactly ${HEADER_KEYS.join(', ')}`);
     if (typeof header.agent_uuid !== 'string' || header.agent_uuid.length === 0) throw new Error('trail header agent_uuid must be a non-empty string');
     if (typeof header.token_id !== 'string' || !/^[0-9]+$/.test(header.token_id)) throw new Error('trail header token_id must be a decimal string');
+    if (typeof header.source !== 'string' || !isPlainObject(header.registry)) throw new Error('trail header source must be a string and registry an object');
     return header;
 }
 
 export function checkRecord(record, expectedSeq, prevId) {
-    const keys = Object.keys(record).sort();
-    if (keys.join() !== RECORD_KEYS.join()) throw new Error(`seq ${expectedSeq}: record keys must be exactly ${RECORD_KEYS.join(', ')}`);
+    if (!isPlainObject(record) || !hasExactlyKeys(record, RECORD_KEYS)) throw new Error(`seq ${expectedSeq}: record keys must be exactly ${RECORD_KEYS.join(', ')}`);
     if (record.seq !== expectedSeq) throw new Error(`expected seq ${expectedSeq}, found ${record.seq}`);
+    if (typeof record.checkpoint_id !== 'string' || record.checkpoint_id.length === 0) throw new Error(`seq ${expectedSeq}: checkpoint_id must be a non-empty string`);
     if (record.prev_checkpoint_id !== prevId) throw new Error(`seq ${expectedSeq}: prev_checkpoint_id does not link to the previous record`);
+    if (typeof record.recorded_at !== 'string' || !TIME_RE.test(record.recorded_at)) throw new Error(`seq ${expectedSeq}: recorded_at must be UTC with microseconds`);
+    if (typeof record.report_excerpt !== 'string' || !isPlainObject(record.provenance)) throw new Error(`seq ${expectedSeq}: report_excerpt must be a string and provenance an object`);
     return record;
 }
 
@@ -86,7 +96,8 @@ export function commitments(header, records, wanted = new Set()) {
  * number spellings, blank lines and carriage returns, so two files that verify are the same bytes.
  */
 export function readTrail(file) {
-    const text = fs.readFileSync(file, 'utf8');
+    // Fatal decoding: bytes that are not valid UTF-8 are an error, never silently replaced.
+    const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(fs.readFileSync(file));
     if (!text.endsWith('\n')) throw new Error('trail file must end with a newline');
     const lines = text.slice(0, -1).split('\n');
     const values = lines.map((line, i) => {
@@ -125,6 +136,7 @@ export function decodeAnchor(bytes) {
     if (b.length !== ANCHOR_LENGTH || !b.subarray(0, 4).equals(ANCHOR_MAGIC)) throw new Error('not a countersign anchor');
     if (b[4] !== ANCHOR_VERSION) throw new Error(`unsupported anchor version ${b[4]}`);
     const prev = b.subarray(53, 85);
+    if (b.readBigUInt64BE(13) > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('anchor sequence number is out of range');
     return {
         tokenId: b.readBigUInt64BE(5).toString(),
         toSeq: Number(b.readBigUInt64BE(13)),

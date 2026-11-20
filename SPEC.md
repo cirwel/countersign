@@ -72,6 +72,13 @@ Given a badge (a CIS-8004 token address) and a trail file, a verifier must:
 
 Records after the latest anchor's sequence number are outside the commitment.
 
+Notes:
+
+- An anchor counts only once a `MetadataSet` event names it. The deployed registry does not emit that event for metadata supplied at registration, so a pointer set that way is not an anchor: the verifier fails while it is current and ignores it afterwards. A register-data transaction that the entry never pointed at is likewise not an anchor.
+- Anchors must come from the entry's current owner. If the token is transferred, anchors sent by the previous owner stop verifying. That is deliberate: the verifier does not reconstruct ownership history.
+- A verifier reports the highest sequence number covered. A trail may carry newer records; they are outside the commitment until the next anchor.
+- The trail file must be valid UTF-8, and every line must equal the canonical serialization of the value it parses to.
+
 ## Test vector
 
 Header:

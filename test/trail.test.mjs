@@ -105,3 +105,21 @@ test('object keys are ordered by code point, not UTF-16 code unit', () => {
     // U+FF5E sorts before U+1F600 by code point but after it by UTF-16 code unit.
     assert.equal(canonical({ '\u{1F600}': 1, '～': 2 }), '{"～":2,"\u{1F600}":1}');
 });
+
+test('record and header fields are type-checked, and key sets are compared exactly', () => {
+    const bad = (mutate) => { const r = records(); mutate(r); return () => commitments(header, r); };
+    assert.throws(bad((r) => { r[0].recorded_at = 'yesterday'; }), /recorded_at/);
+    assert.throws(bad((r) => { r[0].report_excerpt = 7; }), /report_excerpt/);
+    assert.throws(bad((r) => { r[0].provenance = []; }), /provenance/);
+    // One key containing commas must not stand in for several keys.
+    assert.throws(() => commitments(header, [{ 'checkpoint_id,prev_checkpoint_id,provenance,recorded_at,report_excerpt,seq': 1 }]), /record keys/);
+    assert.throws(() => genesisHash({ ...header, token_id: 7 }), /token_id/);
+    assert.throws(() => genesisHash({ ...header, extra: 1 }), /header keys/);
+});
+
+test('an anchor with an out-of-range sequence number is rejected', () => {
+    const { last } = commitments(header, records());
+    const a = encodeAnchor({ tokenId: '7', toSeq: 3, commitment: last, prevAnchorTx: null });
+    a.writeBigUInt64BE(2n ** 60n, 13);
+    assert.throws(() => decodeAnchor(a), /out of range/);
+});
