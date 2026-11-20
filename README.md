@@ -19,6 +19,15 @@ I run [UNITARES](https://github.com/cirwel/unitares), an open-source (Apache-2.0
 | Record | [`trail/watcher.jsonl`](trail/watcher.jsonl) |
 | Registration | [transaction](https://ccdexplorer.io/testnet/transaction/4ea50cb82986fbbf7ec12644d389f7e491328514cbbba60d6b4b2c716d702447) |
 
+Anchors so far:
+
+| Records | Anchor transaction |
+|---|---|
+| 1..1617 | [`b71c9294…`](https://ccdexplorer.io/testnet/transaction/b71c9294303b7bb59b5ec985c2717c89af5e8e47de42f0d7edf7d2d687e7483e) |
+| 1..1619 | [`bc267531…`](https://ccdexplorer.io/testnet/transaction/bc267531b36609a919caa84234a8741cab31c658a28f258ebe211c5b9e69d281) |
+
+The registry entry's `countersign.anchor` metadata always names the latest one, and each anchor names the one before it.
+
 ## Verify it yourself
 
 Needs Node 20 or later. No keys, no account.

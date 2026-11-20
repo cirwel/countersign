@@ -19,6 +19,15 @@ async function badgeOf(tokenId) {
     return r.token_address ?? r.short ?? r;
 }
 
+/** The pointer is stored as 64 hex characters of text; the registry rejects values that are not valid text. */
+async function anchorPointer(tokenId) {
+    const v = await metadata(tokenId, ANCHOR_KEY);
+    if (!v) return null;
+    const text = Buffer.from(v, 'hex').toString('utf8');
+    if (!/^[0-9a-f]{64}$/.test(text)) throw new Error(`metadata ${ANCHOR_KEY} is not a transaction hash`);
+    return text;
+}
+
 async function metadata(tokenId, key) {
     const r = await mcp('get_metadata', { token_id: String(tokenId), key });
     return r?.value_hex ?? r?.hex ?? null;
@@ -100,19 +109,25 @@ const commands = {
     },
 
     /** Write the trail's current commitment to testnet and point the registry entry at it. */
-    async anchor({ trail }) {
+    async anchor({ trail, tx }) {
         const who = loadSigner();
         const { header, records } = readTrail(trail);
         const { last, count } = commitments(header, records);
-        const prevAnchorTx = await metadata(header.token_id, ANCHOR_KEY);
+        const prevAnchorTx = await anchorPointer(header.token_id);
         if (prevAnchorTx) {
             const prev = decodeAnchor((await readRegisterData(prevAnchorTx)).data);
             if (prev.toSeq >= count) throw new Error(`the latest anchor already covers seq ${prev.toSeq}; nothing new to anchor`);
         }
-        const data = encodeAnchor({ tokenId: header.token_id, toSeq: count, commitment: last, prevAnchorTx });
-        const { hash } = await sendRegisterData(data, who);
-        console.log(`anchored seq 1..${count}: ${EXPLORER_TX(hash)}`);
-        const built = await mcp('build_set_metadata', { token_id: header.token_id, key: ANCHOR_KEY, value_hex: hash, sender: who.address });
+        let hash = tx; // --tx <hash>: an anchor that was sent but whose pointer update did not land
+        if (hash) {
+            const sent = decodeAnchor((await readRegisterData(hash)).data);
+            if (sent.commitment !== last.toString('hex') || sent.toSeq !== count) throw new Error('--tx does not match this trail');
+        } else {
+            const data = encodeAnchor({ tokenId: header.token_id, toSeq: count, commitment: last, prevAnchorTx });
+            ({ hash } = await sendRegisterData(data, who));
+            console.log(`anchored seq 1..${count}: ${EXPLORER_TX(hash)}`);
+        }
+        const built = await mcp('build_set_metadata', { token_id: header.token_id, key: ANCHOR_KEY, value_hex: hex(hash), sender: who.address });
         assertRegistry(built.contract_address);
         const set = await sendRegistryUpdate(built, who);
         console.log('registry entry now points at the anchor:', EXPLORER_TX(set.hash));
@@ -134,7 +149,8 @@ const commands = {
 
         const verdict = await mcp('check_badge', { id: badge });
         const v = verdict.badges?.[0] ?? verdict;
-        check('badge check (registered, active, card matches on-chain hash)', v.badge_valid === true, JSON.stringify(v.checks ?? {}));
+        const failed = Object.entries(v.checks ?? {}).filter(([, ok]) => ok === false).map(([k]) => k);
+        check('badge check (registered, active, card matches on-chain hash)', v.badge_valid === true, failed.length ? `failed: ${failed.join(', ')}` : `${Object.keys(v.checks ?? {}).length} registry checks`);
 
         const agent = await mcp('agent_of', { token_id: tokenId });
         const owner = agent?.owner_account ?? agent?.agent?.owner_account;
@@ -143,7 +159,7 @@ const commands = {
         const onChainUuid = Buffer.from((await metadata(tokenId, UUID_KEY)) ?? '', 'hex').toString('utf8');
         check('on-chain metadata names the same UNITARES agent as the trail', onChainUuid === header.agent_uuid, onChainUuid);
 
-        let txHash = await metadata(tokenId, ANCHOR_KEY);
+        let txHash = await anchorPointer(tokenId);
         if (!check('registry entry points at an anchor', Boolean(txHash))) return finish(checks);
 
         // Walk the anchor chain newest to oldest, then compare every anchor against the recomputed chain.
@@ -187,7 +203,7 @@ if (!commands[name]) {
 }
 const { values } = parseArgs({
     args: rest,
-    options: Object.fromEntries(['uuid', 'token', 'name', 'description', 'url', 'out', 'file', 'trail', 'badge', 'psql'].map((k) => [k, { type: 'string' }])),
+    options: Object.fromEntries(['uuid', 'token', 'name', 'description', 'url', 'out', 'file', 'trail', 'badge', 'psql', 'tx'].map((k) => [k, { type: 'string' }])),
 });
 commands[name](values).catch((e) => {
     console.error('error:', e.message);

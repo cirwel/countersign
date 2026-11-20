@@ -56,7 +56,7 @@ A Concordium register-data transaction whose data is exactly 85 bytes:
 | 21 | 32 | `h_n` |
 | 53 | 32 | hash of the previous anchor transaction, or 32 zero bytes for the first anchor |
 
-After each anchor, the registry entry's metadata key `countersign.anchor` is set to the 32-byte hash of that anchor transaction. The entry's metadata key `unitares.agent_uuid` holds the agent UUID as UTF-8 text.
+After each anchor, the registry entry's metadata key `countersign.anchor` is set to the hash of that anchor transaction, written as 64 lowercase hexadecimal characters of UTF-8 text (the registry rejects metadata values that are not valid text). The entry's metadata key `unitares.agent_uuid` holds the agent UUID as UTF-8 text.
 
 ## Verification
 
