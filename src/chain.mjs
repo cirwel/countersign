@@ -16,6 +16,7 @@ import {
     buildBasicAccountSigner,
 } from '@concordium/web-sdk';
 import { ConcordiumGRPCNodeClient, credentials } from '@concordium/web-sdk/nodejs';
+import { assertRegistry } from './registry.mjs';
 
 export const TESTNET_GENESIS = '4221332d34e1694168c2a0c0b3fd0f273809612cb13d000d5c2e00e85f50f796';
 export const EXPLORER_TX = (hash) => `https://ccdexplorer.io/testnet/transaction/${hash}`;
@@ -68,15 +69,28 @@ export function sendRegisterData(bytes, who = loadSigner()) {
     return signSendWait(Transaction.registerData({ data: new DataBlob(Buffer.from(bytes)) }), who);
 }
 
-/** Signs and submits an unsigned payload built by the Agent Registry MCP server. */
-export function sendRegistryUpdate(built, who = loadSigner()) {
+const MAX_REGISTRY_ENERGY = 100000;
+
+/**
+ * Signs and submits an unsigned payload built by the Agent Registry MCP server.
+ * The server is not trusted to choose what gets signed: the caller states the entrypoint it expects,
+ * the contract must be the pinned registry, the energy is capped, and where the caller can build the
+ * parameter itself the server's bytes must equal it.
+ */
+export function sendRegistryUpdate(built, who, expect) {
+    assertRegistry(built.contract_address);
+    if (built.network !== 'testnet') throw new Error('registry payload is not for testnet; refusing to sign');
+    if (!expect?.receiveName || built.receive_name !== expect.receiveName) throw new Error(`registry payload calls ${built.receive_name}, expected ${expect?.receiveName}; refusing to sign`);
+    if (expect.parameterHex !== undefined && built.parameter_hex !== expect.parameterHex) throw new Error('registry payload parameter differs from the one built locally; refusing to sign');
+    const energy = Number(built.suggested_energy ?? 30000);
+    if (!(energy > 0 && energy <= MAX_REGISTRY_ENERGY)) throw new Error(`registry payload asks for ${energy} energy; refusing to sign`);
     const payload = {
         amount: CcdAmount.zero(),
         address: ContractAddress.create(built.contract_address.index, built.contract_address.subindex),
         receiveName: ReceiveName.fromString(built.receive_name),
         message: Parameter.fromHexString(built.parameter_hex),
     };
-    return signSendWait(Transaction.updateContract(payload, Energy.create(built.suggested_energy ?? 30000)), who);
+    return signSendWait(Transaction.updateContract(payload, Energy.create(energy)), who);
 }
 
 /** Finalized register-data transaction: who sent it and what bytes it carries. */

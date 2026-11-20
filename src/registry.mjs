@@ -1,7 +1,7 @@
 // Client for Concordium's hosted Agent Registry MCP server (JSON-RPC over HTTP).
 // The server defaults to mainnet, so every call here names testnet explicitly and
 // refuses any response that reports another network.
-export const MCP_URL = process.env.COUNTERSIGN_MCP_URL ?? 'https://agent-registry-mcp.concordium.com/mcp';
+export const MCP_URL = 'https://agent-registry-mcp.concordium.com/mcp';
 export const NETWORK = 'testnet';
 export const REGISTRY = { index: 12802, subindex: 0 }; // CIS-8004 on testnet; the verifier trusts only this instance
 
@@ -24,14 +24,18 @@ export async function mcp(tool, args = {}) {
     } catch {
         return text;
     }
-    if (value && typeof value === 'object' && 'network' in value && value.network !== NETWORK) {
-        throw new Error(`registry MCP ${tool} answered for network ${value.network}; refusing`);
+    // Tools that answer about chain state echo the network. Pure encoders (token_address, parse_token_address, get_metadata) do not.
+    const NO_NETWORK_ECHO = new Set(['token_address', 'parse_token_address', 'get_metadata']);
+    if (value && typeof value === 'object') {
+        if ('network' in value ? value.network !== NETWORK : !NO_NETWORK_ECHO.has(tool)) {
+            throw new Error(`registry MCP ${tool} did not answer for ${NETWORK}; refusing`);
+        }
     }
     return value;
 }
 
 export function assertRegistry(address) {
-    if (Number(address?.index) !== REGISTRY.index || Number(address?.subindex ?? 0) !== REGISTRY.subindex) {
+    if (Number(address?.index) !== REGISTRY.index || Number(address?.subindex) !== REGISTRY.subindex) {
         throw new Error(`unexpected registry contract ${JSON.stringify(address)}; this tool trusts only <${REGISTRY.index},${REGISTRY.subindex}> on testnet`);
     }
 }

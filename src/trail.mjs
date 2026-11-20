@@ -15,6 +15,14 @@ const sha256 = (...parts) => {
     return h.digest();
 };
 
+/** Orders strings by Unicode code point (JavaScript's default order is by UTF-16 code unit, which differs for astral characters). */
+function byCodePoint(a, b) {
+    const x = Array.from(a, (c) => c.codePointAt(0));
+    const y = Array.from(b, (c) => c.codePointAt(0));
+    for (let i = 0; i < Math.min(x.length, y.length); i++) if (x[i] !== y[i]) return x[i] - y[i];
+    return x.length - y.length;
+}
+
 /** Deterministic JSON: object keys sorted by code point, no insignificant whitespace, UTF-8. */
 export function canonical(value) {
     if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value);
@@ -24,24 +32,37 @@ export function canonical(value) {
     }
     if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';
     if (typeof value === 'object') {
-        const keys = Object.keys(value).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+        const keys = Object.keys(value).sort(byCodePoint);
         return '{' + keys.map((k) => JSON.stringify(k) + ':' + canonical(value[k])).join(',') + '}';
     }
     throw new Error(`unsupported value type ${typeof value}`);
 }
 
+const HEADER_KEYS = ['agent_uuid', 'registry', 'schema', 'source', 'token_id'];
+const TIME_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$/;
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+/** Exact key-set match, compared element by element (a joined-string comparison could be fooled by a key containing a comma). */
+const hasExactlyKeys = (obj, keys) => {
+    const have = Object.keys(obj).sort();
+    return have.length === keys.length && have.every((k, i) => k === keys[i]);
+};
+
 export function checkHeader(header) {
-    if (header?.schema !== SCHEMA) throw new Error(`trail header schema must be ${SCHEMA}`);
-    for (const k of ['agent_uuid', 'token_id', 'registry']) if (header[k] === undefined) throw new Error(`trail header lacks ${k}`);
-    if (!/^[0-9]+$/.test(String(header.token_id))) throw new Error('token_id must be a decimal string');
+    if (!isPlainObject(header) || header.schema !== SCHEMA) throw new Error(`trail header schema must be ${SCHEMA}`);
+    if (!hasExactlyKeys(header, HEADER_KEYS)) throw new Error(`trail header keys must be exactly ${HEADER_KEYS.join(', ')}`);
+    if (typeof header.agent_uuid !== 'string' || header.agent_uuid.length === 0) throw new Error('trail header agent_uuid must be a non-empty string');
+    if (typeof header.token_id !== 'string' || !/^[0-9]+$/.test(header.token_id)) throw new Error('trail header token_id must be a decimal string');
+    if (typeof header.source !== 'string' || !isPlainObject(header.registry)) throw new Error('trail header source must be a string and registry an object');
     return header;
 }
 
 export function checkRecord(record, expectedSeq, prevId) {
-    const keys = Object.keys(record).sort();
-    if (keys.join() !== RECORD_KEYS.join()) throw new Error(`seq ${expectedSeq}: record keys must be exactly ${RECORD_KEYS.join(', ')}`);
+    if (!isPlainObject(record) || !hasExactlyKeys(record, RECORD_KEYS)) throw new Error(`seq ${expectedSeq}: record keys must be exactly ${RECORD_KEYS.join(', ')}`);
     if (record.seq !== expectedSeq) throw new Error(`expected seq ${expectedSeq}, found ${record.seq}`);
+    if (typeof record.checkpoint_id !== 'string' || record.checkpoint_id.length === 0) throw new Error(`seq ${expectedSeq}: checkpoint_id must be a non-empty string`);
     if (record.prev_checkpoint_id !== prevId) throw new Error(`seq ${expectedSeq}: prev_checkpoint_id does not link to the previous record`);
+    if (typeof record.recorded_at !== 'string' || !TIME_RE.test(record.recorded_at)) throw new Error(`seq ${expectedSeq}: recorded_at must be UTC with microseconds`);
+    if (typeof record.report_excerpt !== 'string' || !isPlainObject(record.provenance)) throw new Error(`seq ${expectedSeq}: report_excerpt must be a string and provenance an object`);
     return record;
 }
 
@@ -69,11 +90,27 @@ export function commitments(header, records, wanted = new Set()) {
     return { last: h, count: seq, at };
 }
 
+/**
+ * Reads a trail file and insists that it is byte-for-byte in canonical form: every line must equal the
+ * canonical serialization of what it parses to. That rules out duplicate keys, reordered keys, alternate
+ * number spellings, blank lines and carriage returns, so two files that verify are the same bytes.
+ */
 export function readTrail(file) {
-    const lines = fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.length > 0);
-    if (lines.length === 0) throw new Error('empty trail file');
-    const header = checkHeader(JSON.parse(lines[0]));
-    return { header, records: lines.slice(1).map((l) => JSON.parse(l)) };
+    // Fatal decoding: bytes that are not valid UTF-8 are an error, never silently replaced.
+    const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(fs.readFileSync(file));
+    if (!text.endsWith('\n')) throw new Error('trail file must end with a newline');
+    const lines = text.slice(0, -1).split('\n');
+    const values = lines.map((line, i) => {
+        let value;
+        try {
+            value = JSON.parse(line);
+        } catch {
+            throw new Error(`line ${i + 1} is not JSON`);
+        }
+        if (value === null || typeof value !== 'object' || canonical(value) !== line) throw new Error(`line ${i + 1} is not in canonical form`);
+        return value;
+    });
+    return { header: checkHeader(values[0]), records: values.slice(1) };
 }
 
 export function writeTrail(file, header, records) {
@@ -99,6 +136,7 @@ export function decodeAnchor(bytes) {
     if (b.length !== ANCHOR_LENGTH || !b.subarray(0, 4).equals(ANCHOR_MAGIC)) throw new Error('not a countersign anchor');
     if (b[4] !== ANCHOR_VERSION) throw new Error(`unsupported anchor version ${b[4]}`);
     const prev = b.subarray(53, 85);
+    if (b.readBigUInt64BE(13) > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('anchor sequence number is out of range');
     return {
         tokenId: b.readBigUInt64BE(5).toString(),
         toSeq: Number(b.readBigUInt64BE(13)),

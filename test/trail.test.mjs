@@ -74,3 +74,52 @@ test('the published Watcher trail is well formed', () => {
     assert.ok(count > 1000);
     assert.equal(h.agent_uuid, '907e3195-c649-49db-b753-1edc1a105f33');
 });
+
+test('a trail file must be byte-for-byte canonical', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const { writeTrail } = await import('../src/trail.mjs');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'countersign-test-'));
+    const good = path.join(dir, 'good.jsonl');
+    writeTrail(good, header, records());
+    assert.equal(readTrail(good).records.length, 3);
+    const text = fs.readFileSync(good, 'utf8');
+    const variants = {
+        'duplicate key': text.replace('"report_excerpt":"two"', '"report_excerpt":"evil","report_excerpt":"two"'),
+        'number respelled': text.replace('"seq":2', '"seq":2.0'),
+        'carriage returns': text.replace(/\n/g, '\r\n'),
+        'blank line': text.replace('\n', '\n\n'),
+        'no final newline': text.slice(0, -1),
+        'extra whitespace': text.replace('"seq":2', '"seq": 2'),
+    };
+    for (const [name, body] of Object.entries(variants)) {
+        const f = path.join(dir, 'bad.jsonl');
+        fs.writeFileSync(f, body);
+        assert.throws(() => readTrail(f), undefined, name);
+    }
+    fs.rmSync(dir, { recursive: true });
+});
+
+test('object keys are ordered by code point, not UTF-16 code unit', () => {
+    // U+FF5E sorts before U+1F600 by code point but after it by UTF-16 code unit.
+    assert.equal(canonical({ '\u{1F600}': 1, '～': 2 }), '{"～":2,"\u{1F600}":1}');
+});
+
+test('record and header fields are type-checked, and key sets are compared exactly', () => {
+    const bad = (mutate) => { const r = records(); mutate(r); return () => commitments(header, r); };
+    assert.throws(bad((r) => { r[0].recorded_at = 'yesterday'; }), /recorded_at/);
+    assert.throws(bad((r) => { r[0].report_excerpt = 7; }), /report_excerpt/);
+    assert.throws(bad((r) => { r[0].provenance = []; }), /provenance/);
+    // One key containing commas must not stand in for several keys.
+    assert.throws(() => commitments(header, [{ 'checkpoint_id,prev_checkpoint_id,provenance,recorded_at,report_excerpt,seq': 1 }]), /record keys/);
+    assert.throws(() => genesisHash({ ...header, token_id: 7 }), /token_id/);
+    assert.throws(() => genesisHash({ ...header, extra: 1 }), /header keys/);
+});
+
+test('an anchor with an out-of-range sequence number is rejected', () => {
+    const { last } = commitments(header, records());
+    const a = encodeAnchor({ tokenId: '7', toSeq: 3, commitment: last, prevAnchorTx: null });
+    a.writeBigUInt64BE(2n ** 60n, 13);
+    assert.throws(() => decodeAnchor(a), /out of range/);
+});
