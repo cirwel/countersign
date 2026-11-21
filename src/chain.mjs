@@ -81,7 +81,7 @@ function isNotFoundError(err) {
     return err?.code === 'NOT_FOUND' || err?.code === 5;
 }
 
-export async function withRpcRetry(fn, { maxRetries = 4, baseDelayMs = 1000, deadlineMs, now = () => performance.now(), onBackoff } = {}) {
+export async function withRpcRetry(fn, { maxRetries = 4, baseDelayMs = 1000, deadlineMs, now = Date.now, onBackoff } = {}) {
     let attempt = 0;
     while (true) {
         try {

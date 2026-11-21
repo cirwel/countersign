@@ -17,6 +17,7 @@ import {
     readRegisterData,
     readRegistryHistory,
     sendSetMetadata,
+    withRpcRetry,
 } from '../src/chain.mjs';
 import { encodeBadge, encodeTokenId } from '../src/cis8004.mjs';
 import { commands } from '../src/cli.mjs';
@@ -1544,4 +1545,22 @@ test('cancels getInstanceState stream immediately on first matching operator key
     } finally {
         fs.rmSync(s.dir, { recursive: true });
     }
+});
+
+test('withRpcRetry preserves Date.now epoch-based deadlineMs default when no custom clock is supplied', async () => {
+    let calls = 0;
+    await assert.rejects(
+        () =>
+            withRpcRetry(
+                async () => {
+                    calls += 1;
+                    const err = new Error('temporary failure');
+                    err.code = 'UNAVAILABLE';
+                    throw err;
+                },
+                { deadlineMs: Date.now() - 1, maxRetries: 2, baseDelayMs: 0 },
+            ),
+        /temporary failure/,
+    );
+    assert.equal(calls, 1, 'already-expired Date.now() deadlineMs must stop before retrying');
 });
