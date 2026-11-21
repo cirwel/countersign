@@ -7,6 +7,7 @@ import { AccountAddress, ContractAddress, tokenAddressToBase58 } from '@concordi
 import {
     decodeAgentOf,
     decodeBadge,
+    decodeGetAdmin,
     decodeGetMetadata,
     decodeGetMetadataUtf8,
     encodeBadge,
@@ -597,4 +598,46 @@ test('fetchAgentCard enforces https, SSRF IP/DNS guards, no redirects, timeout, 
         requestFn: makeMockRequestFn({ chunks: ['{"ok":', 'true}'] }),
     });
     assert.equal(ok.toString('utf8'), '{"ok":true}');
+
+    // Rejected responses (302, 404, huge Content-Length) with unclosed body must destroy res+req immediately without hanging.
+    for (const [label, opts] of [
+        ['302 redirect', { statusCode: 302, headers: { location: 'https://other.example/' }, re: /redirect/ }],
+        ['404 status', { statusCode: 404, headers: {}, re: /HTTP 404/ }],
+        ['oversized Content-Length', { statusCode: 200, headers: { 'content-length': '5000' }, re: /exceeds 1000 byte limit/ }],
+    ]) {
+        let resDestroyed = false;
+        let reqDestroyed = false;
+        const unclosedRequestFn = (_url, reqOpts, onRes) => {
+            const req = new EventEmitter();
+            req.destroy = () => { reqDestroyed = true; };
+            req.end = () => {
+                reqOpts.lookup('card.example', { all: true }, () => {
+                    const res = new EventEmitter();
+                    res.statusCode = opts.statusCode;
+                    res.headers = opts.headers;
+                    res.resume = () => { throw new Error('must not drain unclosed rejected body'); };
+                    res.destroy = () => { resDestroyed = true; };
+                    onRes(res);
+                    // Intentionally never emit 'end' or 'close' on res.
+                });
+            };
+            return req;
+        };
+        await assert.rejects(
+            () => fetchAgentCard('https://example.com/card.json', { maxBytes: 1000, timeoutMs: 5000, lookupFn: publicLookup, requestFn: unclosedRequestFn }),
+            opts.re,
+            label,
+        );
+        assert.equal(resDestroyed, true, `${label}: res.destroy() must be called`);
+        assert.equal(reqDestroyed, true, `${label}: req.destroy() must be called`);
+    }
+});
+
+test('decodeGetAdmin strictly decodes Option<AccountAddress>', () => {
+    assert.equal(decodeGetAdmin(Buffer.from([0])), null);
+    const adminBytes = Buffer.from(AccountAddress.fromBase58(WATCHER_OWNER).decodedAddress);
+    assert.equal(decodeGetAdmin(Buffer.concat([Buffer.from([1]), adminBytes])), WATCHER_OWNER);
+    assert.throws(() => decodeGetAdmin(Buffer.from([0, 0])), /trailing/);
+    assert.throws(() => decodeGetAdmin(Buffer.concat([Buffer.from([1]), adminBytes.subarray(0, 16)])), /truncated/);
+    assert.throws(() => decodeGetAdmin(Buffer.from([2])), /Option tag/);
 });

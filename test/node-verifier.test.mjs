@@ -85,6 +85,11 @@ function encodeGetMetadataReturn(val) {
     return Buffer.concat([Buffer.from([1]), u32le(b.length), b]);
 }
 
+function encodeGetAdminReturn(admin) {
+    if (admin === null || admin === undefined) return Buffer.from([0]);
+    return Buffer.concat([Buffer.from([1]), acctBytes(admin)]);
+}
+
 const evMint = (tokenId, owner) =>
     Buffer.concat([Buffer.from([0xfe]), encodeTokenId(tokenId), Buffer.from([1, 0]), acctBytes(owner)]);
 
@@ -96,6 +101,14 @@ const evBurn = (tokenId, owner) =>
 
 const evUpdateOperator = (update, owner, operator) =>
     Buffer.concat([Buffer.from([0xfc, update === 'Add' ? 1 : 0, 0]), acctBytes(owner), Buffer.from([0]), acctBytes(operator)]);
+
+const evAdminTransferred = (previous, next, tsMs = 1700000000000) =>
+    Buffer.concat([
+        Buffer.from([0xf7]),
+        previous ? Buffer.concat([Buffer.from([1]), acctBytes(previous)]) : Buffer.from([0]),
+        next ? Buffer.concat([Buffer.from([1]), acctBytes(next)]) : Buffer.from([0]),
+        u64le(tsMs),
+    ]);
 
 const evMetadataSet = (tokenId, key, valueUtf8, tsMs = 1700000000000) => {
     const k = Buffer.from(key, 'utf8');
@@ -137,7 +150,7 @@ function makeTrailFixtures(count = 4) {
             seq: i,
             checkpoint_id: `cp-${i}`,
             prev_checkpoint_id: i === 1 ? null : `cp-${i - 1}`,
-            recorded_at: `2026-11-01T00:00:0${i}.000000Z`,
+            recorded_at: `2026-11-01T00:00:${String(i).padStart(2, '0')}.000000Z`,
             report_excerpt: `report ${i}`,
             provenance: { producer: 'test' },
         });
@@ -166,6 +179,7 @@ function createMockNode({
     metadata = {},
     txs = [], // { height, hash, sender, registerData?: Buffer, contractEvents?: Buffer[], traceTag?: string }
     moduleRefAt = () => REGISTRY_MODULE_REF,
+    adminAt = () => null,
     stateLookupMap = new Map(), // full state keyHex -> valueHex
     stateEntries = [], // { key, value }
     beforeRpc = null,
@@ -173,6 +187,7 @@ function createMockNode({
     onSendTransaction = null,
     pollSequenceForSubmitted = null, // optional function (hash, pollIndex) => status
     stallBlockEventsAt = null, // optional height to stall on signal
+    stallAbortError = null,
 } = {}) {
     const txsByHeight = new Map();
     const registerDataByHash = new Map();
@@ -207,10 +222,11 @@ function createMockNode({
 
     let submitSeq = 0;
 
-    return {
+    const nodeObj = {
         timeForHeight,
         submitted: [],
         metadata,
+        stallBlockEventsAt,
         async getConsensusStatus() {
             return callRpc('getConsensusStatus', () => ({
                 genesisBlock: { toString: () => genesisBlock },
@@ -267,10 +283,11 @@ function createMockNode({
         async *getBlockTransactionEvents(bh, signal) {
             await callRpc('getBlockTransactionEvents', () => {}, bh);
             const h = heightFromBlockHash(bh);
-            if (stallBlockEventsAt !== null && h === BigInt(stallBlockEventsAt)) {
+            if (nodeObj.stallBlockEventsAt !== null && h === BigInt(nodeObj.stallBlockEventsAt)) {
                 await new Promise((_resolve, reject) => {
-                    if (signal?.aborted) return reject(signal.reason);
-                    signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+                    const fail = () => reject(stallAbortError ?? signal.reason);
+                    if (signal?.aborted) return fail();
+                    signal?.addEventListener('abort', fail, { once: true });
                 });
             }
             const list = txsByHeight.get(h) ?? [];
@@ -391,6 +408,14 @@ function createMockNode({
                         returnValue: ReturnValue.fromBuffer(encodeGetMetadataReturn(metadata[key] ?? null)),
                     };
                 }
+                if (method === 'CIS-8004.getAdmin') {
+                    const h = heightFromBlockHash(bh);
+                    return {
+                        tag: 'success',
+                        usedEnergy: { value: 1000n },
+                        returnValue: ReturnValue.fromBuffer(encodeGetAdminReturn(adminAt(h))),
+                    };
+                }
                 if (method === 'CIS-8004.setMetadata') {
                     return {
                         tag: 'success',
@@ -402,6 +427,7 @@ function createMockNode({
             }, ctx.method.value ?? String(ctx.method));
         },
     };
+    return nodeObj;
 }
 
 function buildScenario({
@@ -416,6 +442,7 @@ function buildScenario({
     anchorToSeqs = [2, 4],
     extraTxs = [],
     moduleRefAt = () => REGISTRY_MODULE_REF,
+    adminAt = () => null,
     stateLookupMap = new Map(),
     stateEntries = [],
     overrideCurrentPointer = undefined,
@@ -424,6 +451,7 @@ function buildScenario({
     onInvokeContract = null,
     onSendTransaction = null,
     stallBlockEventsAt = null,
+    stallAbortError = null,
     trailCount = 4,
 } = {}) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'countersign-node-test-'));
@@ -487,12 +515,14 @@ function buildScenario({
         },
         txs,
         moduleRefAt,
+        adminAt,
         stateLookupMap,
         stateEntries,
         beforeRpc,
         onInvokeContract,
         onSendTransaction,
         stallBlockEventsAt,
+        stallAbortError,
     });
 
     return {
@@ -1149,21 +1179,23 @@ test('createRpcPool retries DEADLINE_EXCEEDED/429/UNAVAILABLE, does NOT retry "b
     assert.equal(res, 'ok');
     assert.equal(attempts, 4);
 
-    // Stalled gRPC stream aborts via AbortController at streamTimeoutMs and retries cleanly.
+    // Stalled gRPC stream throwing CANCELLED upon abortSignal abort translates to DEADLINE_EXCEEDED and retries cleanly to success.
     let stallAttempts = 0;
+    const cancelErr = Object.assign(new Error('Cancelled on client'), { code: 'CANCELLED', details: 'Cancelled on client' });
     const sStall = buildScenario({
         anchorHeights: [1050n],
         anchorToSeqs: [2],
         stallBlockEventsAt: 1053n,
+        stallAbortError: cancelErr,
         beforeRpc: (method, bh) => {
             if (method === 'getBlockTransactionEvents' && String(bh) === 'block-1053') {
                 stallAttempts += 1;
-                if (stallAttempts > 1) sStall.node.stallBlockEventsAt = null;
+                if (stallAttempts === 2) sStall.node.stallBlockEventsAt = null;
             }
         },
     });
     try {
-        // Test aborted stream fails cleanly when consistently stalled.
+        // First fails when maxRetries=0 (single stalled attempt) -> DEADLINE_EXCEEDED
         await assert.rejects(
             () =>
                 readRegistryHistory(TOKEN_ID, {
@@ -1172,18 +1204,29 @@ test('createRpcPool retries DEADLINE_EXCEEDED/429/UNAVAILABLE, does NOT retry "b
                     agent: sStall.agent,
                     hintAnchorTxHashes: [sStall.lastAnchor],
                     streamTimeoutMs: 20,
-                    pool: createRpcPool(5, { maxRetries: 1, baseDelayMs: 5 }),
+                    pool: createRpcPool(5, { maxRetries: 0, baseDelayMs: 5 }),
                     nodeClient: sStall.node,
                 }),
-            /timed out/,
+            (err) => err.code === 'DEADLINE_EXCEEDED' && /timed out/.test(err.message),
         );
+        // Next retry succeeds once stream stops stalling!
+        const hist = await readRegistryHistory(TOKEN_ID, {
+            tipBlockHash: blockHashFor(60000n),
+            tipBlockHeight: 60000n,
+            agent: sStall.agent,
+            hintAnchorTxHashes: [sStall.lastAnchor],
+            streamTimeoutMs: 20,
+            pool: createRpcPool(5, { maxRetries: 2, baseDelayMs: 5 }),
+            nodeClient: sStall.node,
+        });
+        assert.equal(hist.events.length, 1);
         assert.equal(stallAttempts, 2);
     } finally {
         fs.rmSync(sStall.dir, { recursive: true });
     }
 });
 
-test('node configuration supports http/grpc/https/grpcs, --node-insecure, COUNTERSIGN_NODE_INSECURE, IPv6 [::1]:20000, and non-testnet genesis rejection', async () => {
+test('node configuration never inherits overridden COUNTERSIGN_NODE plaintext scheme', async () => {
     const mainnetGenesis = '9dd9ca4d19e9393877d2c44b70f89acbfc0883c2243e5eeaecc0d1cd0503f478';
     const badNode = createMockNode({ genesisBlock: mainnetGenesis });
     await assert.rejects(() => assertTestnet(badNode), /not Concordium testnet/);
@@ -1192,6 +1235,13 @@ test('node configuration supports http/grpc/https/grpcs, --node-insecure, COUNTE
     assert.deepEqual(configureNode('grpc://localhost:20002'), { host: 'localhost', port: 20002, tls: false, rpcTimeoutMs: 30000 });
     assert.deepEqual(configureNode('grpcs://node.example:20003'), { host: 'node.example', port: 20003, tls: true, rpcTimeoutMs: 30000 });
     assert.throws(() => configureNode({ host: 'https://node.example:20000', tls: false }), /explicit TLS scheme/);
+
+    // Overridden COUNTERSIGN_NODE=http://... must NOT leak tls:false into bare host overrides!
+    process.env.COUNTERSIGN_NODE = 'http://old:20000';
+    assert.equal(configureNode(null).tls, false);
+    assert.deepEqual(configureNode({ host: 'new', port: 20000 }), { host: 'new', port: 20000, tls: true, rpcTimeoutMs: 30000 });
+    assert.deepEqual(configureNode('new:20000'), { host: 'new', port: 20000, tls: true, rpcTimeoutMs: 30000 });
+    assert.deepEqual(configureNode({ host: 'new', insecure: true }), { host: 'new', port: 20000, tls: false, rpcTimeoutMs: 30000 });
 
     configureNode(null);
     process.env.COUNTERSIGN_NODE = '[::1]:20000';
@@ -1205,6 +1255,159 @@ test('node configuration supports http/grpc/https/grpcs, --node-insecure, COUNTE
     const grpcClient = createGrpcClient(ipv6Cfg);
     assert.equal(grpcClient.client._transport.defaultOptions.host, '[::1]:20000');
     assert.equal(grpcClient.client._transport.defaultOptions.timeout, 30000);
+});
+
+test('getAdmin + admin nonce scan catches transient upgrade and AdminTransferred even with 0 owner txs', async () => {
+    // 1. Admin present (OWNER_B) with unchanged adminNonce passes with 0 extra block scans.
+    let scannedHeights = [];
+    const sCleanAdmin = buildScenario({
+        anchorHeights: [1050n],
+        anchorToSeqs: [2],
+        adminAt: () => OWNER_B,
+        beforeRpc: (m, bh) => {
+            if (m === 'getBlockTransactionEvents') scannedHeights.push(String(bh));
+        },
+    });
+    try {
+        const { ok, output } = await runVerifyQuiet({ badge: BADGE, trail: sCleanAdmin.trailFile, card: sCleanAdmin.cardFile, nodeClient: sCleanAdmin.node });
+        assert.equal(ok, true, output);
+        // Only block-1000 (Mint), block-1050 (registerData), block-1053 (setMetadata) were fetched.
+        assert.deepEqual(scannedHeights.sort(), ['block-1000', 'block-1050', 'block-1053']);
+    } finally {
+        fs.rmSync(sCleanAdmin.dir, { recursive: true });
+    }
+
+    // 2. Transient upgrade M_orig -> M_evil -> M_orig by OWNER_B with 0 owner txs after anchor must fail closed!
+    const sTransientUpgrade = buildScenario({
+        anchorHeights: [1050n],
+        anchorToSeqs: [2],
+        adminAt: () => OWNER_B,
+        moduleRefAt: (h) => (h >= 20000n && h < 20010n ? OTHER_MOD_REF : REGISTRY_MODULE_REF),
+        extraTxs: [
+            { height: 20000n, hash: txHashFor('adm-up-1'), sender: OWNER_B, traceTag: 'Upgraded', contractEvents: [] },
+            { height: 20010n, hash: txHashFor('adm-up-2'), sender: OWNER_B, traceTag: 'Upgraded', contractEvents: [] },
+        ],
+    });
+    try {
+        const { ok, output } = await runVerifyQuiet({ badge: BADGE, trail: sTransientUpgrade.trailFile, card: sTransientUpgrade.cardFile, nodeClient: sTransientUpgrade.node });
+        assert.equal(ok, false);
+        assert.match(output, /contract upgraded/);
+    } finally {
+        fs.rmSync(sTransientUpgrade.dir, { recursive: true });
+    }
+
+    // 3. Transient AdminTransferred (OWNER_B -> LIVE_OWNER_WITH_OP -> OWNER_B) caught even when regAdmin === tipAdmin!
+    const sAdminTransfer = buildScenario({
+        anchorHeights: [1050n],
+        anchorToSeqs: [2],
+        adminAt: () => OWNER_B,
+        extraTxs: [
+            { height: 25000n, hash: txHashFor('adm-x1'), sender: OWNER_B, contractEvents: [evAdminTransferred(OWNER_B, LIVE_OWNER_WITH_OP)] },
+            { height: 25005n, hash: txHashFor('adm-x2'), sender: LIVE_OWNER_WITH_OP, contractEvents: [evAdminTransferred(LIVE_OWNER_WITH_OP, OWNER_B)] },
+        ],
+    });
+    try {
+        const { ok, output } = await runVerifyQuiet({ badge: BADGE, trail: sAdminTransfer.trailFile, card: sAdminTransfer.cardFile, nodeClient: sAdminTransfer.node });
+        assert.equal(ok, false);
+        assert.match(output, /registry admin transferred/);
+    } finally {
+        fs.rmSync(sAdminTransfer.dir, { recursive: true });
+    }
+
+    // 4. Admin changed between reg and tip fails closed.
+    const sAdminDiff = buildScenario({
+        anchorHeights: [1050n],
+        anchorToSeqs: [2],
+        adminAt: (h) => (h >= 20000n ? LIVE_OWNER_WITH_OP : OWNER_B),
+    });
+    try {
+        const { ok, output } = await runVerifyQuiet({ badge: BADGE, trail: sAdminDiff.trailFile, card: sAdminDiff.cardFile, nodeClient: sAdminDiff.node });
+        assert.equal(ok, false);
+        assert.match(output, /registry admin changed/);
+    } finally {
+        fs.rmSync(sAdminDiff.dir, { recursive: true });
+    }
+
+    // 5. Upgraded trace event in regHeight BEFORE Mint tx fails closed!
+    const sPreMintUpgrade = buildScenario({
+        anchorHeights: [1050n],
+        anchorToSeqs: [2],
+        extraTxs: [{ height: 1000n, hash: txHashFor('pre-mint-up'), sender: OWNER_B, traceTag: 'Upgraded', contractEvents: [] }],
+    });
+    // Put pre-mint upgrade BEFORE Mint in block 1000 by ordering it first in txs!
+    const preMintNode = createMockNode({
+        tipHeight: 60000n,
+        agent: sPreMintUpgrade.agent,
+        metadata: { 'unitares.agent_uuid': AGENT_UUID, 'countersign.anchor': sPreMintUpgrade.lastAnchor },
+        txs: [
+            { height: 1000n, hash: txHashFor('pre-mint-up'), sender: OWNER_B, traceTag: 'Upgraded', contractEvents: [] },
+            { height: 1000n, hash: txHashFor('mint'), sender: OWNER_A, contractEvents: [evMint(TOKEN_ID, OWNER_A)] },
+        ],
+    });
+    try {
+        await assert.rejects(
+            () =>
+                readRegistryHistory(TOKEN_ID, {
+                    tipBlockHash: blockHashFor(60000n),
+                    tipBlockHeight: 60000n,
+                    agent: sPreMintUpgrade.agent,
+                    nodeClient: preMintNode,
+                }),
+            /contract upgraded/,
+        );
+    } finally {
+        fs.rmSync(sPreMintUpgrade.dir, { recursive: true });
+    }
+});
+
+test('preserves ascending history order across multiple BATCH_SIZE=10 block batches', async () => {
+    const count = 14;
+    const anchorHeights = Array.from({ length: count }, (_, i) => BigInt(1050 + i * 20));
+    const anchorToSeqs = Array.from({ length: count }, (_, i) => i + 1);
+    const s = buildScenario({ trailCount: count, anchorHeights, anchorToSeqs });
+    try {
+        const { ok, output } = await runVerifyQuiet({ badge: BADGE, trail: s.trailFile, card: s.cardFile, nodeClient: s.node });
+        assert.equal(ok, true, output);
+        assert.match(output, /VERIFIED: records 1\.\.14 match what was anchored\./);
+        assert.match(output, /14 pointer updates/);
+    } finally {
+        fs.rmSync(s.dir, { recursive: true });
+    }
+});
+
+test('bounds signSendWait polling and transient retry budget by remaining finalization timeout', async () => {
+    const s = buildScenario({ anchorHeights: [], anchorToSeqs: [] });
+    let pollCalls = 0;
+    const timeoutNode = createMockNode({
+        tipHeight: 60000n,
+        agent: s.agent,
+        pollSequenceForSubmitted: () => {
+            pollCalls += 1;
+            const e = new Error('transient');
+            e.code = 'UNAVAILABLE';
+            throw e;
+        },
+    });
+    const origLog = console.log;
+    console.log = () => {};
+    const t0 = Date.now();
+    try {
+        const who = {
+            address: OWNER_A,
+            sender: AccountAddress.fromBase58(OWNER_A),
+            signer: (await import('@concordium/web-sdk')).buildBasicAccountSigner(crypto.randomBytes(32).toString('hex')),
+        };
+        await assert.rejects(
+            () => sendSetMetadata(TOKEN_ID, 'k', 'v', who, timeoutNode, { pollIntervalMs: 10, timeoutMs: 40 }),
+            /transient/,
+        );
+        const elapsed = Date.now() - t0;
+        assert.ok(elapsed < 500, `expected short bounded timeout, took ${elapsed}ms`);
+        assert.equal(pollCalls, 1, 'remaining <= 1500ms must pass maxRetries=0');
+    } finally {
+        console.log = origLog;
+        fs.rmSync(s.dir, { recursive: true });
+    }
 });
 
 test('readRegisterData returns blockHeight alongside sender, data, and blockTime', async () => {

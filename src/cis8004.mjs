@@ -290,6 +290,14 @@ export function decodeGetMetadataUtf8(bytes) {
     return raw === null ? null : utf8Fatal.decode(raw);
 }
 
+/** Strictly decodes CIS-8004.getAdmin return value: Option<AccountAddress>. */
+export function decodeGetAdmin(bytes) {
+    const r = new BinaryReader(bytes, 'getAdmin');
+    const admin = r.readOption(() => r.readAccountAddress());
+    r.assertEnd();
+    return admin;
+}
+
 /**
  * Parses a CIS-8004 MetadataSet (0xf3) event if it targets expectedTokenId.
  * Returns null for non-0xf3 events or 0xf3 events targeting another tokenId; throws if targeting expectedTokenId and malformed.
@@ -629,6 +637,7 @@ export async function fetchAgentCard(
 
     return new Promise((resolve, reject) => {
         let settled = false;
+        let activeRes = null;
         const done = (err, value) => {
             if (settled) return;
             settled = true;
@@ -646,21 +655,24 @@ export async function fetchAgentCard(
                 headers: { accept: 'application/json' },
             },
             (res) => {
+                activeRes = res;
+                const fail = (err) => {
+                    done(err);
+                    res.destroy();
+                    req.destroy();
+                };
                 const status = res.statusCode ?? 0;
                 if (status >= 300 && status < 400) {
-                    res.resume();
-                    done(new Error(`refusing HTTP ${status} redirect fetching agent card`));
+                    fail(new Error(`refusing HTTP ${status} redirect fetching agent card`));
                     return;
                 }
                 if (status < 200 || status >= 300) {
-                    res.resume();
-                    done(new Error(`HTTP ${status} fetching agent card from ${url.origin}${url.pathname}`));
+                    fail(new Error(`HTTP ${status} fetching agent card from ${url.origin}${url.pathname}`));
                     return;
                 }
                 const cl = res.headers?.['content-length'];
                 if (typeof cl === 'string' && /^\d+$/.test(cl) && Number(cl) > maxBytes) {
-                    res.destroy();
-                    done(new Error(`agent card Content-Length (${cl}) exceeds ${maxBytes} byte limit`));
+                    fail(new Error(`agent card Content-Length (${cl}) exceeds ${maxBytes} byte limit`));
                     return;
                 }
 
@@ -671,8 +683,9 @@ export async function fetchAgentCard(
                     total += b.byteLength;
                     if (total > maxBytes) {
                         const err = new Error(`agent card exceeds ${maxBytes} byte limit`);
-                        res.destroy(err);
                         done(err);
+                        res.destroy(err);
+                        req.destroy();
                         return;
                     }
                     chunks.push(b);
@@ -685,8 +698,9 @@ export async function fetchAgentCard(
 
         const timer = setTimeout(() => {
             const err = new Error(`fetching agent card timed out after ${timeoutMs}ms`);
-            req.destroy(err);
             done(err);
+            activeRes?.destroy();
+            req.destroy(err);
         }, timeoutMs);
 
         req.on('error', (err) => done(err));

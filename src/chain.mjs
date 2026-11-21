@@ -21,6 +21,7 @@ import {
 import { ConcordiumGRPCNodeClient, credentials } from '@concordium/web-sdk/nodejs';
 import {
     decodeAgentOf,
+    decodeGetAdmin,
     decodeGetMetadataUtf8,
     encodeGetMetadataParam,
     encodeSetMetadataParam,
@@ -80,14 +81,20 @@ function isNotFoundError(err) {
     return err?.code === 'NOT_FOUND' || err?.code === 5;
 }
 
-export async function withRpcRetry(fn, { maxRetries = 4, baseDelayMs = 1000, onBackoff } = {}) {
+export async function withRpcRetry(fn, { maxRetries = 4, baseDelayMs = 1000, deadlineMs, onBackoff } = {}) {
     let attempt = 0;
     while (true) {
         try {
             return await fn();
         } catch (err) {
             if (!isTransientRpcError(err) || attempt >= maxRetries) throw err;
-            const delay = Math.round(baseDelayMs * 2 ** attempt * (0.85 + 0.3 * Math.random()));
+            if (deadlineMs !== undefined && Date.now() >= deadlineMs) throw err;
+            let delay = Math.round(baseDelayMs * 2 ** attempt * (0.85 + 0.3 * Math.random()));
+            if (deadlineMs !== undefined) {
+                const rem = deadlineMs - Date.now();
+                if (rem <= 0) throw err;
+                delay = Math.min(delay, rem);
+            }
             attempt += 1;
             if (onBackoff) await onBackoff(delay);
             else await sleep(delay);
@@ -153,9 +160,11 @@ function parseNodeString(raw) {
     if (!spec) return null;
     let rest = spec;
     let tls;
+    let explicitTls = false;
     const schemeMatch = /^(https?|grpcs?):\/\/(.*)$/i.exec(spec);
     if (schemeMatch) {
         const scheme = schemeMatch[1].toLowerCase();
+        explicitTls = true;
         tls = scheme === 'https' || scheme === 'grpcs';
         rest = schemeMatch[2];
         if (!rest || rest.includes('/') || rest.includes('?') || rest.includes('#') || rest.includes('@')) {
@@ -167,19 +176,19 @@ function parseNodeString(raw) {
         if (!m || !net.isIPv6(m[1])) throw new Error(`invalid IPv6 node address: ${raw}`);
         const port = m[2] ? Number(m[2]) : DEFAULT_NODE_PORT;
         if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`invalid node port in ${raw}`);
-        return { host: m[1], port, tls };
+        return { host: m[1], port, tls, explicitTls };
     }
     if (net.isIPv6(rest)) {
-        return { host: rest, port: DEFAULT_NODE_PORT, tls };
+        return { host: rest, port: DEFAULT_NODE_PORT, tls, explicitTls };
     }
     const parts = rest.split(':');
     if (parts.length === 1) {
-        return { host: parts[0], port: DEFAULT_NODE_PORT, tls };
+        return { host: parts[0], port: DEFAULT_NODE_PORT, tls, explicitTls };
     }
     if (parts.length === 2 && parts[0].length > 0 && /^\d+$/.test(parts[1])) {
         const port = Number(parts[1]);
         if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`invalid node port in ${raw}`);
-        return { host: parts[0], port, tls };
+        return { host: parts[0], port, tls, explicitTls };
     }
     throw new Error(`invalid node address: ${raw}`);
 }
@@ -188,20 +197,20 @@ function resolveEnvNodeConfig() {
     const parsed = process.env.COUNTERSIGN_NODE ? parseNodeString(process.env.COUNTERSIGN_NODE) : null;
     const host = parsed?.host ?? DEFAULT_NODE_HOST;
     const port = parsed?.port ?? DEFAULT_NODE_PORT;
-    const tls = parsed?.tls !== undefined ? parsed.tls : !envNodeInsecure();
-    return { host, port, tls, rpcTimeoutMs: DEFAULT_RPC_TIMEOUT_MS };
+    const explicitTls = parsed?.explicitTls ?? false;
+    const tls = explicitTls ? parsed.tls : !envNodeInsecure();
+    return { host, port, tls, explicitTls, rpcTimeoutMs: DEFAULT_RPC_TIMEOUT_MS };
 }
 
 function normalizeNodeConfig(opts) {
     if (opts === undefined || opts === null) return null;
-    const base = resolveEnvNodeConfig();
     if (typeof opts === 'string') {
         const parsed = parseNodeString(opts);
         if (!parsed) return null;
         return {
             host: parsed.host,
             port: parsed.port,
-            tls: parsed.tls !== undefined ? parsed.tls : base.tls,
+            tls: parsed.explicitTls ? parsed.tls : !envNodeInsecure(),
             rpcTimeoutMs: DEFAULT_RPC_TIMEOUT_MS,
         };
     }
@@ -214,15 +223,30 @@ function normalizeNodeConfig(opts) {
         }
         parsedHost = parseNodeString(opts.host);
     }
-    const host = parsedHost?.host ?? base.host;
-    const port = opts.port !== undefined ? Number(opts.port) : (parsedHost?.port ?? base.port);
     if (opts.tls !== undefined && typeof opts.tls !== 'boolean') {
         throw new Error('node tls option must be a boolean');
     }
-    if (parsedHost?.tls === true && opts.tls === false) {
+
+    const base = opts.host === undefined ? resolveEnvNodeConfig() : null;
+    const host = parsedHost?.host ?? base.host;
+    const port = opts.port !== undefined ? Number(opts.port) : (parsedHost?.port ?? base.port);
+    const hasExplicitTlsScheme = parsedHost ? parsedHost.explicitTls : base.explicitTls;
+    const schemeTls = parsedHost ? parsedHost.tls : base.tls;
+
+    if (hasExplicitTlsScheme && schemeTls === true && (opts.tls === false || opts.insecure === true)) {
         throw new Error('cannot combine explicit TLS scheme with insecure node option');
     }
-    const tls = opts.tls !== undefined ? opts.tls : (parsedHost?.tls !== undefined ? parsedHost.tls : base.tls);
+    if (hasExplicitTlsScheme && schemeTls === false && opts.tls === true) {
+        throw new Error('cannot combine explicit plaintext scheme with tls: true');
+    }
+
+    let tls;
+    if (opts.tls !== undefined) tls = opts.tls;
+    else if (opts.insecure === true) tls = false;
+    else if (hasExplicitTlsScheme) tls = schemeTls;
+    else if (opts.host !== undefined) tls = !envNodeInsecure();
+    else tls = base.tls;
+
     const rpcTimeoutMs = opts.rpcTimeoutMs !== undefined ? Number(opts.rpcTimeoutMs) : DEFAULT_RPC_TIMEOUT_MS;
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`invalid node port: ${opts.port}`);
     if (!Number.isSafeInteger(rpcTimeoutMs) || rpcTimeoutMs <= 0) throw new Error(`invalid rpcTimeoutMs: ${opts.rpcTimeoutMs}`);
@@ -230,7 +254,9 @@ function normalizeNodeConfig(opts) {
 }
 
 function effectiveNodeConfig() {
-    return explicitConfig ?? resolveEnvNodeConfig();
+    if (explicitConfig) return explicitConfig;
+    const env = resolveEnvNodeConfig();
+    return { host: env.host, port: env.port, tls: env.tls, rpcTimeoutMs: env.rpcTimeoutMs };
 }
 
 /** Configures the Concordium testnet gRPC endpoint and resets any cached node client. */
@@ -318,7 +344,12 @@ export function loadSigner() {
 async function waitForFinalizedPolling(c, hash, { timeoutMs = 180000, pollIntervalMs = 2000 } = {}) {
     const deadline = Date.now() + timeoutMs;
     while (true) {
-        const status = await withRpcRetry(() => c.getBlockItemStatus(hash));
+        const remaining = deadline - Date.now();
+        const retryOpts =
+            remaining <= 1500
+                ? { maxRetries: 0, baseDelayMs: 0, deadlineMs: deadline }
+                : { maxRetries: 2, baseDelayMs: Math.min(500, Math.max(1, Math.floor(remaining / 4))), deadlineMs: deadline };
+        const status = await withRpcRetry(() => c.getBlockItemStatus(hash), retryOpts);
         if (status.status === 'finalized') {
             const summary = status.outcome?.summary;
             if (!summary) throw new Error(`transaction ${hash} finalized without outcome summary`);
@@ -327,11 +358,11 @@ async function waitForFinalizedPolling(c, hash, { timeoutMs = 180000, pollInterv
             }
             return { hash: hash.toString(), summary };
         }
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) {
+        const afterPollRemaining = deadline - Date.now();
+        if (afterPollRemaining <= 0) {
             throw new Error(`transaction ${hash} did not finalize within ${timeoutMs}ms`);
         }
-        await sleep(Math.min(pollIntervalMs, remaining));
+        await sleep(Math.min(pollIntervalMs, Math.max(1, afterPollRemaining)));
     }
 }
 
@@ -425,6 +456,12 @@ export async function readMetadataText(tokenId, key, { blockHash, nodeClient } =
     return decodeGetMetadataUtf8(bytes);
 }
 
+/** Reads and decodes CIS-8004.getAdmin() directly from a Concordium node. */
+export async function readAdmin({ blockHash, nodeClient } = {}) {
+    const bytes = await invokeRegistryView('CIS-8004.getAdmin', Buffer.alloc(0), blockHash, nodeClient);
+    return decodeGetAdmin(bytes);
+}
+
 /** Builds CIS-8004.setMetadata locally, estimates energy via dry-run invokeContract, and submits it on testnet. */
 export async function sendSetMetadata(tokenId, key, valueUtf8, who = loadSigner(), nodeClient, pollOpts) {
     const c = nodeClient ?? (await client());
@@ -488,6 +525,7 @@ export async function readRegistryHistory(
         agent,
         hintAnchorTxHashes = [],
         maxOwnerTxs = 2000,
+        maxAdminTxs = maxOwnerTxs,
         streamTimeoutMs = DEFAULT_RPC_TIMEOUT_MS,
         nodeClient,
         pool: providedPool,
@@ -507,7 +545,7 @@ export async function readRegistryHistory(
 
     const blockHashCache = new Map();
     const blockInfoCache = new Map();
-    const nonceCache = new Map();
+    const accountNonceCaches = new Map();
 
     const blockHashAt = (h) => {
         if (h === tipH && tipBlockHash) return Promise.resolve(tipBlockHash);
@@ -539,26 +577,41 @@ export async function readRegistryHistory(
 
     const timeAt = async (h) => (await blockInfoAt(h)).blockSlotTime.getTime();
 
-    const nonceAt = (h) => {
-        let p = nonceCache.get(h);
+    const nonceAtFor = (accountAddr, h) => {
+        const acctKey = accountAddr.address;
+        let cache = accountNonceCaches.get(acctKey);
+        if (!cache) {
+            cache = new Map();
+            accountNonceCaches.set(acctKey, cache);
+        }
+        let p = cache.get(h);
         if (!p) {
             p = (async () => {
                 const bh = await blockHashAt(h);
-                const info = await rpc.run(() => c.getAccountInfo(ownerAddr, bh));
+                const info = await rpc.run(() => c.getAccountInfo(accountAddr, bh));
                 return BigInt(info.accountNonce?.value ?? info.accountNonce);
             })();
-            nonceCache.set(h, p);
+            cache.set(h, p);
         }
         return p;
     };
 
-    const withStreamTimeout = async (fn) => {
+    const collectStreamWithTimeout = async (streamFn) => {
         const ac = new AbortController();
+        let timedOut = false;
+        const timeoutErr = Object.assign(
+            new Error(`gRPC stream timed out after ${streamTimeoutMs}ms`),
+            { code: 'DEADLINE_EXCEEDED' },
+        );
         const timer = setTimeout(() => {
-            ac.abort(new Error(`gRPC stream timed out after ${streamTimeoutMs}ms (DEADLINE_EXCEEDED)`));
+            timedOut = true;
+            ac.abort(timeoutErr);
         }, streamTimeoutMs);
         try {
-            return await fn(ac.signal);
+            return await streamFn(ac.signal);
+        } catch (err) {
+            if (timedOut) throw timeoutErr;
+            throw err;
         } finally {
             clearTimeout(timer);
         }
@@ -567,7 +620,7 @@ export async function readRegistryHistory(
     const getBlockEvents = async (h) => {
         const bh = await blockHashAt(h);
         return rpc.run(() =>
-            withStreamTimeout(async (signal) => {
+            collectStreamWithTimeout(async (signal) => {
                 const items = [];
                 for await (const s of c.getBlockTransactionEvents(bh, signal)) {
                     if (signal.aborted) throw signal.reason;
@@ -718,10 +771,12 @@ export async function readRegistryHistory(
     const regBlockHash = await blockHashAt(regHeight);
     const resolvedTipBlockHash = tipBlockHash ?? (await blockHashAt(tipH));
 
-    // 3. Verify registry sourceModule.moduleRef at both registration and tip matches pinned REGISTRY_MODULE_REF.
-    const [regInst, tipInst] = await Promise.all([
+    // 3. Verify registry sourceModule.moduleRef and admin identity at both registration and tip.
+    const [regInst, tipInst, regAdmin, tipAdmin] = await Promise.all([
         rpc.run(() => c.getInstanceInfo(registryAddr, regBlockHash)),
         rpc.run(() => c.getInstanceInfo(registryAddr, resolvedTipBlockHash)),
+        rpc.limit(() => readAdmin({ blockHash: regBlockHash, nodeClient: c })),
+        rpc.limit(() => readAdmin({ blockHash: resolvedTipBlockHash, nodeClient: c })),
     ]);
     const refOf = (info) => info?.sourceModule?.moduleRef ?? String(info?.sourceModule ?? '');
     if (refOf(regInst) !== REGISTRY_MODULE_REF || refOf(tipInst) !== REGISTRY_MODULE_REF) {
@@ -729,6 +784,10 @@ export async function readRegistryHistory(
             `registry contract sourceModule mismatch (reg=${refOf(regInst)}, tip=${refOf(tipInst)}, expected=${REGISTRY_MODULE_REF})`,
         );
     }
+    if ((regAdmin !== null) !== (tipAdmin !== null) || (regAdmin !== null && !isSameAccount(regAdmin, tipAdmin))) {
+        throw new Error(`registry admin changed between registration (${regAdmin}) and tip (${tipAdmin})`);
+    }
+    const adminAddr = regAdmin !== null && !isSameAccount(regAdmin, owner) ? AccountAddress.fromBase58(regAdmin) : null;
 
     // 4. Verify zero initial CIS-2 operators for owner at regBlockHash.
     const ownerHex = Buffer.from(ownerAddr.decodedAddress).toString('hex');
@@ -747,7 +806,7 @@ export async function readRegistryHistory(
             throw new Error(`unexpected operator submap prefix for ${owner} at block ${regHeight}`);
         }
         const hasInitialOperator = await rpc.run(() =>
-            withStreamTimeout(async (signal) => {
+            collectStreamWithTimeout(async (signal) => {
                 for await (const entry of c.getInstanceState(registryAddr, regBlockHash, signal)) {
                     if (signal.aborted) throw signal.reason;
                     const k = typeof entry.key === 'string' ? entry.key.toLowerCase() : Buffer.from(entry.key).toString('hex');
@@ -761,14 +820,71 @@ export async function readRegistryHistory(
         }
     }
 
-    // 5. Check owner nonce span <= maxOwnerTxs BEFORE following hint links.
-    const [nStart, nEnd] = await Promise.all([nonceAt(regHeight), nonceAt(tipH)]);
-    if (nEnd < nStart) {
-        throw new Error(`non-monotonic owner accountNonce (${nEnd} < ${nStart})`);
-    }
-    if (nEnd - nStart > BigInt(maxOwnerTxs)) {
-        throw new Error(`owner ${owner} executed ${nEnd - nStart} transactions between block ${regHeight} and ${tipH}, exceeding maxOwnerTxs=${maxOwnerTxs}`);
-    }
+    const checkAccountNonceSpan = async (accountAddr, maxTxs, label) => {
+        const [nStart, nEnd] = await Promise.all([nonceAtFor(accountAddr, regHeight), nonceAtFor(accountAddr, tipH)]);
+        if (nEnd < nStart) {
+            throw new Error(`non-monotonic ${label} accountNonce (${nEnd} < ${nStart})`);
+        }
+        if (nEnd - nStart > BigInt(maxTxs)) {
+            const capName = label === 'admin' ? 'maxAdminTxs' : 'maxOwnerTxs';
+            throw new Error(`${label} ${accountAddr.address} executed ${nEnd - nStart} transactions between block ${regHeight} and ${tipH}, exceeding ${capName}=${maxTxs}`);
+        }
+        return { nStart, nEnd };
+    };
+
+    const scanAccountTxBlocks = async (accountAddr, splitPoints, maxTxs, label) => {
+        const { nStart, nEnd } = await checkAccountNonceSpan(accountAddr, maxTxs, label);
+        if (nEnd === nStart) return [];
+
+        const binaryRange = async (rLo, rHi, nLo, nHi) => {
+            if (nHi < nLo) throw new Error(`non-monotonic ${label} accountNonce (${nHi} < ${nLo})`);
+            if (nLo === nHi || rLo >= rHi) return [];
+            if (rHi === rLo + 1n) return [rHi];
+            const mid = (rLo + rHi) / 2n;
+            const nMid = await nonceAtFor(accountAddr, mid);
+            if (nMid < nLo || nHi < nMid) throw new Error(`non-monotonic ${label} accountNonce across [${rLo}, ${mid}, ${rHi}]`);
+            const [left, right] = await Promise.all([
+                nMid > nLo ? binaryRange(rLo, mid, nLo, nMid) : [],
+                nHi > nMid ? binaryRange(mid, rHi, nMid, nHi) : [],
+            ]);
+            return left.concat(right);
+        };
+
+        const scanRange = async (rLo, rHi, nLo, nHi) => {
+            if (nHi < nLo) throw new Error(`non-monotonic ${label} accountNonce (${nHi} < ${nLo})`);
+            if (nLo === nHi || rLo >= rHi) return [];
+            if (rHi === rLo + 1n) return [rHi];
+            if (rHi - rLo <= 32n) return binaryRange(rLo, rHi, nLo, nHi);
+
+            let prev = rLo;
+            let step = 8n;
+            while (prev < rHi) {
+                const next = prev + step < rHi ? prev + step : rHi;
+                const nNext = await nonceAtFor(accountAddr, next);
+                if (nNext < nLo) throw new Error(`non-monotonic ${label} accountNonce (${nNext} < ${nLo})`);
+                if (nNext > nLo) {
+                    const [left, right] = await Promise.all([
+                        binaryRange(prev, next, nLo, nNext),
+                        nNext < nHi ? scanRange(next, rHi, nNext, nHi) : [],
+                    ]);
+                    return left.concat(right);
+                }
+                prev = next;
+                step *= 2n;
+            }
+            return [];
+        };
+
+        const pointNonces = await Promise.all(splitPoints.map((p) => nonceAtFor(accountAddr, p)));
+        const intervalResults = await Promise.all(
+            splitPoints.slice(0, -1).map((p, i) => scanRange(p, splitPoints[i + 1], pointNonces[i], pointNonces[i + 1])),
+        );
+        return intervalResults.flat();
+    };
+
+    // 5. Check owner (and admin if distinct) nonce span BEFORE following hint links.
+    await checkAccountNonceSpan(ownerAddr, maxOwnerTxs, 'owner');
+    if (adminAddr) await checkAccountNonceSpan(adminAddr, maxAdminTxs, 'admin');
 
     // 6. Follow hintAnchorTxHashes / prevAnchorTx links (bounded & owner/token/height-validated) to get split hints.
     const maxHintHops = Math.min(Number(maxOwnerTxs), 256);
@@ -795,60 +911,20 @@ export async function readRegistryHistory(
         }
     }
 
-    // 7. Exhaustively find every block in (regHeight, tipH] where owner's accountNonce increased.
-    const binaryRange = async (rLo, rHi, nLo, nHi) => {
-        if (nHi < nLo) throw new Error(`non-monotonic owner accountNonce (${nHi} < ${nLo})`);
-        if (nLo === nHi || rLo >= rHi) return [];
-        if (rHi === rLo + 1n) return [rHi];
-        const mid = (rLo + rHi) / 2n;
-        const nMid = await nonceAt(mid);
-        if (nMid < nLo || nHi < nMid) throw new Error(`non-monotonic owner accountNonce across [${rLo}, ${mid}, ${rHi}]`);
-        const [left, right] = await Promise.all([
-            nMid > nLo ? binaryRange(rLo, mid, nLo, nMid) : [],
-            nHi > nMid ? binaryRange(mid, rHi, nMid, nHi) : [],
-        ]);
-        return left.concat(right);
-    };
-
-    const scanRange = async (rLo, rHi, nLo, nHi) => {
-        if (nHi < nLo) throw new Error(`non-monotonic owner accountNonce (${nHi} < ${nLo})`);
-        if (nLo === nHi || rLo >= rHi) return [];
-        if (rHi === rLo + 1n) return [rHi];
-        if (rHi - rLo <= 32n) return binaryRange(rLo, rHi, nLo, nHi);
-
-        let prev = rLo;
-        let step = 8n;
-        while (prev < rHi) {
-            const next = prev + step < rHi ? prev + step : rHi;
-            const nNext = await nonceAt(next);
-            if (nNext < nLo) throw new Error(`non-monotonic owner accountNonce (${nNext} < ${nLo})`);
-            if (nNext > nLo) {
-                const [left, right] = await Promise.all([
-                    binaryRange(prev, next, nLo, nNext),
-                    nNext < nHi ? scanRange(next, rHi, nNext, nHi) : [],
-                ]);
-                return left.concat(right);
-            }
-            prev = next;
-            step *= 2n;
-        }
-        return [];
-    };
-
+    // 7. Exhaustively find every block in (regHeight, tipH] where owner's (or admin's) accountNonce increased.
     const splitSet = new Set([regHeight, tipH]);
     for (const h of hintHeightSet) {
         if (h - 1n > regHeight) splitSet.add(h - 1n);
         splitSet.add(h);
     }
-    const points = [...splitSet].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-    const pointNonces = await Promise.all(points.map(nonceAt));
-    const intervalResults = await Promise.all(
-        points.slice(0, -1).map((p, i) => scanRange(p, points[i + 1], pointNonces[i], pointNonces[i + 1])),
-    );
-    const discoveredHeights = [...new Set(intervalResults.flat())].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    const ownerPoints = [...splitSet].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    const [ownerHeights, adminHeights] = await Promise.all([
+        scanAccountTxBlocks(ownerAddr, ownerPoints, maxOwnerTxs, 'owner'),
+        adminAddr ? scanAccountTxBlocks(adminAddr, [regHeight, tipH], maxAdminTxs, 'admin') : [],
+    ]);
+    const discoveredHeights = [...new Set([...ownerHeights, ...adminHeights])].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 
-    // 8. Stream getBlockTransactionEvents for regHeight (post-Mint) and each discovered block in ascending order.
-    const discoveredEvents = await Promise.all(discoveredHeights.map(getBlockEvents));
+    // 8. Stream getBlockTransactionEvents for regHeight and discovered blocks in bounded ascending batches.
     const collected = [];
 
     const processBlock = (h, summaries, startAfterMint) => {
@@ -876,6 +952,9 @@ export async function readRegistryHistory(
                     if (parsed.type === 'Unknown') {
                         throw new Error(`unknown CIS-8004 event tag 0x${parsed.tag.toString(16)} at block ${h} (tx ${txHash})`);
                     }
+                    if (parsed.type === 'AdminTransferred') {
+                        throw new Error(`registry admin transferred at block ${h} (tx ${txHash})`);
+                    }
                     if (parsed.type === 'Transfer' && parsed.tokenId === targetTokenId) {
                         if (!isSameAccount(parsed.from, owner) || !isSameAccount(parsed.to, owner)) {
                             throw new Error(`token ${targetTokenId} was transferred (${parsed.from} -> ${parsed.to}) at block ${h} (tx ${txHash})`);
@@ -899,8 +978,13 @@ export async function readRegistryHistory(
     };
 
     processBlock(regHeight, mintHit.summaries, true);
-    for (let i = 0; i < discoveredHeights.length; i++) {
-        processBlock(discoveredHeights[i], discoveredEvents[i], false);
+    const BATCH_SIZE = 10;
+    for (let i = 0; i < discoveredHeights.length; i += BATCH_SIZE) {
+        const batch = discoveredHeights.slice(i, i + BATCH_SIZE);
+        const batchEvents = await Promise.all(batch.map(getBlockEvents));
+        for (let j = 0; j < batch.length; j++) {
+            processBlock(batch[j], batchEvents[j], false);
+        }
     }
 
     return {
