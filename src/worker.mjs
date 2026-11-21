@@ -564,35 +564,29 @@ export class AnchorWorker {
         if (legacyExists && canonExists) {
             const stLegacy = fs.statSync(this.legacyStatePath);
             const stCanon = fs.statSync(this.statePath);
-            if (stLegacy.dev !== stCanon.dev || stLegacy.ino !== stCanon.ino) {
+            const sameInode = stLegacy.dev === stCanon.dev && stLegacy.ino === stCanon.ino;
+            const canonRaw = fs.readFileSync(this.statePath);
+            if (!sameInode) {
                 const legacyRaw = fs.readFileSync(this.legacyStatePath);
-                const canonRaw = fs.readFileSync(this.statePath);
                 if (Buffer.compare(legacyRaw, canonRaw) !== 0) {
                     throw new Error(
                         `conflicting state files exist at both legacy path (${this.legacyStatePath}) and canonical path (${this.statePath}); resolve manually`,
                     );
                 }
-                if (!this.dryRun) {
-                    fs.unlinkSync(this.legacyStatePath);
-                    this.log(`removed already-migrated legacy state file ${this.legacyStatePath}`);
+            }
+            if (!this.dryRun) {
+                const needsPrivateRewrite = (stCanon.mode & 0o777) !== 0o600 || (sameInode && !fs.lstatSync(this.legacyStatePath).isSymbolicLink());
+                if (needsPrivateRewrite) {
+                    writeFileAtomic(this.statePath, canonRaw, { mode: 0o600 });
                 }
+                fs.unlinkSync(this.legacyStatePath);
+                this.log(`removed already-migrated legacy state file ${this.legacyStatePath}`);
             }
             return this.statePath;
         }
         if (legacyExists && !canonExists) {
             if (this.dryRun) {
                 return this.legacyStatePath;
-            }
-            const isSymlink = fs.lstatSync(this.legacyStatePath).isSymbolicLink();
-            if (!isSymlink) {
-                try {
-                    fs.renameSync(this.legacyStatePath, this.statePath);
-                    fs.chmodSync(this.statePath, 0o600);
-                    this.log(`migrated legacy state file ${this.legacyStatePath} -> ${this.statePath}`);
-                    return this.statePath;
-                } catch (err) {
-                    if (err?.code !== 'EXDEV') throw err;
-                }
             }
             const raw = fs.readFileSync(this.legacyStatePath);
             writeFileAtomic(this.statePath, raw, { mode: 0o600 });
@@ -1007,7 +1001,7 @@ export class AnchorWorker {
         let remainingOwnerBudget = history.maxOwnerTxs - history.ownerNonceSpan;
         let resumedPendingOnThisTick = false;
 
-        const applyRefreshedSnapshot = async () => {
+        const applyRefreshedSnapshot = async ({ preserveTimerForTxHash = null } = {}) => {
             const snap = await loadFinalizedSnapshot();
             tipBlockHash = snap.tipBlockHash;
             tipBlockHeight = snap.tipBlockHeight;
@@ -1017,9 +1011,13 @@ export class AnchorWorker {
             existing = snap.existing;
             prev = snap.prev;
             remainingOwnerBudget = snap.remainingOwnerBudget;
-            if (prev && prev.txHash !== this._lastSeenAnchorTxHash) {
-                this._seedLastAnchorMs(prev.blockTime);
-                this._lastSeenAnchorTxHash = prev.txHash;
+            if (prev) {
+                if (prev.txHash === preserveTimerForTxHash) {
+                    this._lastSeenAnchorTxHash = prev.txHash;
+                } else if (prev.txHash !== this._lastSeenAnchorTxHash) {
+                    this._seedLastAnchorMs(prev.blockTime);
+                    this._lastSeenAnchorTxHash = prev.txHash;
+                }
             }
             this._syncTipFromAnchor(prev, agent.ownerAccount);
         };
@@ -1092,7 +1090,7 @@ export class AnchorWorker {
                         this.log(`resumed pending metadata tx ${metaTx.txHash} for anchor ${pending.txHash}`);
                         metadataHandled = true;
                         resumedPendingOnThisTick = true;
-                        await applyRefreshedSnapshot();
+                        await applyRefreshedSnapshot({ preserveTimerForTxHash: pending.txHash });
                     };
 
                     if (metaStatus.state === 'pending' || metaStatus.state === 'committed') {
@@ -1330,7 +1328,7 @@ export class AnchorWorker {
                             });
                             this.lastAnchorMs = this.now();
                             this.log(`resumed pending anchor seq 1..${d.toSeq}: ${EXPLORER_TX(pending.txHash)}`);
-                            await applyRefreshedSnapshot();
+                            await applyRefreshedSnapshot({ preserveTimerForTxHash: pending.txHash });
                         }
                     }
                 }

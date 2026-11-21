@@ -2789,6 +2789,96 @@ test('refresh re-seeds --every-seconds timer on newer chain anchor and parseHigh
         },
     });
     assert.equal(r2.length, 2);
+
+    // Recovered pending anchor older than everySeconds keeps completion timer (does NOT re-anchor seq 3 on same tick)
+    {
+        const tPath = path.join(dir, 'preserve-timer-after-recovery.jsonl');
+        const sPath = `${tPath}.anchor-state.json`;
+        writeTrail(tPath, header, recs);
+        const recNode = createMutableMockNode();
+        const oldRd = recNode.addRegisterData({
+            sender: OWNER_A,
+            height: 1500n,
+            data: encodeAnchor({ tokenId: TOKEN_ID, toSeq: 2, commitment: at.get(2), prevAnchorTx: null }),
+        });
+        fs.writeFileSync(
+            sPath,
+            JSON.stringify({
+                version: 1,
+                agentUuid: AGENT_UUID,
+                tokenId: TOKEN_ID,
+                pendingAnchor: {
+                    txHash: oldRd.txHash,
+                    status: 'finalized',
+                    tokenId: TOKEN_ID,
+                    toSeq: 2,
+                    commitment: at.get(2).toString('hex'),
+                    prevAnchorTx: null,
+                    sender: OWNER_A,
+                },
+            }),
+        );
+        const origConsole = console.log;
+        console.log = () => {};
+        try {
+            const recW = new AnchorWorker({
+                uuid: AGENT_UUID,
+                tokenId: TOKEN_ID,
+                trailPath: tPath,
+                statePath: sPath,
+                everySeconds: 60,
+                nodeClient: recNode,
+                signer: makeSigner(OWNER_A),
+                source: () => [],
+                now: () => 50_000,
+                wallClock: () => new Date(1700000000000 + 2000 * 2000),
+                log: () => {},
+            });
+            const recRes = await recW.tick();
+            assert.equal(recRes.anchoredSeq, 2);
+            assert.equal(recRes.anchored, false);
+            assert.equal(recNode.submitted.length, 1, 'must publish ONLY resumed setMetadata, not immediate 2nd anchor');
+        } finally {
+            console.log = origConsole;
+        }
+    }
+
+    // Hard-linked legacy/canonical sidecars + non-0600 legacy permissions unlink cleanly and enforce 0600 atomically
+    {
+        const hlDir = path.join(dir, 'hardlink');
+        fs.mkdirSync(hlDir);
+        const realT = path.join(hlDir, 'real.jsonl');
+        const linkT = path.join(hlDir, 'alias.jsonl');
+        writeTrail(realT, header, [makeRecord(1)]);
+        fs.symlinkSync(realT, linkT);
+        const canonS = `${canonicalTrailPath(realT)}.anchor-state.json`;
+        const legacyS = `${path.resolve(linkT)}.anchor-state.json`;
+        fs.writeFileSync(canonS, JSON.stringify({ version: 1, agentUuid: AGENT_UUID, tokenId: TOKEN_ID }), { mode: 0o644 });
+        fs.chmodSync(canonS, 0o644);
+        fs.linkSync(canonS, legacyS);
+
+        const hlW = new AnchorWorker({
+            uuid: AGENT_UUID,
+            tokenId: TOKEN_ID,
+            trailPath: linkT,
+            once: true,
+            source: () => [],
+            log: () => {},
+        });
+        await hlW.syncTrail();
+        assert.equal(fs.existsSync(legacyS), false, 'hardlinked legacy alias must be removed before updates');
+        assert.equal(fs.statSync(canonS).mode & 0o777, 0o600, 'migrated/canonical state must be 0600');
+        hlW._updateState({ lastAnchoredSeq: 1 });
+        assert.equal(hlW._readState().lastAnchoredSeq, 1);
+
+        // Clean mode 0600 on copy-migrated 0644 regular legacy sidecar
+        fs.unlinkSync(canonS);
+        fs.writeFileSync(legacyS, JSON.stringify({ version: 1, agentUuid: AGENT_UUID, tokenId: TOKEN_ID, lastAnchoredSeq: 1 }));
+        fs.chmodSync(legacyS, 0o644);
+        await hlW.syncTrail();
+        assert.equal(fs.existsSync(legacyS), false);
+        assert.equal(fs.statSync(canonS).mode & 0o777, 0o600);
+    }
 });
 
 test('fetchCheckpointsAfter handles 4000+ rows with batchSize=1 iteratively and caps at high-water mark', () => {
