@@ -6,7 +6,7 @@
   "type": "module",
   "bin": { "countersign": "src/cli.mjs" },
   "engines": { "node": ">=20" },
-  "scripts": { "test": "node --test test/trail.test.mjs" },
+  "scripts": { "test": "node --test test/*.test.mjs" },
   "dependencies": {
     "@concordium/web-sdk": "12.0.3"
   }
