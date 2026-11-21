@@ -5,13 +5,44 @@ import { checkRecord } from './trail.mjs';
 export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const utf8Fatal = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
+/** Extracts libpq PG* environment variables from a postgres:// or postgresql:// DATABASE_URL without leaking secrets to argv. */
+export function parseDatabaseUrlToPgEnv(databaseUrl) {
+    let u;
+    try {
+        u = new URL(databaseUrl);
+    } catch (err) {
+        throw new Error(`invalid DATABASE_URL: ${err.message}`);
+    }
+    if (u.protocol !== 'postgres:' && u.protocol !== 'postgresql:') {
+        throw new Error(`unsupported DATABASE_URL scheme ${u.protocol}; expected postgres:// or postgresql://`);
+    }
+    const pgEnv = {};
+    const hostParam = u.searchParams.get('host');
+    const hostname = u.hostname ? u.hostname.replace(/^\[(.*)\]$/, '$1') : '';
+    const host = hostParam || hostname;
+    if (host) pgEnv.PGHOST = host;
+    if (u.port) pgEnv.PGPORT = u.port;
+    if (u.username) pgEnv.PGUSER = decodeURIComponent(u.username);
+    if (u.password) pgEnv.PGPASSWORD = decodeURIComponent(u.password);
+    const pathDb = u.pathname.startsWith('/') ? u.pathname.slice(1) : u.pathname;
+    const dbname = u.searchParams.get('dbname') || (pathDb ? decodeURIComponent(pathDb) : '');
+    if (dbname) pgEnv.PGDATABASE = dbname;
+    const sslmode = u.searchParams.get('sslmode');
+    if (sslmode) pgEnv.PGSSLMODE = sslmode;
+    return pgEnv;
+}
+
 /**
  * Splits a psql command string into argv using POSIX shell-style quoting ('...', "...", and backslash escapes).
  * Defaults to ['psql', '-d', 'governance'] unless DATABASE_URL or PGDATABASE is set in env (then ['psql']).
  */
 export function parsePsqlCommand(psqlSpec, env = process.env) {
     if (psqlSpec === undefined || psqlSpec === null) {
-        return env?.DATABASE_URL || env?.PGDATABASE ? ['psql'] : ['psql', '-d', 'governance'];
+        if (env?.DATABASE_URL) {
+            parseDatabaseUrlToPgEnv(env.DATABASE_URL);
+            return ['psql'];
+        }
+        return env?.PGDATABASE ? ['psql'] : ['psql', '-d', 'governance'];
     }
     if (typeof psqlSpec !== 'string') {
         throw new Error('psql command must be a string');
@@ -173,11 +204,21 @@ export function fetchCheckpointsAfter({
     }
     const sql = buildCheckpointStreamSql({ uuid, afterSeq });
     const [bin, ...psqlArgs] = parsePsqlCommand(psql, env);
-    const out = execFile(bin, [...psqlArgs, '-v', 'ON_ERROR_STOP=1', '-At', '-c', sql], {
+    const childEnv = { ...env };
+    if ((psql === undefined || psql === null) && env?.DATABASE_URL) {
+        Object.assign(childEnv, parseDatabaseUrlToPgEnv(env.DATABASE_URL));
+    }
+    childEnv.PGCLIENTENCODING = 'UTF8';
+    const basePgOptions = String(childEnv.PGOPTIONS ?? '').trim();
+    const readOnlyFlag = '-c default_transaction_read_only=on';
+    childEnv.PGOPTIONS = basePgOptions
+        ? (basePgOptions.includes('default_transaction_read_only=on') ? basePgOptions : `${basePgOptions} ${readOnlyFlag}`)
+        : readOnlyFlag;
+    const out = execFile(bin, [...psqlArgs, '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-At', '-c', sql], {
         encoding: 'utf8',
         maxBuffer: 1 << 30,
         timeout: timeoutMs,
-        env: { ...env, PGCLIENTENCODING: 'UTF8' },
+        env: childEnv,
     });
     if (out && typeof out.then === 'function') {
         return out.then((resolved) => parseAndValidateRows(resolved, afterSeq, prevCheckpointId));

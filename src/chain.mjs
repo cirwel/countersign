@@ -353,9 +353,11 @@ export function loadSigner() {
     return { address: k.accountAddress, sender: AccountAddress.fromBase58(k.accountAddress), signer: buildBasicAccountSigner(signKey) };
 }
 
-async function waitForFinalizedPolling(c, hash, { timeoutMs = 180000, pollIntervalMs = 2000, now = () => performance.now() } = {}) {
+export async function waitForFinalizedPolling(c, hash, { timeoutMs = 180000, pollIntervalMs = 2000, now = () => performance.now() } = {}) {
+    const txObj = typeof hash === 'string' ? TransactionHash.fromHexString(hash) : hash;
+    const txLabel = typeof hash === 'string' ? hash : hash.toString();
     const deadline = now() + timeoutMs;
-    const timeoutErr = () => new Error(`transaction ${hash} did not finalize within ${timeoutMs}ms`);
+    const timeoutErr = () => new Error(`transaction ${txLabel} did not finalize within ${timeoutMs}ms`);
     while (true) {
         const remaining = deadline - now();
         if (remaining <= 0) throw timeoutErr();
@@ -367,7 +369,7 @@ async function waitForFinalizedPolling(c, hash, { timeoutMs = 180000, pollInterv
         let status;
         try {
             status = await Promise.race([
-                withRpcRetry(() => c.getBlockItemStatus(hash), retryOpts),
+                withRpcRetry(() => c.getBlockItemStatus(txObj), retryOpts),
                 new Promise((_, reject) => {
                     timer = setTimeout(() => reject(timeoutErr()), remaining);
                 }),
@@ -376,13 +378,13 @@ async function waitForFinalizedPolling(c, hash, { timeoutMs = 180000, pollInterv
             clearTimeout(timer);
         }
         if (now() >= deadline) throw timeoutErr();
-        if (status.status === 'finalized') {
+        if (status?.status === 'finalized') {
             const summary = status.outcome?.summary;
-            if (!summary) throw new Error(`transaction ${hash} finalized without outcome summary`);
+            if (!summary) throw new Error(`transaction ${txLabel} finalized without outcome summary`);
             if (summary.transactionType === 'failed' || summary.rejectReason) {
-                throw new Error(`transaction ${hash} was rejected: ${JSON.stringify(summary.rejectReason ?? summary, bigintSafe)}`);
+                throw new Error(`transaction ${txLabel} was rejected: ${JSON.stringify(summary.rejectReason ?? summary, bigintSafe)}`);
             }
-            return { hash: hash.toString(), summary };
+            return { hash: txLabel, summary };
         }
         const afterPollRemaining = deadline - now();
         if (afterPollRemaining <= 0) throw timeoutErr();
@@ -390,15 +392,46 @@ async function waitForFinalizedPolling(c, hash, { timeoutMs = 180000, pollInterv
     }
 }
 
-async function signSendWait(builder, who, nodeClient, pollOpts) {
+/** Inspects a transaction's current node state ('absent', 'pending', 'committed', or 'finalized'). */
+export async function getTransactionState(txHash, nodeClient) {
+    const c = nodeClient ?? (await client());
+    await assertTestnet(c);
+    const txObj = typeof txHash === 'string' ? TransactionHash.fromHexString(txHash) : txHash;
+    let status;
+    try {
+        status = await withRpcRetry(() => c.getBlockItemStatus(txObj));
+    } catch (err) {
+        if (isNotFoundError(err)) return { state: 'absent' };
+        throw err;
+    }
+    if (!status) return { state: 'absent' };
+    if (status.status === 'received') return { state: 'pending' };
+    if (status.status === 'committed') return { state: 'committed' };
+    if (status.status === 'finalized') {
+        return {
+            state: 'finalized',
+            summary: status.outcome?.summary,
+            blockHash: status.outcome?.blockHash,
+        };
+    }
+    throw new Error(`unexpected block item status for ${txHash}: ${status.status}`);
+}
+
+async function signSendWait(builder, who, nodeClient, pollOpts = {}) {
+    const { onSigned, ...waitOpts } = pollOpts ?? {};
     const c = nodeClient ?? (await client());
     await assertTestnet(c);
     const { nonce } = await withRpcRetry(() => c.getNextAccountNonce(who.sender));
     const tx = builder.addMetadata({ sender: who.sender, nonce }).build();
     const signed = await Transaction.signAndFinalize(tx, who.signer);
+    const txHash = Buffer.from(Transaction.getAccountTransactionHash(signed)).toString('hex');
+    const expiryEpochSeconds = Number(signed.header?.expiry?.expiryEpochSeconds ?? 0);
+    if (onSigned) {
+        await onSigned({ txHash, expiryEpochSeconds, signed });
+    }
     const hash = await c.sendTransaction(signed);
     console.log('submitted tx:', hash.toString());
-    return waitForFinalizedPolling(c, hash, pollOpts);
+    return waitForFinalizedPolling(c, hash, waitOpts);
 }
 
 export const bigintSafe = (_k, v) => (typeof v === 'bigint' ? v.toString() : v);
@@ -523,7 +556,7 @@ export async function readRegisterData(txHash, nodeClient) {
     const c = nodeClient ?? (await client());
     await assertTestnet(c);
     const status = await withRpcRetry(() => c.getBlockItemStatus(TransactionHash.fromHexString(txHash)));
-    if (status.status !== 'finalized') throw new Error(`transaction ${txHash} is not finalized (${status.status})`);
+    if (!status || status.status !== 'finalized') throw new Error(`transaction ${txHash} is not finalized (${status?.status ?? 'absent'})`);
     const s = status.outcome.summary;
     if (s.transactionType !== 'registerData') throw new Error(`transaction ${txHash} is ${s.transactionType}, not registerData`);
     const block = await withRpcRetry(() => c.getBlockInfo(status.outcome.blockHash));

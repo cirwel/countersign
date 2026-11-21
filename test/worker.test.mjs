@@ -5,14 +5,19 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, test } from 'node:test';
-import { AccountAddress, ReturnValue, TransactionHash, buildBasicAccountSigner } from '@concordium/web-sdk';
+import { AccountAddress, ReturnValue, Transaction, TransactionHash, buildBasicAccountSigner } from '@concordium/web-sdk';
 import { TESTNET_GENESIS } from '../src/chain.mjs';
-import { buildCheckpointStreamSql, fetchCheckpointsAfter, parsePsqlCommand } from '../src/checkpoints.mjs';
+import {
+    buildCheckpointStreamSql,
+    fetchCheckpointsAfter,
+    parseDatabaseUrlToPgEnv,
+    parsePsqlCommand,
+} from '../src/checkpoints.mjs';
 import { encodeBadge, encodeTokenId } from '../src/cis8004.mjs';
 import { commands } from '../src/cli.mjs';
 import { REGISTRY, REGISTRY_MODULE_REF } from '../src/registry.mjs';
 import { canonical, commitments, decodeAnchor, encodeAnchor, readTrail, writeTrail } from '../src/trail.mjs';
-import { AnchorWorker, runAnchorWorker, shouldAnchor } from '../src/worker.mjs';
+import { AnchorWorker, runAnchorWorker, shouldAnchor, trailLockPath, withFileLock } from '../src/worker.mjs';
 
 const AGENT_UUID = '907e3195-c649-49db-b753-1edc1a105f33';
 const TOKEN_ID = '1315';
@@ -145,7 +150,11 @@ function createMutableMockNode({
     owner = OWNER_A,
     status = 'Active',
     uuid = AGENT_UUID,
+    includeUuidMetadata = true,
     onInvokeContract = null,
+    onSendTransaction = null,
+    statusForHash = null,
+    onRpc = null,
 } = {}) {
     const baseTimeMs = 1700000000000;
     const card = makeCardBytes({ ownerAccount: owner });
@@ -161,7 +170,7 @@ function createMutableMockNode({
 
     const state = {
         tipHeight,
-        metadata: { 'unitares.agent_uuid': uuid },
+        metadata: includeUuidMetadata ? { 'unitares.agent_uuid': uuid } : {},
         txsByHeight: new Map(),
         registerDataByHash: new Map(),
         nonceChanges: [],
@@ -221,6 +230,7 @@ function createMutableMockNode({
             return { blockHeight: h, blockSlotTime: new Date(timeForHeight(h)) };
         },
         async getAccountInfo(acct, bh) {
+            onRpc?.('getAccountInfo', bh);
             const h = heightFromBlockHash(bh);
             let count = 1n;
             for (const nc of state.nonceChanges) {
@@ -229,6 +239,7 @@ function createMutableMockNode({
             return { accountNonce: { value: count } };
         },
         async getNextAccountNonce(acct) {
+            onRpc?.('getNextAccountNonce', acct.address);
             let count = 1n;
             for (const nc of state.nonceChanges) {
                 if (nc.sender === acct.address) count += 1n;
@@ -236,14 +247,17 @@ function createMutableMockNode({
             return { nonce: { value: count } };
         },
         async getInstanceInfo() {
+            onRpc?.('getInstanceInfo');
             return { sourceModule: { moduleRef: REGISTRY_MODULE_REF } };
         },
         async instanceStateLookup() {
+            onRpc?.('instanceStateLookup');
             const err = new Error('Key not found');
             err.code = 'NOT_FOUND';
             throw err;
         },
         async *getBlockTransactionEvents(bh) {
+            onRpc?.('getBlockTransactionEvents', bh);
             const h = heightFromBlockHash(bh);
             const list = state.txsByHeight.get(h) ?? [];
             for (const tx of list) {
@@ -274,6 +288,11 @@ function createMutableMockNode({
         },
         async getBlockItemStatus(txHash) {
             const hHex = txHash.toString();
+            onRpc?.('getBlockItemStatus', hHex);
+            if (statusForHash) {
+                const custom = await statusForHash(hHex, node);
+                if (custom !== undefined) return custom;
+            }
             const tx = state.registerDataByHash.get(hHex);
             if (tx) {
                 return {
@@ -305,13 +324,16 @@ function createMutableMockNode({
                     }
                 }
             }
-            throw new Error(`mock tx ${hHex} not found`);
+            const err = new Error(`mock tx ${hHex} not found`);
+            err.code = 'NOT_FOUND';
+            throw err;
         },
         async sendTransaction(signed) {
-            const hashHex = txHashFor(`tx-${++state.submitSeq}`);
+            const hashHex = Buffer.from(Transaction.getAccountTransactionHash(signed)).toString('hex');
             const sender = signed.header.sender.address;
             const entry = { hashHex, payload: signed.payload, sender };
             state.submitted.push(entry);
+            if (onSendTransaction) await onSendTransaction(entry, node);
             if (signed.payload?.type === 21) {
                 const dataBuf = Buffer.from(signed.payload.data.data);
                 node.addRegisterData({ sender, data: dataBuf, txHash: hashHex });
@@ -412,8 +434,9 @@ test('buildCheckpointStreamSql & fetchCheckpointsAfter preserve escapes/NULLs, v
         },
     });
     assert.equal(capturedCall.bin, 'psql');
-    assert.deepEqual(capturedCall.args.slice(0, 5), ['dbname=my db', '-v', 'ON_ERROR_STOP=1', '-At', '-c']);
+    assert.deepEqual(capturedCall.args.slice(0, 7), ['dbname=my db', '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-At', '-c']);
     assert.equal(capturedCall.opts.env.PGCLIENTENCODING, 'UTF8');
+    assert.match(capturedCall.opts.env.PGOPTIONS, /default_transaction_read_only=on/);
     assert.equal(rows.length, 2);
     assert.equal(rows[0].report_excerpt, 'back\\\\slash "quote" \'sq\'\nline2\rCR 😀 ～');
     assert.equal(rows[1].report_excerpt, '');
@@ -1114,7 +1137,7 @@ test('cli watch command validates flags and executes --once --dry-run cleanly', 
     assert.equal(readTrail(trailPath).records.length, 2);
 });
 
-test('AnchorWorker rejects superseded/invalid pendingAnchor, supports --dry-run recovery plan, and cancels real sleep on AbortSignal', async () => {
+test('AnchorWorker clears orphaned/existing pendingAnchor, refuses drifted pendingAnchor, supports --dry-run recovery plan, and cancels real sleep on AbortSignal', async () => {
     const dir = makeTempDir();
     const header = {
         schema: 'countersign.trail.v1',
@@ -1124,7 +1147,7 @@ test('AnchorWorker rejects superseded/invalid pendingAnchor, supports --dry-run 
         registry: { network: 'testnet', ...REGISTRY },
     };
 
-    // 1. Superseded pendingAnchor (someone else already anchored seq 1..3) -> refuses cleanly
+    // 1a. Superseded orphaned pendingAnchor (someone else anchored seq 1..3) -> logs orphan, clears pendingAnchor, 0 setMetadata
     {
         const trailPath = path.join(dir, 'superseded.jsonl');
         const statePath = `${trailPath}.anchor-state.json`;
@@ -1160,6 +1183,7 @@ test('AnchorWorker rejects superseded/invalid pendingAnchor, supports --dry-run 
         );
 
         let setMetaCalled = false;
+        const logs = [];
         const worker = new AnchorWorker({
             uuid: AGENT_UUID,
             tokenId: TOKEN_ID,
@@ -1172,10 +1196,112 @@ test('AnchorWorker rejects superseded/invalid pendingAnchor, supports --dry-run 
             setMetadata: () => {
                 setMetaCalled = true;
             },
+            log: (m) => logs.push(m),
+        });
+        const res = await worker.tick();
+        assert.equal(setMetaCalled, false);
+        assert.equal(res.anchoredSeq, 3);
+        assert.ok(logs.some((m) => /orphaned pending anchor/.test(m)));
+        const cleared = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+        assert.equal(cleared.pendingAnchor, null);
+        assert.equal(cleared.lastAnchoredSeq, 3);
+        assert.equal(cleared.lastAnchoredTxHash, winnerRd.txHash);
+    }
+
+    // 1b. pendingAnchor already present in existing anchors (followed by a newer anchor) -> clears pendingAnchor cleanly
+    {
+        const trailPath = path.join(dir, 'in-existing.jsonl');
+        const statePath = `${trailPath}.anchor-state.json`;
+        const recs = [makeRecord(1), makeRecord(2), makeRecord(3)];
+        writeTrail(trailPath, header, recs);
+        const { at } = commitments(header, recs, new Set([2, 3]));
+        const node = createMutableMockNode();
+        const rd1 = node.addRegisterData({
+            sender: OWNER_A,
+            data: encodeAnchor({ tokenId: TOKEN_ID, toSeq: 2, commitment: at.get(2), prevAnchorTx: null }),
+        });
+        node.addSetMetadata({ sender: OWNER_A, value: rd1.txHash });
+        const rd2 = node.addRegisterData({
+            sender: OWNER_A,
+            data: encodeAnchor({ tokenId: TOKEN_ID, toSeq: 3, commitment: at.get(3), prevAnchorTx: rd1.txHash }),
+        });
+        node.addSetMetadata({ sender: OWNER_A, value: rd2.txHash });
+
+        fs.writeFileSync(
+            statePath,
+            JSON.stringify({
+                version: 1,
+                agentUuid: AGENT_UUID,
+                tokenId: TOKEN_ID,
+                pendingAnchor: {
+                    txHash: rd1.txHash,
+                    tokenId: TOKEN_ID,
+                    toSeq: 2,
+                    commitment: at.get(2).toString('hex'),
+                    prevAnchorTx: null,
+                    sender: OWNER_A,
+                },
+            }),
+        );
+
+        const worker = new AnchorWorker({
+            uuid: AGENT_UUID,
+            tokenId: TOKEN_ID,
+            trailPath,
+            statePath,
+            everyRecords: 1,
+            nodeClient: node,
+            signer: makeSigner(OWNER_A),
+            source: () => [],
+            log: () => {},
+        });
+        const res = await worker.tick();
+        assert.equal(res.anchoredSeq, 3);
+        const st = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+        assert.equal(st.pendingAnchor, null);
+        assert.equal(st.lastAnchoredTxHash, rd2.txHash);
+    }
+
+    // 1c. pendingAnchor whose commitment disagrees with local trail still refuses to resume
+    {
+        const trailPath = path.join(dir, 'drifted-pending.jsonl');
+        const statePath = `${trailPath}.anchor-state.json`;
+        const recs = [makeRecord(1), makeRecord(2)];
+        writeTrail(trailPath, header, recs);
+        const node = createMutableMockNode();
+        const bogusCommitment = Buffer.alloc(32, 0xaa);
+        const rd = node.addRegisterData({
+            sender: OWNER_A,
+            data: encodeAnchor({ tokenId: TOKEN_ID, toSeq: 2, commitment: bogusCommitment, prevAnchorTx: null }),
+        });
+        fs.writeFileSync(
+            statePath,
+            JSON.stringify({
+                version: 1,
+                agentUuid: AGENT_UUID,
+                tokenId: TOKEN_ID,
+                pendingAnchor: {
+                    txHash: rd.txHash,
+                    tokenId: TOKEN_ID,
+                    toSeq: 2,
+                    commitment: bogusCommitment.toString('hex'),
+                    prevAnchorTx: null,
+                    sender: OWNER_A,
+                },
+            }),
+        );
+        const worker = new AnchorWorker({
+            uuid: AGENT_UUID,
+            tokenId: TOKEN_ID,
+            trailPath,
+            statePath,
+            everyRecords: 1,
+            nodeClient: node,
+            signer: makeSigner(OWNER_A),
+            source: () => [],
             log: () => {},
         });
         await assert.rejects(() => worker.tick(), /refusing to resume/);
-        assert.equal(setMetaCalled, false);
     }
 
     // 2. --dry-run with valid pendingAnchor logs resume_set_metadata without writing chain or state
@@ -1266,4 +1392,490 @@ test('AnchorWorker rejects superseded/invalid pendingAnchor, supports --dry-run 
             ], { encoding: 'utf8', stdio: 'pipe' }),
         (err) => err.status === 1 && /everyRecords or everySeconds/.test(err.stderr),
     );
+});
+
+test('pre-broadcast pendingAnchor & metadataTx handle absent before/after expiry and pending/committed polling without duplicates', async () => {
+    const dir = makeTempDir();
+    const signer = makeSigner(OWNER_A);
+    const origLog = console.log;
+    console.log = () => {};
+
+    try {
+        // 1. Pre-broadcast crash BEFORE sendTransaction broadcasts registerData (tx absent on node)
+        {
+            const trailPath = path.join(dir, 'prebroadcast-rd.jsonl');
+            const statePath = `${trailPath}.anchor-state.json`;
+            let nowSec = 1_700_000_000;
+            const node = createMutableMockNode({
+                onSendTransaction: () => {
+                    throw new Error('simulated crash right before sendTransaction');
+                },
+            });
+
+            const w1 = new AnchorWorker({
+                uuid: AGENT_UUID,
+                tokenId: TOKEN_ID,
+                trailPath,
+                statePath,
+                everyRecords: 1,
+                nodeClient: node,
+                signer,
+                source: (afterSeq) => (afterSeq === 0 ? [makeRecord(1)] : []),
+                wallClock: () => new Date(nowSec * 1000),
+                log: () => {},
+            });
+
+            await assert.rejects(() => w1.tick(), /simulated crash right before sendTransaction/);
+            const saved = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+            assert.ok(saved.pendingAnchor);
+            assert.equal(saved.pendingAnchor.status, 'signed');
+            assert.ok(saved.pendingAnchor.expiryEpochSeconds > 0);
+            const firstSignedHash = saved.pendingAnchor.txHash;
+
+            // Restart BEFORE expiry while tx is absent -> throws retryable ambiguous error, 0 new broadcasts
+            let sendCalls = 0;
+            const node2 = createMutableMockNode({
+                onSendTransaction: () => {
+                    sendCalls += 1;
+                },
+            });
+            nowSec = saved.pendingAnchor.expiryEpochSeconds - 10;
+            const w2 = new AnchorWorker({
+                uuid: AGENT_UUID,
+                tokenId: TOKEN_ID,
+                trailPath,
+                statePath,
+                everyRecords: 1,
+                nodeClient: node2,
+                signer,
+                source: () => [],
+                wallClock: () => new Date(nowSec * 1000),
+                log: () => {},
+            });
+            await assert.rejects(() => w2.tick(), /ambiguous before expiry/);
+            assert.equal(sendCalls, 0);
+
+            // Restart AFTER expiry while tx is still absent -> clears expired pendingAnchor and submits cleanly
+            node2.state.nonceChanges.push({ sender: OWNER_A, height: 1100n });
+            nowSec = saved.pendingAnchor.expiryEpochSeconds + 5;
+            const res = await w2.tick();
+            assert.equal(res.anchored, true);
+            assert.equal(res.anchoredSeq, 1);
+            assert.equal(sendCalls, 2); // 1 registerData + 1 setMetadata
+            assert.notEqual(res.txHash, firstSignedHash);
+            assert.equal(JSON.parse(fs.readFileSync(statePath, 'utf8')).pendingAnchor, null);
+        }
+
+        // 2. registerData in 'received'/'committed' state polls to finalization without duplicate registerData
+        {
+            const trailPath = path.join(dir, 'inflight-rd.jsonl');
+            const statePath = `${trailPath}.anchor-state.json`;
+            const recs = [makeRecord(1), makeRecord(2)];
+            const header = {
+                schema: 'countersign.trail.v1',
+                source: 'test',
+                agent_uuid: AGENT_UUID,
+                token_id: TOKEN_ID,
+                registry: { network: 'testnet', ...REGISTRY },
+            };
+            writeTrail(trailPath, header, recs);
+            const { last } = commitments(header, recs);
+            const pendingHash = txHashFor('inflight-rd-tx');
+            const data = encodeAnchor({ tokenId: TOKEN_ID, toSeq: 2, commitment: last, prevAnchorTx: null });
+
+            let polls = 0;
+            const node = createMutableMockNode({
+                statusForHash: (h) => {
+                    if (h !== pendingHash) return undefined;
+                    polls += 1;
+                    if (polls === 1) return { status: 'received' };
+                    if (polls === 2) return { status: 'committed' };
+                    return {
+                        status: 'finalized',
+                        outcome: {
+                            blockHash: { height: 2001n, toString: () => 'block-2001' },
+                            summary: {
+                                transactionType: 'registerData',
+                                sender: { address: OWNER_A },
+                                dataRegistered: { data: data.toString('hex') },
+                            },
+                        },
+                    };
+                },
+            });
+            // Also register for readRegisterData once finalized
+            node.state.registerDataByHash.set(pendingHash, {
+                height: 2001n,
+                hash: pendingHash,
+                sender: OWNER_A,
+                registerData: data,
+            });
+
+            fs.writeFileSync(
+                statePath,
+                JSON.stringify({
+                    version: 1,
+                    agentUuid: AGENT_UUID,
+                    tokenId: TOKEN_ID,
+                    pendingAnchor: {
+                        txHash: pendingHash,
+                        status: 'signed',
+                        expiryEpochSeconds: 9_999_999_999,
+                        tokenId: TOKEN_ID,
+                        toSeq: 2,
+                        commitment: last.toString('hex'),
+                        prevAnchorTx: null,
+                        sender: OWNER_A,
+                    },
+                }),
+            );
+
+            // Override getBlockItemStatus only for first 2 polls, then let registerDataByHash return finalized
+            const origGetStatus = node.getBlockItemStatus.bind(node);
+            let rdPolls = 0;
+            node.getBlockItemStatus = async (txHash) => {
+                if (txHash.toString() === pendingHash) {
+                    rdPolls += 1;
+                    if (rdPolls === 1) return { status: 'received' };
+                    if (rdPolls === 2) return { status: 'committed' };
+                }
+                return origGetStatus(txHash);
+            };
+
+            const w = new AnchorWorker({
+                uuid: AGENT_UUID,
+                tokenId: TOKEN_ID,
+                trailPath,
+                statePath,
+                everyRecords: 1,
+                nodeClient: node,
+                signer,
+                source: () => [],
+                log: () => {},
+            });
+            const res = await w.tick();
+            assert.equal(res.anchoredSeq, 2);
+            // Only setMetadata was broadcast (no duplicate registerData!)
+            assert.equal(node.submitted.length, 1);
+            assert.equal(node.submitted[0].payload.receiveName.value, 'CIS-8004.setMetadata');
+        }
+
+        // 3. Pre-broadcast crash BEFORE setMetadata sendTransaction -> ambiguous before expiry, re-submits after expiry, polls committed when landed
+        {
+            const trailPath = path.join(dir, 'prebroadcast-meta.jsonl');
+            const statePath = `${trailPath}.anchor-state.json`;
+            let nowSec = 1_700_000_000;
+            let failOnSetMeta = true;
+
+            const node = createMutableMockNode({
+                onSendTransaction: (entry) => {
+                    if (entry.payload?.type !== 21 && failOnSetMeta) {
+                        throw new Error('simulated crash before setMetadata broadcast');
+                    }
+                },
+            });
+
+            const w1 = new AnchorWorker({
+                uuid: AGENT_UUID,
+                tokenId: TOKEN_ID,
+                trailPath,
+                statePath,
+                everyRecords: 1,
+                nodeClient: node,
+                signer,
+                source: (afterSeq) => (afterSeq === 0 ? [makeRecord(1)] : []),
+                wallClock: () => new Date(nowSec * 1000),
+                log: () => {},
+            });
+
+            await assert.rejects(() => w1.tick(), /simulated crash before setMetadata broadcast/);
+            const saved = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+            assert.ok(saved.pendingAnchor?.metadataTx?.txHash);
+            const metaExpiry = saved.pendingAnchor.metadataTx.expiryEpochSeconds;
+
+            // Before expiry with absent metadataTx -> throws ambiguous error, 0 broadcasts
+            nowSec = metaExpiry - 5;
+            await assert.rejects(() => w1.tick(), /in-flight\/ambiguous until expiry/);
+
+            // If metadataTx actually enters 'committed' and finalizes on node -> polls it with 0 duplicate setMetadata!
+            const metaHash = saved.pendingAnchor.metadataTx.txHash;
+            const rdHash = saved.pendingAnchor.txHash;
+            let metaPolls = 0;
+            const origGetStatus = node.getBlockItemStatus.bind(node);
+            node.getBlockItemStatus = async (txHash) => {
+                if (txHash.toString() === metaHash) {
+                    metaPolls += 1;
+                    if (metaPolls === 1) return { status: 'committed' };
+                    node.state.metadata['countersign.anchor'] = rdHash;
+                    return {
+                        status: 'finalized',
+                        outcome: {
+                            blockHash: { height: 2002n, toString: () => 'block-2002' },
+                            summary: { transactionType: 'update', sender: { address: OWNER_A }, events: [] },
+                        },
+                    };
+                }
+                return origGetStatus(txHash);
+            };
+            const submittedBefore = node.submitted.length;
+            const res = await w1.tick();
+            assert.equal(node.submitted.length, submittedBefore, 'must NOT send duplicate setMetadata');
+            assert.equal(res.anchoredSeq, 1);
+            assert.equal(JSON.parse(fs.readFileSync(statePath, 'utf8')).pendingAnchor, null);
+        }
+    } finally {
+        console.log = origLog;
+    }
+});
+
+test('canonical trail lock blocks differing --state workers, serializes stale-lock takeover race, and rejects concurrent in-process calls', async () => {
+    const dir = makeTempDir();
+    const trailPath = path.join(dir, 'shared.jsonl');
+    const symlinkTrail = path.join(dir, 'shared-link.jsonl');
+    fs.writeFileSync(trailPath, '');
+    fs.symlinkSync(trailPath, symlinkTrail);
+
+    const w1 = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath,
+        statePath: path.join(dir, 'state-1.json'),
+        once: true,
+        log: () => {},
+    });
+    const w2 = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath: symlinkTrail,
+        statePath: path.join(dir, 'state-2.json'),
+        once: true,
+        log: () => {},
+    });
+    assert.equal(w1.lockPath, w2.lockPath, 'lockPath must derive canonically from trailPath, never statePath');
+
+    // Mutual stale-lock takeover race: two concurrent contenders on one stale lock -> exactly 1 wins!
+    const lockPath = trailLockPath(trailPath);
+    const deadPid = findDeadPid();
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: deadPid, host: os.hostname(), startedAt: new Date().toISOString() }) + '\n');
+
+    let holdGate;
+    const gatePromise = new Promise((r) => {
+        holdGate = r;
+    });
+    let enteredGate;
+    const enteredPromise = new Promise((r) => {
+        enteredGate = r;
+    });
+
+    const contender1 = withFileLock(lockPath, async () => {
+        enteredGate();
+        await gatePromise;
+        return 'won-1';
+    });
+    const contender2 = withFileLock(lockPath, async () => 'won-2');
+
+    const results = await Promise.allSettled([
+        (async () => {
+            await enteredPromise;
+            holdGate();
+            return contender1;
+        })(),
+        contender2,
+    ]);
+    const fulfilled = results.filter((r) => r.status === 'fulfilled');
+    const rejected = results.filter((r) => r.status === 'rejected');
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+    assert.equal(fs.existsSync(lockPath), false);
+
+    // Concurrent tick() on same AnchorWorker instance rejects cleanly
+    const node = createMutableMockNode();
+    let releaseSource;
+    const sourceGate = new Promise((r) => {
+        releaseSource = r;
+    });
+    let insideSource;
+    const insidePromise = new Promise((r) => {
+        insideSource = r;
+    });
+    const wSlow = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath: path.join(dir, 'concurrent-instance.jsonl'),
+        once: true,
+        dryRun: true,
+        nodeClient: node,
+        source: async () => {
+            insideSource();
+            await sourceGate;
+            return [];
+        },
+        log: () => {},
+    });
+    const p1 = wSlow.tick();
+    await insidePromise;
+    await assert.rejects(() => wSlow.tick(), /already active on this instance/);
+    releaseSource();
+    await p1;
+});
+
+test('AnchorWorker recovers torn trail append via trailAppend journal and fails closed on unjournaled corruption', async () => {
+    const dir = makeTempDir();
+    const trailPath = path.join(dir, 'torn.jsonl');
+    const statePath = `${trailPath}.anchor-state.json`;
+    const header = {
+        schema: 'countersign.trail.v1',
+        source: 'test',
+        agent_uuid: AGENT_UUID,
+        token_id: TOKEN_ID,
+        registry: { network: 'testnet', ...REGISTRY },
+    };
+    writeTrail(trailPath, header, [makeRecord(1)]);
+    const baseSize = fs.statSync(trailPath).size;
+
+    // Simulate SIGKILL mid-append: journaled trailAppend + torn partial line on disk
+    fs.writeFileSync(
+        statePath,
+        JSON.stringify({
+            version: 1,
+            agentUuid: AGENT_UUID,
+            tokenId: TOKEN_ID,
+            trailAppend: { baseSize, targetSeq: 2 },
+        }),
+    );
+    fs.appendFileSync(trailPath, '{"checkpoint_id":"cp-2","partial');
+
+    const stream = [makeRecord(1), makeRecord(2)];
+    const logs = [];
+    const worker = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath,
+        statePath,
+        once: true,
+        source: (afterSeq) => stream.filter((r) => r.seq > afterSeq),
+        log: (m) => logs.push(m),
+    });
+
+    const synced = await worker.syncTrail();
+    assert.equal(synced.lastSeq, 2);
+    assert.equal(readTrail(trailPath).records.length, 2);
+    assert.equal(JSON.parse(fs.readFileSync(statePath, 'utf8')).trailAppend, null);
+    assert.ok(logs.some((l) => /recovering interrupted trail append/.test(l)));
+
+    // Unjournaled corruption (no trailAppend) MUST fail closed
+    fs.appendFileSync(trailPath, '{"corrupt');
+    await assert.rejects(() => worker.syncTrail(), /newline|not JSON/);
+});
+
+test('DATABASE_URL extracts PG* env vars without exposing password in argv and rejects non-postgres URLs', () => {
+    const pgEnv = parseDatabaseUrlToPgEnv('postgresql://alice:s3cr3t%21@pg.internal:5433/unitares?sslmode=require');
+    assert.deepEqual(pgEnv, {
+        PGHOST: 'pg.internal',
+        PGPORT: '5433',
+        PGUSER: 'alice',
+        PGPASSWORD: 's3cr3t!',
+        PGDATABASE: 'unitares',
+        PGSSLMODE: 'require',
+    });
+
+    assert.equal(parseDatabaseUrlToPgEnv('postgres://[::1]:5432/gov').PGHOST, '::1');
+    assert.equal(parseDatabaseUrlToPgEnv('postgresql:///gov?host=/var/run/postgresql').PGHOST, '/var/run/postgresql');
+    assert.throws(() => parsePsqlCommand(undefined, { DATABASE_URL: 'http://evil.example/db' }), /unsupported DATABASE_URL scheme/);
+
+    let call = null;
+    const rows = fetchCheckpointsAfter({
+        uuid: AGENT_UUID,
+        afterSeq: 0,
+        env: { DATABASE_URL: 'postgresql://alice:topsecret@db.host:5432/gov?sslmode=verify-full' },
+        execFile: (bin, args, opts) => {
+            call = { bin, args, opts };
+            return '';
+        },
+    });
+    assert.deepEqual(rows, []);
+    assert.equal(call.bin, 'psql');
+    assert.equal(call.args.join(' ').includes('topsecret'), false, 'password must never appear in argv');
+    assert.equal(call.opts.env.PGPASSWORD, 'topsecret');
+    assert.equal(call.opts.env.PGHOST, 'db.host');
+    assert.equal(call.opts.env.PGDATABASE, 'gov');
+    assert.equal(call.opts.env.PGSSLMODE, 'verify-full');
+    assert.match(call.opts.env.PGOPTIONS, /default_transaction_read_only=on/);
+});
+
+test('AnchorWorker seeds --every-seconds from prev.blockTime across restarts, requires unitares.agent_uuid, and skips history scans on idle polls', async () => {
+    const dir = makeTempDir();
+    const trailPath = path.join(dir, 'restart-seed.jsonl');
+    const header = {
+        schema: 'countersign.trail.v1',
+        source: 'test',
+        agent_uuid: AGENT_UUID,
+        token_id: TOKEN_ID,
+        registry: { network: 'testnet', ...REGISTRY },
+    };
+    const recs = [makeRecord(1), makeRecord(2), makeRecord(3)];
+    writeTrail(trailPath, header, recs);
+    const { at } = commitments(header, recs, new Set([2]));
+
+    let historyRpcCount = 0;
+    const node = createMutableMockNode({
+        onRpc: (m) => {
+            if (m === 'getBlockTransactionEvents' || m === 'getAccountInfo' || m === 'getInstanceInfo') {
+                historyRpcCount += 1;
+            }
+        },
+    });
+    const rd = node.addRegisterData({
+        sender: OWNER_A,
+        height: 1500n, // blockTime = 1700000000000 + 1500*2000 = 1700003000000
+        data: encodeAnchor({ tokenId: TOKEN_ID, toSeq: 2, commitment: at.get(2), prevAnchorTx: null }),
+    });
+    node.addSetMetadata({ sender: OWNER_A, height: 1501n, value: rd.txHash });
+
+    const prevBlockMs = 1_700_003_000_000;
+    let wallNowMs = prevBlockMs + 10_000; // only 10s elapsed since prev.blockTime
+    let monoMs = 5_000;
+
+    const worker = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath,
+        everySeconds: 3600,
+        nodeClient: node,
+        signer: makeSigner(OWNER_A),
+        source: () => [],
+        now: () => monoMs,
+        wallClock: () => new Date(wallNowMs),
+        log: () => {},
+    });
+
+    // Tick 1: runs initial full history reconciliation, seeds lastAnchorMs from prev.blockTime -> 10s < 3600s -> no anchor
+    const t1 = await worker.tick();
+    assert.equal(t1.anchored, false);
+    assert.equal(t1.anchoredSeq, 2);
+    assert.ok(historyRpcCount > 0);
+
+    // Ticks 2 & 3 (idle polls): pointer unchanged & !due -> ZERO history RPCs!
+    const countAfterT1 = historyRpcCount;
+    monoMs += 15_000;
+    wallNowMs += 15_000;
+    await worker.tick();
+    monoMs += 15_000;
+    wallNowMs += 15_000;
+    await worker.tick();
+    assert.equal(historyRpcCount, countAfterT1, 'idle polls must skip readRegistryHistory');
+
+    // Missing unitares.agent_uuid metadata fails closed
+    const missingUuidNode = createMutableMockNode({ includeUuidMetadata: false });
+    const wMissing = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath: path.join(dir, 'missing-uuid.jsonl'),
+        once: true,
+        nodeClient: missingUuidNode,
+        signer: makeSigner(OWNER_A),
+        source: () => [],
+        log: () => {},
+    });
+    await assert.rejects(() => wMissing.tick(), /on-chain unitares\.agent_uuid/);
 });
