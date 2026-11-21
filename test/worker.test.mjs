@@ -1554,7 +1554,8 @@ test('pre-broadcast pendingAnchor & metadataTx handle absent before/after expiry
                 }),
             );
 
-            // Override getBlockItemStatus only for first 2 polls, then let registerDataByHash return finalized
+            // Override getBlockItemStatus only for first 2 polls, then finalize pendingHash at block 2001n
+            node.state.registerDataByHash.delete(pendingHash);
             const origGetStatus = node.getBlockItemStatus.bind(node);
             let rdPolls = 0;
             node.getBlockItemStatus = async (txHash) => {
@@ -1562,6 +1563,9 @@ test('pre-broadcast pendingAnchor & metadataTx handle absent before/after expiry
                     rdPolls += 1;
                     if (rdPolls === 1) return { status: 'received' };
                     if (rdPolls === 2) return { status: 'committed' };
+                    if (!node.state.registerDataByHash.has(pendingHash)) {
+                        node.addRegisterData({ sender: OWNER_A, data, txHash: pendingHash, height: 2001n });
+                    }
                 }
                 return origGetStatus(txHash);
             };
@@ -1622,7 +1626,7 @@ test('pre-broadcast pendingAnchor & metadataTx handle absent before/after expiry
             nowSec = metaExpiry + 1000;
             await assert.rejects(() => w1.tick(), /in-flight\/ambiguous until finalized chain time passes expiry/);
 
-            // If metadataTx actually enters 'committed' and finalizes on node -> polls it with 0 duplicate setMetadata!
+            // If metadataTx actually enters 'committed' and finalizes on node at block 2002n -> polls it with 0 duplicate setMetadata!
             const metaHash = saved.pendingAnchor.metadataTx.txHash;
             const rdHash = saved.pendingAnchor.txHash;
             let metaPolls = 0;
@@ -1631,14 +1635,9 @@ test('pre-broadcast pendingAnchor & metadataTx handle absent before/after expiry
                 if (txHash.toString() === metaHash) {
                     metaPolls += 1;
                     if (metaPolls === 1) return { status: 'committed' };
-                    node.state.metadata['countersign.anchor'] = rdHash;
-                    return {
-                        status: 'finalized',
-                        outcome: {
-                            blockHash: { height: 2002n, toString: () => 'block-2002' },
-                            summary: { transactionType: 'update', sender: { address: OWNER_A }, events: [] },
-                        },
-                    };
+                    if (!node.state.metadata['countersign.anchor']) {
+                        node.addSetMetadata({ sender: OWNER_A, value: rdHash, txHash: metaHash, height: 2002n });
+                    }
                 }
                 return origGetStatus(txHash);
             };
@@ -2154,8 +2153,8 @@ test('canonical paths, collision guards, 0644 trail mode, isolated journal clean
     assert.equal(wSym.trailPath, canonicalTrailPath(realTrail));
     assert.equal(wSym.statePath, `${canonicalTrailPath(realTrail)}.anchor-state.json`);
 
-    // 2. Trail mode 0644 on creation + preserved existing mode, while state file stays 0600
-    const trail644 = path.join(dir, 'mode.jsonl');
+    // 2. Trail mode 0600 on creation + preserved existing 0644/0640 modes, while state file stays 0600
+    const trailNew = path.join(dir, 'mode.jsonl');
     const node = createMutableMockNode();
     const origLog = console.log;
     console.log = () => {};
@@ -2163,30 +2162,44 @@ test('canonical paths, collision guards, 0644 trail mode, isolated journal clean
         await runAnchorWorker({
             uuid: AGENT_UUID,
             tokenId: TOKEN_ID,
-            trailPath: trail644,
+            trailPath: trailNew,
             once: true,
             nodeClient: node,
             signer: makeSigner(OWNER_A),
             source: (afterSeq) => (afterSeq === 0 ? [makeRecord(1)] : []),
             log: () => {},
         });
-        assert.equal(fs.statSync(trail644).mode & 0o777, 0o644);
-        assert.equal(fs.statSync(`${trail644}.anchor-state.json`).mode & 0o777, 0o600);
+        assert.equal(fs.statSync(trailNew).mode & 0o777, 0o600);
+        assert.equal(fs.statSync(`${trailNew}.anchor-state.json`).mode & 0o777, 0o600);
 
-        // Dry-run appends atomically via writeFileAtomic and preserves custom existing trail mode (0640)
-        fs.chmodSync(trail644, 0o640);
+        // Pre-existing 0644 and 0640 trails preserve their existing modes across dryRun
+        fs.chmodSync(trailNew, 0o644);
         await runAnchorWorker({
             uuid: AGENT_UUID,
             tokenId: TOKEN_ID,
-            trailPath: trail644,
+            trailPath: trailNew,
             once: true,
             dryRun: true,
             nodeClient: node,
             source: (afterSeq) => (afterSeq === 1 ? [makeRecord(2)] : []),
             log: () => {},
         });
-        assert.equal(readTrail(trail644).records.length, 2);
-        assert.equal(fs.statSync(trail644).mode & 0o777, 0o640);
+        assert.equal(readTrail(trailNew).records.length, 2);
+        assert.equal(fs.statSync(trailNew).mode & 0o777, 0o644);
+
+        fs.chmodSync(trailNew, 0o640);
+        await runAnchorWorker({
+            uuid: AGENT_UUID,
+            tokenId: TOKEN_ID,
+            trailPath: trailNew,
+            once: true,
+            dryRun: true,
+            nodeClient: node,
+            source: (afterSeq) => (afterSeq === 2 ? [makeRecord(3)] : []),
+            log: () => {},
+        });
+        assert.equal(readTrail(trailNew).records.length, 3);
+        assert.equal(fs.statSync(trailNew).mode & 0o777, 0o640);
     } finally {
         console.log = origLog;
     }
@@ -2271,11 +2284,13 @@ test('canonical paths, collision guards, 0644 trail mode, isolated journal clean
         await assert.rejects(() => wIdle.tick(), /does not match the anchor/);
     }
 
-    // 5. cli export preserves symlink targets and writes mode 0644
+    // 5. cli export preserves symlink targets + existing modes (0644/0640), and defaults new trails to 0600
     {
         const target = path.join(dir, 'export-target.jsonl');
         const link = path.join(dir, 'export-link.jsonl');
+        const freshExport = path.join(dir, 'export-new.jsonl');
         fs.writeFileSync(target, '', { mode: 0o644 });
+        fs.chmodSync(target, 0o644);
         fs.symlinkSync(target, link);
         const r1 = makeRecord(1);
         const orig = console.log;
@@ -2287,12 +2302,29 @@ test('canonical paths, collision guards, 0644 trail mode, isolated journal clean
                 out: link,
                 execFile: () => `${JSON.stringify(r1)}\n`,
             });
+            assert.equal(fs.lstatSync(link).isSymbolicLink(), true, 'export must preserve symlink');
+            assert.equal(readTrail(target).records.length, 1);
+            assert.equal(fs.statSync(target).mode & 0o777, 0o644);
+
+            fs.chmodSync(target, 0o640);
+            await commands.export({
+                uuid: AGENT_UUID,
+                token: TOKEN_ID,
+                out: link,
+                execFile: () => `${JSON.stringify(r1)}\n`,
+            });
+            assert.equal(fs.statSync(target).mode & 0o777, 0o640);
+
+            await commands.export({
+                uuid: AGENT_UUID,
+                token: TOKEN_ID,
+                out: freshExport,
+                execFile: () => `${JSON.stringify(r1)}\n`,
+            });
+            assert.equal(fs.statSync(freshExport).mode & 0o777, 0o600);
         } finally {
             console.log = orig;
         }
-        assert.equal(fs.lstatSync(link).isSymbolicLink(), true, 'export must preserve symlink');
-        assert.equal(readTrail(target).records.length, 1);
-        assert.equal(fs.statSync(target).mode & 0o777, 0o644);
     }
 });
 
@@ -2330,15 +2362,323 @@ test('DATABASE_URL preserves all libpq params, rejects multi-host/unsupported pa
         execFile: (_bin, args) => {
             const sql = args[args.length - 1];
             batchSqls.push(sql);
+            if (sql.includes('MAX(o.seq)')) return '5\n';
             if (sql.includes('o.seq > 0')) return `${JSON.stringify(all5[0])}\n${JSON.stringify(all5[1])}\n`;
-            if (sql.includes('o.seq > 2')) return `${JSON.stringify(all5[2])}\n${JSON.stringify(all5[3])}\n`;
-            if (sql.includes('o.seq > 4')) return `${JSON.stringify(all5[4])}\n`;
+            if (sql.includes('o.seq > 2 AND o.seq <= 5')) return `${JSON.stringify(all5[2])}\n${JSON.stringify(all5[3])}\n`;
+            if (sql.includes('o.seq > 4 AND o.seq <= 5')) return `${JSON.stringify(all5[4])}\n`;
             return '';
         },
     });
     assert.equal(rows.length, 5);
-    assert.equal(batchSqls.length, 3);
+    assert.equal(batchSqls.length, 4);
     assert.match(batchSqls[0], /o\.seq > 0 ORDER BY o\.seq ASC LIMIT 2$/);
-    assert.match(batchSqls[1], /o\.seq > 2 ORDER BY o\.seq ASC LIMIT 2$/);
-    assert.match(batchSqls[2], /o\.seq > 4 ORDER BY o\.seq ASC LIMIT 2$/);
+    assert.match(batchSqls[1], /COALESCE\(MAX\(o\.seq\), 0\)::text.*o\.seq > 2/);
+    assert.match(batchSqls[2], /o\.seq > 2 AND o\.seq <= 5 ORDER BY o\.seq ASC LIMIT 2$/);
+    assert.match(batchSqls[3], /o\.seq > 4 AND o\.seq <= 5 ORDER BY o\.seq ASC LIMIT 2$/);
+});
+
+test('pending setMetadata landing at 1998 updates refreshed budget to refuse fresh anchor, and committed->finalized rd refreshes expectedSetNonce', async () => {
+    const dir = makeTempDir();
+    const header = {
+        schema: 'countersign.trail.v1',
+        source: 'test',
+        agent_uuid: AGENT_UUID,
+        token_id: TOKEN_ID,
+        registry: { network: 'testnet', ...REGISTRY },
+    };
+    const origLog = console.log;
+    console.log = () => {};
+
+    try {
+        // 1. Pending metadataTx finalizes when ownerNonceSpan was 1998 -> refreshed span is 1999 (budget=1),
+        //    so a subsequent fresh 2-tx anchor on the same tick is refused (1999 + 2 > 2000)!
+        {
+            const trailPath = path.join(dir, 'refresh-budget.jsonl');
+            const statePath = `${trailPath}.anchor-state.json`;
+            const recs = [makeRecord(1), makeRecord(2), makeRecord(3)];
+            writeTrail(trailPath, header, recs);
+            const { at } = commitments(header, recs, new Set([2]));
+
+            const node = createMutableMockNode();
+            for (let i = 0; i < 1997; i += 1) {
+                node.state.nonceChanges.push({ sender: OWNER_A, height: 1500n });
+            }
+            const rd = node.addRegisterData({
+                sender: OWNER_A,
+                height: 1501n,
+                data: encodeAnchor({ tokenId: TOKEN_ID, toSeq: 2, commitment: at.get(2), prevAnchorTx: null }),
+            }); // ownerNonceSpan is now 1998!
+            const metaHash = txHashFor('landing-meta-1999');
+
+            fs.writeFileSync(
+                statePath,
+                JSON.stringify({
+                    version: 1,
+                    agentUuid: AGENT_UUID,
+                    tokenId: TOKEN_ID,
+                    pendingAnchor: {
+                        txHash: rd.txHash,
+                        status: 'finalized',
+                        tokenId: TOKEN_ID,
+                        toSeq: 2,
+                        commitment: at.get(2).toString('hex'),
+                        prevAnchorTx: null,
+                        sender: OWNER_A,
+                        metadataTx: { txHash: metaHash, expiryEpochSeconds: 9_999_999_999 },
+                    },
+                }),
+            );
+
+            const origGetStatus = node.getBlockItemStatus.bind(node);
+            let metaPolls = 0;
+            node.getBlockItemStatus = async (txHash) => {
+                if (txHash.toString() === metaHash) {
+                    metaPolls += 1;
+                    if (metaPolls === 1) return { status: 'committed' };
+                    if (!node.state.metadata['countersign.anchor']) {
+                        node.addSetMetadata({ sender: OWNER_A, value: rd.txHash, txHash: metaHash, height: 2005n });
+                    }
+                }
+                return origGetStatus(txHash);
+            };
+
+            const worker = new AnchorWorker({
+                uuid: AGENT_UUID,
+                tokenId: TOKEN_ID,
+                trailPath,
+                statePath,
+                everyRecords: 1,
+                nodeClient: node,
+                signer: makeSigner(OWNER_A),
+                source: () => [],
+                log: () => {},
+            });
+
+            await assert.rejects(() => worker.tick(), /1999 \+ 2 exceeds maxOwnerTxs=2000/);
+            assert.equal(node.submitted.length, 0);
+            assert.equal(JSON.parse(fs.readFileSync(statePath, 'utf8')).pendingAnchor, null);
+        }
+
+        // 2. Pending registerData already transitioned committed -> finalized AFTER initial tipBlockHeight:
+        //    worker refreshes tipBlockHash so expectedSetNonce includes the new registerData nonce and CAS passes!
+        {
+            const trailPath = path.join(dir, 'late-finalized-rd.jsonl');
+            const statePath = `${trailPath}.anchor-state.json`;
+            const recs = [makeRecord(1), makeRecord(2)];
+            writeTrail(trailPath, header, recs);
+            const { last } = commitments(header, recs);
+            const data = encodeAnchor({ tokenId: TOKEN_ID, toSeq: 2, commitment: last, prevAnchorTx: null });
+            const lateHash = txHashFor('late-finalized-rd');
+            const node = createMutableMockNode();
+
+            fs.writeFileSync(
+                statePath,
+                JSON.stringify({
+                    version: 1,
+                    agentUuid: AGENT_UUID,
+                    tokenId: TOKEN_ID,
+                    pendingAnchor: {
+                        txHash: lateHash,
+                        status: 'signed',
+                        expiryEpochSeconds: 9_999_999_999,
+                        tokenId: TOKEN_ID,
+                        toSeq: 2,
+                        commitment: last.toString('hex'),
+                        prevAnchorTx: null,
+                        sender: OWNER_A,
+                    },
+                }),
+            );
+
+            // Simulate pending rd finalizing right between initial getConsensusStatus (height 2000) and getBlockItemStatus!
+            const origGetStatus = node.getBlockItemStatus.bind(node);
+            node.getBlockItemStatus = async (txHash) => {
+                if (txHash.toString() === lateHash && !node.state.registerDataByHash.has(lateHash)) {
+                    node.addRegisterData({ sender: OWNER_A, data, txHash: lateHash, height: 2005n });
+                }
+                return origGetStatus(txHash);
+            };
+
+            const worker = new AnchorWorker({
+                uuid: AGENT_UUID,
+                tokenId: TOKEN_ID,
+                trailPath,
+                statePath,
+                everyRecords: 1,
+                nodeClient: node,
+                signer: makeSigner(OWNER_A),
+                source: () => [],
+                log: () => {},
+            });
+            const res = await worker.tick();
+            assert.equal(res.anchoredSeq, 2);
+            assert.equal(node.submitted.length, 1);
+            assert.equal(node.submitted[0].payload.receiveName.value, 'CIS-8004.setMetadata');
+        }
+    } finally {
+        console.log = origLog;
+    }
+});
+
+test('legacy sidecar recovery beside symlinked trail migrates on live tick, preserves disk on dryRun, and blocks cli anchor', async () => {
+    const dir = makeTempDir();
+    const realDir = path.join(dir, 'real');
+    const linkDir = path.join(dir, 'links');
+    fs.mkdirSync(realDir);
+    fs.mkdirSync(linkDir);
+
+    const realTrail = path.join(realDir, 'agent.jsonl');
+    const symTrail = path.join(linkDir, 'alias.jsonl');
+    const header = {
+        schema: 'countersign.trail.v1',
+        source: 'test',
+        agent_uuid: AGENT_UUID,
+        token_id: TOKEN_ID,
+        registry: { network: 'testnet', ...REGISTRY },
+    };
+    const recs = [makeRecord(1), makeRecord(2)];
+    writeTrail(realTrail, header, recs);
+    fs.symlinkSync(realTrail, symTrail);
+
+    const canonicalSidecar = `${canonicalTrailPath(realTrail)}.anchor-state.json`;
+    const legacySidecar = canonicalTrailPath(`${symTrail}.anchor-state.json`);
+    assert.notEqual(canonicalSidecar, legacySidecar);
+
+    const { last } = commitments(header, recs);
+    const node = createMutableMockNode();
+    const rd = node.addRegisterData({
+        sender: OWNER_A,
+        data: encodeAnchor({ tokenId: TOKEN_ID, toSeq: 2, commitment: last, prevAnchorTx: null }),
+    });
+    const pendingState = JSON.stringify({
+        version: 1,
+        agentUuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        pendingAnchor: {
+            txHash: rd.txHash,
+            status: 'finalized',
+            tokenId: TOKEN_ID,
+            toSeq: 2,
+            commitment: last.toString('hex'),
+            prevAnchorTx: null,
+            sender: OWNER_A,
+        },
+    });
+    fs.writeFileSync(legacySidecar, pendingState);
+
+    // 1. cli anchor refuses when legacy sidecar beside symlinked --trail has pendingAnchor
+    await assert.rejects(
+        () => commands.anchor({ trail: symTrail, nodeClient: node, who: makeSigner(OWNER_A) }),
+        /pending anchor .* exists/,
+    );
+
+    // 2. dryRun reads legacy sidecar in-place without mutating disk or creating canonical sidecar
+    const dryLogs = [];
+    const dryRes = await runAnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath: symTrail,
+        once: true,
+        dryRun: true,
+        nodeClient: node,
+        loadSignerFn: () => {
+            throw new Error('dryRun must not load signer');
+        },
+        source: () => [],
+        log: (m) => dryLogs.push(m),
+    });
+    assert.equal(dryRes.plan.action, 'resume_set_metadata');
+    assert.equal(fs.existsSync(legacySidecar), true);
+    assert.equal(fs.existsSync(canonicalSidecar), false);
+
+    // 3. Conflicting canonical + legacy sidecars fail closed
+    fs.writeFileSync(canonicalSidecar, pendingState);
+    await assert.rejects(
+        () =>
+            runAnchorWorker({
+                uuid: AGENT_UUID,
+                tokenId: TOKEN_ID,
+                trailPath: symTrail,
+                once: true,
+                nodeClient: node,
+                signer: makeSigner(OWNER_A),
+                source: () => [],
+                log: () => {},
+            }),
+        /conflicting state files/,
+    );
+    fs.unlinkSync(canonicalSidecar);
+
+    // 4. Live tick migrates legacy -> canonical, unlinks legacy, and resumes setMetadata cleanly
+    const origLog = console.log;
+    console.log = () => {};
+    try {
+        const liveRes = await runAnchorWorker({
+            uuid: AGENT_UUID,
+            tokenId: TOKEN_ID,
+            trailPath: symTrail,
+            once: true,
+            nodeClient: node,
+            signer: makeSigner(OWNER_A),
+            source: () => [],
+            log: () => {},
+        });
+        assert.equal(liveRes.anchoredSeq, 2);
+    } finally {
+        console.log = origLog;
+    }
+    assert.equal(fs.existsSync(legacySidecar), false);
+    assert.equal(fs.existsSync(canonicalSidecar), true);
+    assert.equal(JSON.parse(fs.readFileSync(canonicalSidecar, 'utf8')).pendingAnchor, null);
+});
+
+test('fetchCheckpointsAfter handles 4000+ rows with batchSize=1 iteratively and caps at high-water mark', () => {
+    const total = 4100;
+    const records = [];
+    for (let i = 1; i <= total; i += 1) {
+        records.push(makeRecord(i));
+    }
+
+    // Sync batchSize=1 over 4100 rows finishes cleanly with zero stack overflow
+    const rows = fetchCheckpointsAfter({
+        uuid: AGENT_UUID,
+        afterSeq: 0,
+        batchSize: 1,
+        execFile: (_bin, args) => {
+            const sql = args[args.length - 1];
+            if (sql.includes('MAX(o.seq)')) return `${total}\n`;
+            const m = /o\.seq > (\d+)/.exec(sql);
+            const cur = Number(m[1]);
+            if (cur >= total) return '';
+            return `${JSON.stringify(records[cur])}\n`;
+        },
+    });
+    assert.equal(rows.length, total);
+    assert.equal(rows[0].seq, 1);
+    assert.equal(rows[total - 1].seq, total);
+
+    // Concurrent rows arriving past high-water mark after page 1 are excluded until next poll
+    const extraRecord = makeRecord(5); // seq 5 arrives concurrently after high-water=4 is captured
+    const hwRows = fetchCheckpointsAfter({
+        uuid: AGENT_UUID,
+        afterSeq: 0,
+        batchSize: 2,
+        execFile: (_bin, args) => {
+            const sql = args[args.length - 1];
+            if (sql.includes('MAX(o.seq)')) return '4\n';
+            const after = Number(/o\.seq > (\d+)/.exec(sql)[1]);
+            const upperMatch = /o\.seq <= (\d+)/.exec(sql);
+            const upper = upperMatch ? Number(upperMatch[1]) : Infinity;
+            const dbRows = [...records.slice(0, 4), extraRecord];
+            return (
+                dbRows
+                    .filter((r) => r.seq > after && r.seq <= upper)
+                    .slice(0, 2)
+                    .map((r) => JSON.stringify(r))
+                    .join('\n') + '\n'
+            );
+        },
+    });
+    assert.equal(hwRows.length, 4);
+    assert.equal(hwRows[3].seq, 4);
 });

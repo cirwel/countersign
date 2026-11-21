@@ -2,6 +2,7 @@
 // countersign: register an agent, export its trail, anchor a commitment, verify.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import {
@@ -150,10 +151,22 @@ export const commands = {
     /** Write the trail's current commitment to testnet and point the registry entry at it. */
     async anchor({ trail, tx, node, nodeClient, who: providedWho, ...opts }) {
         if (!trail) throw new Error('--trail <path> is required');
+        const explicitState = opts.state ?? opts.statePath;
         const targetTrail = canonicalTrailPath(trail);
-        const resolvedStatePath = canonicalStatePath(targetTrail, opts.state ?? opts.statePath);
+        const resolvedStatePath = canonicalStatePath(targetTrail, explicitState);
+        const legacyStatePath =
+            explicitState === undefined || explicitState === null
+                ? (() => {
+                    const cand = canonicalTrailPath(`${path.resolve(trail)}.anchor-state.json`);
+                    return cand !== resolvedStatePath ? cand : null;
+                })()
+                : null;
         const trailLock = trailLockPath(targetTrail);
-        if (resolvedStatePath === targetTrail || resolvedStatePath === trailLock) {
+        if (
+            resolvedStatePath === targetTrail ||
+            resolvedStatePath === trailLock ||
+            (legacyStatePath && (legacyStatePath === targetTrail || legacyStatePath === trailLock))
+        ) {
             throw new Error(`statePath (${resolvedStatePath}) must not collide with trailPath or lockPath`);
         }
         return withFileLock(trailLock, async () => {
@@ -163,17 +176,30 @@ export const commands = {
             const { header, records } = readTrail(targetTrail);
             const tokenId = header.token_id;
             return withFileLock(tokenLockPath(tokenId, { tokenLockDir: opts.tokenLockDir }), async () => {
-                if (!tx && fs.existsSync(resolvedStatePath)) {
-                    let parsedState;
-                    try {
-                        parsedState = JSON.parse(fs.readFileSync(resolvedStatePath, 'utf8'));
-                    } catch (err) {
-                        throw new Error(`corrupt anchor state file ${resolvedStatePath}: ${err.message}`);
-                    }
-                    if (parsedState?.pendingAnchor) {
+                if (legacyStatePath && fs.existsSync(legacyStatePath) && fs.existsSync(resolvedStatePath)) {
+                    const stLegacy = fs.statSync(legacyStatePath);
+                    const stCanon = fs.statSync(resolvedStatePath);
+                    if (stLegacy.dev !== stCanon.dev || stLegacy.ino !== stCanon.ino) {
                         throw new Error(
-                            `pending anchor ${parsedState.pendingAnchor.txHash} exists in ${resolvedStatePath}; finish it with "countersign anchor --trail ${trail} --tx ${parsedState.pendingAnchor.txHash}" or "countersign watch --once" before broadcasting a new registerData`,
+                            `conflicting anchor state files exist at both legacy path (${legacyStatePath}) and canonical path (${resolvedStatePath}); resolve manually`,
                         );
+                    }
+                }
+                if (!tx) {
+                    const stateCandidates = legacyStatePath ? [resolvedStatePath, legacyStatePath] : [resolvedStatePath];
+                    for (const stateFile of stateCandidates) {
+                        if (!fs.existsSync(stateFile)) continue;
+                        let parsedState;
+                        try {
+                            parsedState = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+                        } catch (err) {
+                            throw new Error(`corrupt anchor state file ${stateFile}: ${err.message}`);
+                        }
+                        if (parsedState?.pendingAnchor) {
+                            throw new Error(
+                                `pending anchor ${parsedState.pendingAnchor.txHash} exists in ${stateFile}; finish it with "countersign anchor --trail ${trail} --tx ${parsedState.pendingAnchor.txHash}" or "countersign watch --once" before broadcasting a new registerData`,
+                            );
+                        }
                     }
                 }
 

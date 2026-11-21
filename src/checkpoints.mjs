@@ -136,15 +136,22 @@ export function parsePsqlCommand(psqlSpec, env = process.env) {
 }
 
 /** Builds a read-only SQL query over core.checkpoint_outbox joined with core.checkpoints for one agent after `afterSeq`. */
-export function buildCheckpointStreamSql({ uuid, afterSeq = 0, limit = null }) {
+export function buildCheckpointStreamSql({ uuid, afterSeq = 0, upperSeq = null, limit = null }) {
     if (typeof uuid !== 'string' || !UUID_RE.test(uuid)) {
         throw new Error(`invalid agent UUID: ${uuid}`);
     }
     if (!Number.isSafeInteger(afterSeq) || afterSeq < 0) {
         throw new Error(`afterSeq must be a non-negative safe integer, got ${afterSeq}`);
     }
+    if (upperSeq !== null && upperSeq !== undefined && (!Number.isSafeInteger(upperSeq) || upperSeq < 0)) {
+        throw new Error(`upperSeq must be a non-negative safe integer or null, got ${upperSeq}`);
+    }
     if (limit !== null && limit !== undefined && (!Number.isSafeInteger(limit) || limit <= 0)) {
         throw new Error(`limit must be a positive safe integer or null, got ${limit}`);
+    }
+    let where = `WHERE i.agent_id = '${uuid}' AND o.event_schema = 'checkpoint.recorded.v1' AND o.seq > ${afterSeq}`;
+    if (upperSeq !== null && upperSeq !== undefined) {
+        where += ` AND o.seq <= ${upperSeq}`;
     }
     const parts = [
         'SELECT json_build_object(',
@@ -158,7 +165,7 @@ export function buildCheckpointStreamSql({ uuid, afterSeq = 0, limit = null }) {
         'FROM core.checkpoint_outbox o',
         'JOIN core.checkpoints c ON c.checkpoint_id = o.event_id AND c.identity_id = o.identity_id AND c.seq = o.seq',
         'JOIN core.identities i ON i.identity_id = o.identity_id',
-        `WHERE i.agent_id = '${uuid}' AND o.event_schema = 'checkpoint.recorded.v1' AND o.seq > ${afterSeq}`,
+        where,
         'ORDER BY o.seq ASC',
     ];
     if (limit !== null && limit !== undefined) {
@@ -167,17 +174,45 @@ export function buildCheckpointStreamSql({ uuid, afterSeq = 0, limit = null }) {
     return parts.join(' ');
 }
 
-function parseAndValidateRows(raw, afterSeq, prevCheckpointId) {
-    let text;
-    if (typeof raw === 'string') {
-        text = raw;
-    } else if (Buffer.isBuffer(raw) || raw instanceof Uint8Array) {
-        text = utf8Fatal.decode(raw);
-    } else if (raw === null || raw === undefined) {
-        text = '';
-    } else {
-        throw new Error('psql output must be a string or Buffer');
+/** Builds a read-only SQL query returning the maximum outbox seq > `afterSeq` (or 0 if none). */
+export function buildCheckpointHighWaterSql({ uuid, afterSeq = 0 }) {
+    if (typeof uuid !== 'string' || !UUID_RE.test(uuid)) {
+        throw new Error(`invalid agent UUID: ${uuid}`);
     }
+    if (!Number.isSafeInteger(afterSeq) || afterSeq < 0) {
+        throw new Error(`afterSeq must be a non-negative safe integer, got ${afterSeq}`);
+    }
+    return [
+        'SELECT COALESCE(MAX(o.seq), 0)::text',
+        'FROM core.checkpoint_outbox o',
+        'JOIN core.checkpoints c ON c.checkpoint_id = o.event_id AND c.identity_id = o.identity_id AND c.seq = o.seq',
+        'JOIN core.identities i ON i.identity_id = o.identity_id',
+        `WHERE i.agent_id = '${uuid}' AND o.event_schema = 'checkpoint.recorded.v1' AND o.seq > ${afterSeq}`,
+    ].join(' ');
+}
+
+function decodePsqlText(raw) {
+    if (typeof raw === 'string') return raw;
+    if (Buffer.isBuffer(raw) || raw instanceof Uint8Array) return utf8Fatal.decode(raw);
+    if (raw === null || raw === undefined) return '';
+    throw new Error('psql output must be a string or Buffer');
+}
+
+function parseHighWaterSeq(raw) {
+    const text = decodePsqlText(raw);
+    const trimmed = text.endsWith('\n') ? text.slice(0, -1) : text;
+    if (!/^(?:0|[1-9][0-9]*)$/.test(trimmed)) {
+        throw new Error(`invalid high-water seq from psql: ${JSON.stringify(text)}`);
+    }
+    const n = Number(trimmed);
+    if (!Number.isSafeInteger(n) || n < 0) {
+        throw new Error(`high-water seq out of safe integer range: ${trimmed}`);
+    }
+    return n;
+}
+
+function parseAndValidateRows(raw, afterSeq, prevCheckpointId) {
+    const text = decodePsqlText(raw);
 
     if (text.length === 0) return [];
     const trimmed = text.endsWith('\n') ? text.slice(0, -1) : text;
@@ -261,21 +296,71 @@ export function fetchCheckpointsAfter({
         env: childEnv,
     };
 
-    const allRows = [];
-    const runBatch = (cursor, expectedPrev) => {
-        const sql = buildCheckpointStreamSql({ uuid, afterSeq: cursor, limit: batchSize });
-        const out = execFile(bin, [...psqlArgs, '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-At', '-c', sql], execOpts);
-        const handleResult = (raw) => {
-            const batch = parseAndValidateRows(raw, cursor, expectedPrev);
-            allRows.push(...batch);
-            if (batch.length < batchSize) return allRows;
-            const last = batch.at(-1);
-            return runBatch(last.seq, last.checkpoint_id);
-        };
-        if (out && typeof out.then === 'function') {
-            return out.then(handleResult);
+    const execQuery = (sql) => execFile(bin, [...psqlArgs, '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-At', '-c', sql], execOpts);
+    const isThenable = (v) => v !== null && (typeof v === 'object' || typeof v === 'function') && typeof v.then === 'function';
+
+    const appendValidatedPage = (raw, cur, expPrev, allRows, upperSeq) => {
+        const batch = parseAndValidateRows(raw, cur, expPrev);
+        if (batch.length === 0) {
+            throw new Error(`checkpoint stream ended early at seq ${cur} before high-water mark ${upperSeq}`);
         }
-        return handleResult(out);
+        allRows.push(...batch);
+        const last = batch.at(-1);
+        if (batch.length < batchSize && last.seq < upperSeq) {
+            throw new Error(`checkpoint stream gap before high-water mark ${upperSeq} (stopped at seq ${last.seq})`);
+        }
+        return { cursor: last.seq, expectedPrev: last.checkpoint_id };
     };
-    return runBatch(afterSeq, afterSeq === 0 ? null : prevCheckpointId);
+
+    const finishAsyncLoop = async (pendingBatchPromise, allRows, cursor, expectedPrev, upperSeq) => {
+        let pendingOut = pendingBatchPromise;
+        let cur = cursor;
+        let expPrev = expectedPrev;
+        while (cur < upperSeq) {
+            const raw = pendingOut !== null
+                ? await pendingOut
+                : await execQuery(buildCheckpointStreamSql({ uuid, afterSeq: cur, upperSeq, limit: batchSize }));
+            pendingOut = null;
+            ({ cursor: cur, expectedPrev: expPrev } = appendValidatedPage(raw, cur, expPrev, allRows, upperSeq));
+        }
+        return allRows;
+    };
+
+    const finishAsyncFromHighWater = async (hwPromise, allRows) => {
+        const last = allRows.at(-1);
+        const upperSeq = parseHighWaterSeq(await hwPromise);
+        if (upperSeq === 0 || upperSeq <= last.seq) return allRows;
+        return finishAsyncLoop(null, allRows, last.seq, last.checkpoint_id, upperSeq);
+    };
+
+    const finishAsyncFromPage1 = async (page1Promise) => {
+        const page1 = parseAndValidateRows(await page1Promise, afterSeq, afterSeq === 0 ? null : prevCheckpointId);
+        if (page1.length < batchSize) return page1;
+        const allRows = [...page1];
+        const last = allRows.at(-1);
+        return finishAsyncFromHighWater(execQuery(buildCheckpointHighWaterSql({ uuid, afterSeq: last.seq })), allRows);
+    };
+
+    const out1 = execQuery(buildCheckpointStreamSql({ uuid, afterSeq, limit: batchSize }));
+    if (isThenable(out1)) return finishAsyncFromPage1(out1);
+
+    const page1 = parseAndValidateRows(out1, afterSeq, afterSeq === 0 ? null : prevCheckpointId);
+    if (page1.length < batchSize) return page1;
+
+    const allRows = [...page1];
+    const last = allRows.at(-1);
+    const hwOut = execQuery(buildCheckpointHighWaterSql({ uuid, afterSeq: last.seq }));
+    if (isThenable(hwOut)) return finishAsyncFromHighWater(hwOut, allRows);
+
+    const upperSeq = parseHighWaterSeq(hwOut);
+    if (upperSeq === 0 || upperSeq <= last.seq) return allRows;
+
+    let cursor = last.seq;
+    let expectedPrev = last.checkpoint_id;
+    while (cursor < upperSeq) {
+        const out = execQuery(buildCheckpointStreamSql({ uuid, afterSeq: cursor, upperSeq, limit: batchSize }));
+        if (isThenable(out)) return finishAsyncLoop(out, allRows, cursor, expectedPrev, upperSeq);
+        ({ cursor, expectedPrev } = appendValidatedPage(out, cursor, expectedPrev, allRows, upperSeq));
+    }
+    return allRows;
 }

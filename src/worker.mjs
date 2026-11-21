@@ -90,12 +90,12 @@ export function tokenLockPath(tokenId, opts = {}) {
     return path.join(canonicalTrailPath(lockDir), `token-${REGISTRY.index}-${REGISTRY.subindex}-${tokenStr}.lock`);
 }
 
-/** Returns the existing file mode for a trail file, or 0o644 for a newly created trail. */
+/** Returns the existing file mode for a trail file, or 0o600 for a newly created trail. */
 export function trailFileMode(filePath) {
     try {
         return fs.statSync(filePath).mode & 0o777;
     } catch (err) {
-        if (err?.code === 'ENOENT') return 0o644;
+        if (err?.code === 'ENOENT') return 0o600;
         throw err;
     }
 }
@@ -463,17 +463,29 @@ export class AnchorWorker {
 
         this.uuid = uuid;
         this.tokenId = tokenStr;
+        const resolvedTrail = path.resolve(trailPath);
         const canonicalTrail = canonicalTrailPath(trailPath);
         this.trailPath = canonicalTrail;
         this.statePath = canonicalStatePath(canonicalTrail, statePath);
+        this.legacyStatePath = null;
+        if (statePath === undefined || statePath === null) {
+            const legacyCandidate = canonicalTrailPath(`${resolvedTrail}.anchor-state.json`);
+            if (legacyCandidate !== this.statePath) {
+                this.legacyStatePath = legacyCandidate;
+            }
+        }
         this.lockPath = lockPath ? canonicalTrailPath(lockPath) : trailLockPath(canonicalTrail);
         this.tokenLockPath = tokenLockPath(this.tokenId, { tokenLockDir });
-        assertDistinctPaths([
+        const distinctEntries = [
             ['trailPath', this.trailPath],
             ['statePath', this.statePath],
             ['lockPath', this.lockPath],
             ['tokenLockPath', this.tokenLockPath],
-        ]);
+        ];
+        if (this.legacyStatePath) {
+            distinctEntries.push(['legacyStatePath', this.legacyStatePath]);
+        }
+        assertDistinctPaths(distinctEntries);
 
         this.psql = psql;
         this.psqlTimeoutMs = psqlTimeoutMs;
@@ -532,22 +544,48 @@ export class AnchorWorker {
         this.lastAnchorMs = this.now() - elapsedMs;
     }
 
+    _reconcileLegacyState() {
+        if (!this.legacyStatePath) return this.statePath;
+        const legacyExists = fs.existsSync(this.legacyStatePath);
+        const canonExists = fs.existsSync(this.statePath);
+        if (legacyExists && canonExists) {
+            const stLegacy = fs.statSync(this.legacyStatePath);
+            const stCanon = fs.statSync(this.statePath);
+            if (stLegacy.dev !== stCanon.dev || stLegacy.ino !== stCanon.ino) {
+                throw new Error(
+                    `conflicting state files exist at both legacy path (${this.legacyStatePath}) and canonical path (${this.statePath}); resolve manually`,
+                );
+            }
+        }
+        if (legacyExists && !canonExists) {
+            if (this.dryRun) {
+                return this.legacyStatePath;
+            }
+            const raw = fs.readFileSync(this.legacyStatePath);
+            writeFileAtomic(this.statePath, raw, { mode: 0o600 });
+            fs.unlinkSync(this.legacyStatePath);
+            this.log(`migrated legacy state file ${this.legacyStatePath} -> ${this.statePath}`);
+        }
+        return this.statePath;
+    }
+
     _readState() {
-        if (!fs.existsSync(this.statePath)) return null;
+        const targetStatePath = this._reconcileLegacyState();
+        if (!fs.existsSync(targetStatePath)) return null;
         let parsed;
         try {
-            parsed = JSON.parse(fs.readFileSync(this.statePath, 'utf8'));
+            parsed = JSON.parse(fs.readFileSync(targetStatePath, 'utf8'));
         } catch (err) {
-            throw new Error(`corrupt anchor state file ${this.statePath}: ${err.message}`);
+            throw new Error(`corrupt anchor state file ${targetStatePath}: ${err.message}`);
         }
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-            throw new Error(`invalid anchor state file ${this.statePath}: expected JSON object`);
+            throw new Error(`invalid anchor state file ${targetStatePath}: expected JSON object`);
         }
         if (parsed.agentUuid !== undefined && parsed.agentUuid !== this.uuid) {
-            throw new Error(`state file ${this.statePath} agentUuid ${parsed.agentUuid} does not match ${this.uuid}`);
+            throw new Error(`state file ${targetStatePath} agentUuid ${parsed.agentUuid} does not match ${this.uuid}`);
         }
         if (parsed.tokenId !== undefined && String(parsed.tokenId) !== this.tokenId) {
-            throw new Error(`state file ${this.statePath} tokenId ${parsed.tokenId} does not match ${this.tokenId}`);
+            throw new Error(`state file ${targetStatePath} tokenId ${parsed.tokenId} does not match ${this.tokenId}`);
         }
         if (parsed.pendingAnchor !== undefined && parsed.pendingAnchor !== null) {
             const p = parsed.pendingAnchor;
@@ -560,13 +598,13 @@ export class AnchorWorker {
                 !TX_RE.test(p.commitment ?? '') ||
                 (p.prevAnchorTx !== null && !TX_RE.test(p.prevAnchorTx ?? ''))
             ) {
-                throw new Error(`corrupt pendingAnchor in ${this.statePath}`);
+                throw new Error(`corrupt pendingAnchor in ${targetStatePath}`);
             }
             if (p.tokenId !== undefined && String(p.tokenId) !== this.tokenId) {
                 throw new Error(`pendingAnchor tokenId ${p.tokenId} does not match ${this.tokenId}`);
             }
             if (p.metadataTx !== undefined && p.metadataTx !== null && !isTxRefObj(p.metadataTx)) {
-                throw new Error(`corrupt pendingAnchor.metadataTx in ${this.statePath}`);
+                throw new Error(`corrupt pendingAnchor.metadataTx in ${targetStatePath}`);
             }
         }
         if (parsed.trailAppend !== undefined && parsed.trailAppend !== null) {
@@ -579,7 +617,7 @@ export class AnchorWorker {
                 !Number.isSafeInteger(ta.targetSeq) ||
                 ta.targetSeq <= 0
             ) {
-                throw new Error(`corrupt trailAppend in ${this.statePath}`);
+                throw new Error(`corrupt trailAppend in ${targetStatePath}`);
             }
         }
         return parsed;
@@ -693,6 +731,7 @@ export class AnchorWorker {
 
     /** Initializes or reads/verifies the trail file, then fetches and durably appends any new checkpoints. */
     async syncTrail() {
+        this._reconcileLegacyState();
         let baseTrail;
         if (!fs.existsSync(this.trailPath)) {
             const header = checkHeader({
@@ -702,7 +741,7 @@ export class AnchorWorker {
                 token_id: this.tokenId,
                 registry: { network: NETWORK, ...REGISTRY },
             });
-            writeFileAtomic(this.trailPath, canonical(header) + '\n', { mode: 0o644 });
+            writeFileAtomic(this.trailPath, canonical(header) + '\n', { mode: 0o600 });
             baseTrail = {
                 header,
                 records: [],
@@ -810,11 +849,54 @@ export class AnchorWorker {
         const c = this.nodeClient ?? (await client());
         await assertTestnet(c);
 
-        const cs = await withRpcRetry(() => c.getConsensusStatus());
-        const tipBlockHash = cs.lastFinalizedBlock;
-        const tipBlockHeight = cs.lastFinalizedBlockHeight;
+        const loadFinalizedSnapshot = async () => {
+            const freshCs = await withRpcRetry(() => c.getConsensusStatus());
+            const freshBh = freshCs.lastFinalizedBlock;
+            const freshHeight = freshCs.lastFinalizedBlockHeight;
+            const freshAgent = await readAgentOf(this.tokenId, { blockHash: freshBh, nodeClient: c });
+            if (!freshAgent) throw new Error(`registry token ${this.tokenId} is not registered`);
+            if (freshAgent.status !== 'Active') {
+                throw new Error(`registry token ${this.tokenId} status is ${freshAgent.status ?? 'unknown'}; refusing to anchor`);
+            }
+            const freshUuid = await readMetadataText(this.tokenId, UUID_KEY, { blockHash: freshBh, nodeClient: c });
+            if (freshUuid !== this.uuid) {
+                throw new Error(`on-chain ${UUID_KEY} (${freshUuid ?? 'not set'}) does not match worker uuid ${this.uuid}`);
+            }
+            const freshCurrent = await readMetadataText(this.tokenId, ANCHOR_KEY, { blockHash: freshBh, nodeClient: c });
+            if (freshCurrent !== null && !TX_RE.test(freshCurrent)) {
+                throw new Error(`metadata ${ANCHOR_KEY} is not a transaction hash`);
+            }
+            const freshHistory = await readRegistryHistory(this.tokenId, {
+                tipBlockHash: freshBh,
+                tipBlockHeight: freshHeight,
+                agent: freshAgent,
+                hintAnchorTxHashes: freshCurrent ? [freshCurrent] : [],
+                nodeClient: c,
+            });
+            const freshExisting = await loadAnchorsFromHistory(freshHistory, c, freshHeight);
+            const freshPrev = verifyExistingAnchors(freshExisting, {
+                tokenId: this.tokenId,
+                ownerAccount: freshAgent.ownerAccount,
+                commitmentAt: this.trail.commitmentsBySeq,
+                currentPointer: freshCurrent,
+            });
+            return {
+                tipBlockHash: freshBh,
+                tipBlockHeight: freshHeight,
+                agent: freshAgent,
+                current: freshCurrent,
+                history: freshHistory,
+                existing: freshExisting,
+                prev: freshPrev,
+                remainingOwnerBudget: freshHistory.maxOwnerTxs - freshHistory.ownerNonceSpan,
+            };
+        };
 
-        const agent = await readAgentOf(this.tokenId, { blockHash: tipBlockHash, nodeClient: c });
+        const cs = await withRpcRetry(() => c.getConsensusStatus());
+        let tipBlockHash = cs.lastFinalizedBlock;
+        let tipBlockHeight = cs.lastFinalizedBlockHeight;
+
+        let agent = await readAgentOf(this.tokenId, { blockHash: tipBlockHash, nodeClient: c });
         if (!agent) throw new Error(`registry token ${this.tokenId} is not registered`);
         if (agent.status !== 'Active') {
             throw new Error(`registry token ${this.tokenId} status is ${agent.status ?? 'unknown'}; refusing to anchor`);
@@ -869,14 +951,14 @@ export class AnchorWorker {
             }
         }
 
-        const history = await readRegistryHistory(this.tokenId, {
+        let history = await readRegistryHistory(this.tokenId, {
             tipBlockHash,
             tipBlockHeight,
             agent,
             hintAnchorTxHashes: current ? [current] : [],
             nodeClient: c,
         });
-        const existing = await loadAnchorsFromHistory(history, c, tipBlockHeight);
+        let existing = await loadAnchorsFromHistory(history, c, tipBlockHeight);
         let prev = verifyExistingAnchors(existing, {
             tokenId: this.tokenId,
             ownerAccount: agent.ownerAccount,
@@ -891,6 +973,22 @@ export class AnchorWorker {
 
         let remainingOwnerBudget = history.maxOwnerTxs - history.ownerNonceSpan;
         let resumedPendingOnThisTick = false;
+
+        const applyRefreshedSnapshot = async () => {
+            const snap = await loadFinalizedSnapshot();
+            tipBlockHash = snap.tipBlockHash;
+            tipBlockHeight = snap.tipBlockHeight;
+            agent = snap.agent;
+            current = snap.current;
+            history = snap.history;
+            existing = snap.existing;
+            prev = snap.prev;
+            remainingOwnerBudget = snap.remainingOwnerBudget;
+            if (prev) {
+                this._lastSeenAnchorTxHash = prev.txHash;
+            }
+            this._syncTipFromAnchor(prev, agent.ownerAccount);
+        };
 
         if (state?.pendingAnchor) {
             let pending = state.pendingAnchor;
@@ -948,7 +1046,7 @@ export class AnchorWorker {
                         }
                     }
 
-                    const finishLandedMetadata = () => {
+                    const finishLandedMetadata = async () => {
                         const anchoredAt = this.wallClock().toISOString();
                         clearPending({
                             lastAnchoredSeq: pending.toSeq,
@@ -958,19 +1056,9 @@ export class AnchorWorker {
                         });
                         this.lastAnchorMs = this.now();
                         this.log(`resumed pending metadata tx ${metaTx.txHash} for anchor ${pending.txHash}`);
-                        current = pending.txHash;
-                        prev = {
-                            txHash: pending.txHash,
-                            tokenId: this.tokenId,
-                            toSeq: pending.toSeq,
-                            commitment: pending.commitment,
-                            prevAnchorTx: pending.prevAnchorTx,
-                            sender: pending.sender ?? agent.ownerAccount,
-                            blockTime: anchoredAt,
-                        };
-                        this._syncTipFromAnchor(prev, agent.ownerAccount);
                         metadataHandled = true;
                         resumedPendingOnThisTick = true;
+                        await applyRefreshedSnapshot();
                     };
 
                     if (metaStatus.state === 'pending' || metaStatus.state === 'committed') {
@@ -1008,7 +1096,7 @@ export class AnchorWorker {
                         if (waitSucceeded) {
                             const latestCurrent = await readMetadataText(this.tokenId, ANCHOR_KEY, { nodeClient: c });
                             if (latestCurrent === pending.txHash) {
-                                finishLandedMetadata();
+                                await finishLandedMetadata();
                             } else if (latestCurrent !== (prev?.txHash ?? null)) {
                                 this.log(`pending metadata tx ${metaTx.txHash} landed and pointer moved concurrently; clearing pending state`);
                                 clearPending();
@@ -1030,7 +1118,7 @@ export class AnchorWorker {
                         } else {
                             const latestCurrent = await readMetadataText(this.tokenId, ANCHOR_KEY, { nodeClient: c });
                             if (latestCurrent === pending.txHash) {
-                                finishLandedMetadata();
+                                await finishLandedMetadata();
                             } else if (latestCurrent !== (prev?.txHash ?? null)) {
                                 this.log(`pending metadata tx ${metaTx.txHash} landed and pointer moved concurrently; clearing pending state`);
                                 clearPending();
@@ -1049,6 +1137,7 @@ export class AnchorWorker {
                 if (!metadataHandled) {
                     let rdStatus = await getTransactionState(pending.txHash, c);
                     let pendingCleared = false;
+                    let waitedForPendingRd = false;
 
                     if (rdStatus.state === 'absent') {
                         if (finalizedChainEpochSec <= (pending.expiryEpochSeconds ?? Infinity)) {
@@ -1084,6 +1173,7 @@ export class AnchorWorker {
                         }
                         try {
                             await waitForFinalizedPolling(c, pending.txHash);
+                            waitedForPendingRd = true;
                         } catch (waitErr) {
                             if (/was rejected:/.test(waitErr.message)) {
                                 this.log(`pending registerData tx ${pending.txHash} rejected; clearing pending state`);
@@ -1104,6 +1194,9 @@ export class AnchorWorker {
 
                     if (!pendingCleared) {
                         const rd = await readRegisterData(pending.txHash, c);
+                        if (waitedForPendingRd || rd.blockHeight > Number(tipBlockHeight)) {
+                            await applyRefreshedSnapshot();
+                        }
                         const d = decodeAnchor(rd.data);
                         const expectedPrevTx = prev?.txHash ?? null;
                         const expectedCommitment = this.trail.commitmentsBySeq.get(d.toSeq)?.toString('hex');
@@ -1193,7 +1286,6 @@ export class AnchorWorker {
                                 onSigned: onMetadataSigned,
                                 expectedNonce: expectedSetNonce,
                             });
-                            remainingOwnerBudget -= 1;
                             resumedPendingOnThisTick = true;
                             const anchoredAt = this.wallClock().toISOString();
                             clearPending({
@@ -1204,17 +1296,7 @@ export class AnchorWorker {
                             });
                             this.lastAnchorMs = this.now();
                             this.log(`resumed pending anchor seq 1..${d.toSeq}: ${EXPLORER_TX(pending.txHash)}`);
-                            current = pending.txHash;
-                            prev = {
-                                txHash: pending.txHash,
-                                tokenId: this.tokenId,
-                                toSeq: d.toSeq,
-                                commitment: d.commitment,
-                                prevAnchorTx: d.prevAnchorTx,
-                                sender: rd.sender,
-                                blockTime: rd.blockTime ?? anchoredAt,
-                            };
-                            this._syncTipFromAnchor(prev, agent.ownerAccount);
+                            await applyRefreshedSnapshot();
                         }
                     }
                 }
