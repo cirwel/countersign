@@ -2878,6 +2878,19 @@ test('refresh re-seeds --every-seconds timer on newer chain anchor and parseHigh
         await hlW.syncTrail();
         assert.equal(fs.existsSync(legacyS), false);
         assert.equal(fs.statSync(canonS).mode & 0o777, 0o600);
+
+        // Chained canonical -> legacy -> target symlink preserves state at canonical path before unlinking legacy symlink
+        fs.unlinkSync(canonS);
+        const chainTarget = path.join(hlDir, 'chain-target.json');
+        fs.writeFileSync(chainTarget, JSON.stringify({ version: 1, agentUuid: AGENT_UUID, tokenId: TOKEN_ID, lastAnchoredSeq: 2 }), { mode: 0o600 });
+        fs.chmodSync(chainTarget, 0o600);
+        fs.symlinkSync(chainTarget, legacyS);
+        fs.symlinkSync(legacyS, canonS);
+        await hlW.syncTrail();
+        assert.equal(fs.existsSync(legacyS), false);
+        assert.equal(fs.existsSync(chainTarget), true);
+        assert.equal(hlW._readState().lastAnchoredSeq, 2);
+        assert.equal(fs.statSync(canonS).mode & 0o777, 0o600);
     }
 });
 

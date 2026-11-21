@@ -575,8 +575,7 @@ export class AnchorWorker {
                 }
             }
             if (!this.dryRun) {
-                const needsPrivateRewrite = (stCanon.mode & 0o777) !== 0o600 || (sameInode && !fs.lstatSync(this.legacyStatePath).isSymbolicLink());
-                if (needsPrivateRewrite) {
+                if ((stCanon.mode & 0o777) !== 0o600 || sameInode) {
                     writeFileAtomic(this.statePath, canonRaw, { mode: 0o600 });
                 }
                 fs.unlinkSync(this.legacyStatePath);
