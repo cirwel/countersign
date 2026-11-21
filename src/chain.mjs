@@ -81,17 +81,17 @@ function isNotFoundError(err) {
     return err?.code === 'NOT_FOUND' || err?.code === 5;
 }
 
-export async function withRpcRetry(fn, { maxRetries = 4, baseDelayMs = 1000, deadlineMs, onBackoff } = {}) {
+export async function withRpcRetry(fn, { maxRetries = 4, baseDelayMs = 1000, deadlineMs, now = () => performance.now(), onBackoff } = {}) {
     let attempt = 0;
     while (true) {
         try {
             return await fn();
         } catch (err) {
             if (!isTransientRpcError(err) || attempt >= maxRetries) throw err;
-            if (deadlineMs !== undefined && Date.now() >= deadlineMs) throw err;
+            if (deadlineMs !== undefined && now() >= deadlineMs) throw err;
             let delay = Math.round(baseDelayMs * 2 ** attempt * (0.85 + 0.3 * Math.random()));
             if (deadlineMs !== undefined) {
-                const rem = deadlineMs - Date.now();
+                const rem = deadlineMs - now();
                 if (rem <= 0) throw err;
                 delay = Math.min(delay, rem);
             }
@@ -341,16 +341,16 @@ export function loadSigner() {
     return { address: k.accountAddress, sender: AccountAddress.fromBase58(k.accountAddress), signer: buildBasicAccountSigner(signKey) };
 }
 
-async function waitForFinalizedPolling(c, hash, { timeoutMs = 180000, pollIntervalMs = 2000 } = {}) {
-    const deadline = Date.now() + timeoutMs;
+async function waitForFinalizedPolling(c, hash, { timeoutMs = 180000, pollIntervalMs = 2000, now = () => performance.now() } = {}) {
+    const deadline = now() + timeoutMs;
     const timeoutErr = () => new Error(`transaction ${hash} did not finalize within ${timeoutMs}ms`);
     while (true) {
-        const remaining = deadline - Date.now();
+        const remaining = deadline - now();
         if (remaining <= 0) throw timeoutErr();
         const retryOpts =
             remaining <= 1500
-                ? { maxRetries: 0, baseDelayMs: 0, deadlineMs: deadline }
-                : { maxRetries: 2, baseDelayMs: Math.min(500, Math.max(1, Math.floor(remaining / 4))), deadlineMs: deadline };
+                ? { maxRetries: 0, baseDelayMs: 0, deadlineMs: deadline, now }
+                : { maxRetries: 2, baseDelayMs: Math.min(500, Math.max(1, Math.floor(remaining / 4))), deadlineMs: deadline, now };
         let timer;
         let status;
         try {
@@ -363,7 +363,7 @@ async function waitForFinalizedPolling(c, hash, { timeoutMs = 180000, pollInterv
         } finally {
             clearTimeout(timer);
         }
-        if (Date.now() >= deadline) throw timeoutErr();
+        if (now() >= deadline) throw timeoutErr();
         if (status.status === 'finalized') {
             const summary = status.outcome?.summary;
             if (!summary) throw new Error(`transaction ${hash} finalized without outcome summary`);
@@ -372,7 +372,7 @@ async function waitForFinalizedPolling(c, hash, { timeoutMs = 180000, pollInterv
             }
             return { hash: hash.toString(), summary };
         }
-        const afterPollRemaining = deadline - Date.now();
+        const afterPollRemaining = deadline - now();
         if (afterPollRemaining <= 0) throw timeoutErr();
         await sleep(Math.min(pollIntervalMs, Math.max(1, afterPollRemaining)));
     }

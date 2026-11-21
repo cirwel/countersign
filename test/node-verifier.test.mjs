@@ -1471,6 +1471,33 @@ test('enforces wall-clock timeout even when in-flight getBlockItemStatus resolve
     }
 });
 
+test('rejects via post-race monotonic deadline check when clock expires before synchronous finalized return', async () => {
+    const s = buildScenario({ anchorHeights: [], anchorToSeqs: [] });
+    const expiredNode = createMockNode({ tipHeight: 60000n, agent: s.agent });
+    const origGetStatus = expiredNode.getBlockItemStatus.bind(expiredNode);
+    let t = 0;
+    expiredNode.getBlockItemStatus = async (txHash) => {
+        t = 30; // advances past timeoutMs = 25 synchronously before timer fires
+        return origGetStatus(txHash);
+    };
+    const origLog = console.log;
+    console.log = () => {};
+    try {
+        const who = {
+            address: OWNER_A,
+            sender: AccountAddress.fromBase58(OWNER_A),
+            signer: (await import('@concordium/web-sdk')).buildBasicAccountSigner(crypto.randomBytes(32).toString('hex')),
+        };
+        await assert.rejects(
+            () => sendSetMetadata(TOKEN_ID, 'k', 'v', who, expiredNode, { pollIntervalMs: 10, timeoutMs: 25, now: () => t }),
+            /did not finalize within 25ms/,
+        );
+    } finally {
+        console.log = origLog;
+        fs.rmSync(s.dir, { recursive: true });
+    }
+});
+
 test('cancels getInstanceState stream immediately on first matching operator key without retrying', async () => {
     const s = buildScenario({
         agentOwner: LIVE_OWNER_WITH_OP,
