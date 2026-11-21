@@ -260,7 +260,7 @@ function createMockNode({
                 for (const nc of nonceChanges) {
                     if (isSameAccount(nc.sender, acct.address)) count += 1n;
                 }
-                return { nonce: { value: count } };
+                return { nonce: { value: count }, allFinal: true };
             }, acct.address);
         },
         async getInstanceInfo(_addr, bh) {
@@ -358,6 +358,7 @@ function createMockNode({
             const entry = { hashHex, payload: signed.payload, sender: signed.header.sender.address };
             this.submitted.push(entry);
             if (onSendTransaction) await onSendTransaction(entry, this);
+            nonceChanges.push({ sender: entry.sender, height: tipHeight });
 
             if (signed.payload?.type === 21) {
                 const dataBuf = Buffer.from(signed.payload.data.data);

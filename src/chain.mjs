@@ -14,6 +14,7 @@ import {
     Parameter,
     ReceiveName,
     ReturnValue,
+    SequenceNumber,
     Transaction,
     TransactionHash,
     buildBasicAccountSigner,
@@ -34,6 +35,10 @@ import { decodeAnchor } from './trail.mjs';
 
 export { TESTNET_GENESIS };
 export const EXPLORER_TX = (hash) => `https://ccdexplorer.io/testnet/transaction/${hash}`;
+export const UUID_KEY = 'unitares.agent_uuid';
+export const ANCHOR_KEY = 'countersign.anchor';
+export const TX_RE = /^[0-9a-f]{64}$/;
+const utf8Fatal = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 const DEFAULT_NODE_HOST = 'grpc.testnet.concordium.com';
 const DEFAULT_NODE_PORT = 20000;
 const DEFAULT_RPC_TIMEOUT_MS = 30000;
@@ -269,6 +274,14 @@ export function configureNode(opts) {
     return effectiveNodeConfig();
 }
 
+/** Applies CLI/worker node and TLS options to the shared node configuration when specified. */
+export function applyNodeOptions(node, nodeInsecure) {
+    if (!node && !nodeInsecure) return;
+    const cfg = typeof node === 'string' ? { host: node } : (node && typeof node === 'object' ? { ...node } : {});
+    if (nodeInsecure) cfg.tls = false;
+    configureNode(cfg);
+}
+
 /** Instantiates a ConcordiumGRPCNodeClient for the configured endpoint without issuing RPCs yet. */
 export function createGrpcClient(cfg = effectiveNodeConfig()) {
     const creds = cfg.tls ? credentials.createSsl() : credentials.createInsecure();
@@ -341,9 +354,11 @@ export function loadSigner() {
     return { address: k.accountAddress, sender: AccountAddress.fromBase58(k.accountAddress), signer: buildBasicAccountSigner(signKey) };
 }
 
-async function waitForFinalizedPolling(c, hash, { timeoutMs = 180000, pollIntervalMs = 2000, now = () => performance.now() } = {}) {
+export async function waitForFinalizedPolling(c, hash, { timeoutMs = 180000, pollIntervalMs = 2000, now = () => performance.now() } = {}) {
+    const txObj = typeof hash === 'string' ? TransactionHash.fromHexString(hash) : hash;
+    const txLabel = typeof hash === 'string' ? hash : hash.toString();
     const deadline = now() + timeoutMs;
-    const timeoutErr = () => new Error(`transaction ${hash} did not finalize within ${timeoutMs}ms`);
+    const timeoutErr = () => new Error(`transaction ${txLabel} did not finalize within ${timeoutMs}ms`);
     while (true) {
         const remaining = deadline - now();
         if (remaining <= 0) throw timeoutErr();
@@ -355,7 +370,7 @@ async function waitForFinalizedPolling(c, hash, { timeoutMs = 180000, pollInterv
         let status;
         try {
             status = await Promise.race([
-                withRpcRetry(() => c.getBlockItemStatus(hash), retryOpts),
+                withRpcRetry(() => c.getBlockItemStatus(txObj), retryOpts),
                 new Promise((_, reject) => {
                     timer = setTimeout(() => reject(timeoutErr()), remaining);
                 }),
@@ -364,13 +379,13 @@ async function waitForFinalizedPolling(c, hash, { timeoutMs = 180000, pollInterv
             clearTimeout(timer);
         }
         if (now() >= deadline) throw timeoutErr();
-        if (status.status === 'finalized') {
+        if (status?.status === 'finalized') {
             const summary = status.outcome?.summary;
-            if (!summary) throw new Error(`transaction ${hash} finalized without outcome summary`);
+            if (!summary) throw new Error(`transaction ${txLabel} finalized without outcome summary`);
             if (summary.transactionType === 'failed' || summary.rejectReason) {
-                throw new Error(`transaction ${hash} was rejected: ${JSON.stringify(summary.rejectReason ?? summary, bigintSafe)}`);
+                throw new Error(`transaction ${txLabel} was rejected: ${JSON.stringify(summary.rejectReason ?? summary, bigintSafe)}`);
             }
-            return { hash: hash.toString(), summary };
+            return { hash: txLabel, summary };
         }
         const afterPollRemaining = deadline - now();
         if (afterPollRemaining <= 0) throw timeoutErr();
@@ -378,15 +393,57 @@ async function waitForFinalizedPolling(c, hash, { timeoutMs = 180000, pollInterv
     }
 }
 
-async function signSendWait(builder, who, nodeClient, pollOpts) {
+/** Inspects a transaction's current node state ('absent', 'pending', 'committed', or 'finalized'). */
+export async function getTransactionState(txHash, nodeClient) {
     const c = nodeClient ?? (await client());
     await assertTestnet(c);
-    const { nonce } = await withRpcRetry(() => c.getNextAccountNonce(who.sender));
-    const tx = builder.addMetadata({ sender: who.sender, nonce }).build();
+    const txObj = typeof txHash === 'string' ? TransactionHash.fromHexString(txHash) : txHash;
+    let status;
+    try {
+        status = await withRpcRetry(() => c.getBlockItemStatus(txObj));
+    } catch (err) {
+        if (isNotFoundError(err)) return { state: 'absent' };
+        throw err;
+    }
+    if (!status) return { state: 'absent' };
+    if (status.status === 'received') return { state: 'pending' };
+    if (status.status === 'committed') return { state: 'committed' };
+    if (status.status === 'finalized') {
+        return {
+            state: 'finalized',
+            summary: status.outcome?.summary,
+            blockHash: status.outcome?.blockHash,
+        };
+    }
+    throw new Error(`unexpected block item status for ${txHash}: ${status.status}`);
+}
+
+async function signSendWait(builder, who, nodeClient, pollOpts = {}) {
+    const { onSigned, expectedNonce, ...waitOpts } = pollOpts ?? {};
+    const c = nodeClient ?? (await client());
+    await assertTestnet(c);
+    const next = await withRpcRetry(() => c.getNextAccountNonce(who.sender));
+    let txNonce = next.nonce;
+    if (expectedNonce !== undefined && expectedNonce !== null) {
+        const exp = BigInt(expectedNonce);
+        const nextVal = BigInt(next.nonce?.value ?? next.nonce);
+        if (next.allFinal !== true || nextVal !== exp) {
+            throw new Error(
+                `owner nonce CAS failed for ${who.address}: expected finalized nonce ${exp}, got ${nextVal} (allFinal=${next.allFinal})`,
+            );
+        }
+        txNonce = SequenceNumber.create(exp);
+    }
+    const tx = builder.addMetadata({ sender: who.sender, nonce: txNonce }).build();
     const signed = await Transaction.signAndFinalize(tx, who.signer);
+    const txHash = Buffer.from(Transaction.getAccountTransactionHash(signed)).toString('hex');
+    const expiryEpochSeconds = Number(signed.header?.expiry?.expiryEpochSeconds ?? 0);
+    if (onSigned) {
+        await onSigned({ txHash, expiryEpochSeconds, signed });
+    }
     const hash = await c.sendTransaction(signed);
     console.log('submitted tx:', hash.toString());
-    return waitForFinalizedPolling(c, hash, pollOpts);
+    return waitForFinalizedPolling(c, hash, waitOpts);
 }
 
 export const bigintSafe = (_k, v) => (typeof v === 'bigint' ? v.toString() : v);
@@ -511,7 +568,7 @@ export async function readRegisterData(txHash, nodeClient) {
     const c = nodeClient ?? (await client());
     await assertTestnet(c);
     const status = await withRpcRetry(() => c.getBlockItemStatus(TransactionHash.fromHexString(txHash)));
-    if (status.status !== 'finalized') throw new Error(`transaction ${txHash} is not finalized (${status.status})`);
+    if (!status || status.status !== 'finalized') throw new Error(`transaction ${txHash} is not finalized (${status?.status ?? 'absent'})`);
     const s = status.outcome.summary;
     if (s.transactionType !== 'registerData') throw new Error(`transaction ${txHash} is ${s.transactionType}, not registerData`);
     const block = await withRpcRetry(() => c.getBlockInfo(status.outcome.blockHash));
@@ -905,7 +962,8 @@ export async function readRegistryHistory(
     };
 
     // 5. Check owner (and admin if distinct) nonce span BEFORE following hint links.
-    await checkAccountNonceSpan(ownerAddr, maxOwnerTxs, 'owner');
+    const ownerNonceSpanCheck = await checkAccountNonceSpan(ownerAddr, maxOwnerTxs, 'owner');
+    const ownerNonceSpan = Number(ownerNonceSpanCheck.nEnd - ownerNonceSpanCheck.nStart);
     if (adminAddr) await checkAccountNonceSpan(adminAddr, maxAdminTxs, 'admin');
 
     // 6. Follow hintAnchorTxHashes / prevAnchorTx links (bounded & owner/token/height-validated) to get split hints.
@@ -1015,6 +1073,57 @@ export async function readRegistryHistory(
         mintTxHash: mintHit.txHash,
         owner,
         scannedBlocks: discoveredHeights.length,
+        ownerNonceSpan,
+        maxOwnerTxs,
         events: collected,
     };
+}
+
+export const chainIsUnbroken = (anchors) => anchors.every((a, i) => a.prevAnchorTx === (i === 0 ? null : anchors[i - 1].txHash));
+export const coverageGrows = (anchors) => anchors.every((a, i) => a.toSeq > (i === 0 ? 0 : anchors[i - 1].toSeq));
+
+/** Loads and decodes every register-data anchor transaction referenced in MetadataSet history. */
+export async function loadAnchorsFromHistory(history, nodeClient, tipBlockHeight) {
+    const pointers = history.events.filter((e) => e.key === ANCHOR_KEY);
+    const pool = createRpcPool(5);
+    return pool.map(pointers, async (p) => {
+        const txHash = utf8Fatal.decode(p.value);
+        if (!TX_RE.test(txHash)) {
+            throw new Error(`the pointer was once set to a value that is not a transaction hash (in ${p.txHash})`);
+        }
+        const tx = await readRegisterData(txHash, nodeClient);
+        if (tipBlockHeight !== undefined && tx.blockHeight > Number(tipBlockHeight)) {
+            throw new Error(`anchor transaction ${txHash} at block ${tx.blockHeight} is after pinned tip block ${tipBlockHeight}`);
+        }
+        return {
+            txHash,
+            ...decodeAnchor(tx.data),
+            sender: tx.sender,
+            blockTime: tx.blockTime,
+            blockHeight: tx.blockHeight,
+        };
+    });
+}
+
+/** Verifies chain continuity, ownership, trail commitments, and current pointer alignment across existing anchors. */
+export function verifyExistingAnchors(existing, { tokenId, ownerAccount, commitmentAt, currentPointer }) {
+    if (!chainIsUnbroken(existing) || !coverageGrows(existing)) {
+        throw new Error('the existing anchors do not form one chain; refusing to add to it');
+    }
+    const getCommitment = typeof commitmentAt === 'function' ? commitmentAt : (seq) => commitmentAt.get(seq);
+    for (const a of existing) {
+        if (!isSameAccount(a.sender, ownerAccount) || a.tokenId !== tokenId) {
+            throw new Error(`existing anchor ${a.txHash} does not belong to owner ${ownerAccount} / token ${tokenId}`);
+        }
+        const got = getCommitment(a.toSeq);
+        const gotHex = Buffer.isBuffer(got) ? got.toString('hex') : got;
+        if (gotHex !== a.commitment) {
+            throw new Error(`this trail does not match the anchor covering records 1..${a.toSeq} (${a.txHash}); refusing to anchor`);
+        }
+    }
+    const prev = existing.at(-1) ?? null;
+    if (currentPointer !== (prev?.txHash ?? null)) {
+        throw new Error('the current pointer is not the last one in the event history yet; retry shortly');
+    }
+    return prev;
 }

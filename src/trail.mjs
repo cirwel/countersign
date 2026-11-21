@@ -91,13 +91,11 @@ export function commitments(header, records, wanted = new Set()) {
 }
 
 /**
- * Reads a trail file and insists that it is byte-for-byte in canonical form: every line must equal the
- * canonical serialization of what it parses to. That rules out duplicate keys, reordered keys, alternate
- * number spellings, blank lines and carriage returns, so two files that verify are the same bytes.
+ * Decodes and validates raw trail bytes, insisting on strict UTF-8 and byte-for-byte canonical JSON lines.
  */
-export function readTrail(file) {
+export function parseTrailBuffer(bytes) {
     // Fatal decoding: bytes that are not valid UTF-8 are an error, never silently replaced.
-    const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(fs.readFileSync(file));
+    const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
     if (!text.endsWith('\n')) throw new Error('trail file must end with a newline');
     const lines = text.slice(0, -1).split('\n');
     const values = lines.map((line, i) => {
@@ -113,9 +111,22 @@ export function readTrail(file) {
     return { header: checkHeader(values[0]), records: values.slice(1) };
 }
 
+/**
+ * Reads a trail file and insists that it is byte-for-byte in canonical form: every line must equal the
+ * canonical serialization of what it parses to. That rules out duplicate keys, reordered keys, alternate
+ * number spellings, blank lines and carriage returns, so two files that verify are the same bytes.
+ */
+export function readTrail(file) {
+    return parseTrailBuffer(fs.readFileSync(file));
+}
+
+/** Serializes a canonical trail header and records to newline-terminated canonical JSONL text. */
+export function serializeTrail(header, records) {
+    return [canonical(checkHeader(header)), ...records.map(canonical)].join('\n') + '\n';
+}
+
 export function writeTrail(file, header, records) {
-    const out = [canonical(checkHeader(header)), ...records.map(canonical)].join('\n') + '\n';
-    fs.writeFileSync(file, out);
+    fs.writeFileSync(file, serializeTrail(header, records));
 }
 
 const u64 = (n) => {

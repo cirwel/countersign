@@ -1,0 +1,1608 @@
+// Crash-safe, stream-driven automatic anchoring worker for Countersign.
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {
+    ANCHOR_KEY,
+    EXPLORER_TX,
+    TX_RE,
+    UUID_KEY,
+    applyNodeOptions,
+    assertTestnet,
+    client,
+    getTransactionState,
+    isSameAccount,
+    loadAnchorsFromHistory,
+    loadSigner,
+    readAgentOf,
+    readMetadataText,
+    readRegisterData,
+    readRegistryHistory,
+    sendRegisterData,
+    sendSetMetadata,
+    verifyExistingAnchors,
+    waitForFinalizedPolling,
+    withRpcRetry,
+} from './chain.mjs';
+import { UUID_RE, fetchCheckpointsAfter } from './checkpoints.mjs';
+import { NETWORK, REGISTRY } from './registry.mjs';
+import {
+    SCHEMA,
+    canonical,
+    checkHeader,
+    checkRecord,
+    commitments,
+    decodeAnchor,
+    encodeAnchor,
+    genesisHash,
+    parseTrailBuffer,
+    readTrail,
+    serializeTrail,
+    stepHash,
+} from './trail.mjs';
+
+function isPidAlive(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (err) {
+        if (err && err.code === 'EPERM') return true;
+        if (err && err.code === 'ESRCH') return false;
+        throw err;
+    }
+}
+
+/** Resolves the canonical filesystem path for a trail file even before the file or leaf directories exist. */
+export function canonicalTrailPath(trailPath) {
+    const abs = path.resolve(trailPath);
+    let cur = abs;
+    const suffix = [];
+    while (!fs.existsSync(cur)) {
+        const parent = path.dirname(cur);
+        if (parent === cur) break;
+        suffix.unshift(path.basename(cur));
+        cur = parent;
+    }
+    const realBase = fs.existsSync(cur) ? fs.realpathSync(cur) : cur;
+    return suffix.length > 0 ? path.join(realBase, ...suffix) : realBase;
+}
+
+/** Returns the canonical exclusive lockfile path derived from the canonical trail file path. */
+export function trailLockPath(trailPath) {
+    return `${canonicalTrailPath(trailPath)}.lock`;
+}
+
+/** Resolves the canonical anchor-state path for a trail file and optional override. */
+export function canonicalStatePath(trailPath, statePath) {
+    const canonicalTrail = canonicalTrailPath(trailPath);
+    return statePath ? canonicalTrailPath(statePath) : `${canonicalTrail}.anchor-state.json`;
+}
+
+/** Returns the per-token exclusive lockfile path under COUNTERSIGN_LOCK_DIR or ~/.config/countersign/locks. */
+export function tokenLockPath(tokenId, opts = {}) {
+    const tokenStr = tokenId === undefined || tokenId === null ? '' : String(tokenId);
+    if (!/^[0-9]+$/.test(tokenStr)) {
+        throw new Error(`invalid tokenId for tokenLockPath: ${tokenId}`);
+    }
+    const lockDir = opts.tokenLockDir ?? process.env.COUNTERSIGN_LOCK_DIR ?? path.join(os.homedir(), '.config', 'countersign', 'locks');
+    fs.mkdirSync(lockDir, { mode: 0o700, recursive: true });
+    return path.join(canonicalTrailPath(lockDir), `token-${REGISTRY.index}-${REGISTRY.subindex}-${tokenStr}.lock`);
+}
+
+/** Resolves parent directories canonically while preserving the leaf filename (safe for leaf symlinks). */
+export function canonicalParentFilePath(filePath) {
+    const abs = path.resolve(filePath);
+    return path.join(canonicalTrailPath(path.dirname(abs)), path.basename(abs));
+}
+
+/** Resolves any legacy non-canonical sidecar path beside a symlinked trail when statePath is omitted. */
+export function legacySidecarPath(trailPath, resolvedCanonicalStatePath) {
+    const absTrail = path.resolve(trailPath);
+    const cand = canonicalParentFilePath(`${absTrail}.anchor-state.json`);
+    return cand !== canonicalParentFilePath(resolvedCanonicalStatePath) ? cand : null;
+}
+
+/** Returns the existing file mode for a trail file, or 0o600 for a newly created trail. */
+export function trailFileMode(filePath) {
+    try {
+        return fs.statSync(filePath).mode & 0o777;
+    } catch (err) {
+        if (err?.code === 'ENOENT') return 0o600;
+        throw err;
+    }
+}
+
+function assertDistinctPaths(entries) {
+    for (let i = 0; i < entries.length; i += 1) {
+        for (let j = i + 1; j < entries.length; j += 1) {
+            const [labelA, pathA] = entries[i];
+            const [labelB, pathB] = entries[j];
+            if (pathA === pathB) {
+                throw new Error(`${labelA} (${pathA}) must not collide with ${labelB}`);
+            }
+            if (fs.existsSync(pathA) && fs.existsSync(pathB)) {
+                const stA = fs.statSync(pathA);
+                const stB = fs.statSync(pathB);
+                if (stA.dev === stB.dev && stA.ino === stB.ino) {
+                    throw new Error(`${labelA} (${pathA}) and ${labelB} (${pathB}) resolve to the same file inode`);
+                }
+            }
+        }
+    }
+}
+
+/** Atomically writes bytes or UTF-8 string via same-directory temp file + fsync + chmod + rename. */
+export function writeFileAtomic(filePath, content, { mode = 0o600 } = {}) {
+    const dir = path.dirname(filePath);
+    fs.mkdirSync(dir, { recursive: true });
+    const tmpPath = path.join(dir, `.${path.basename(filePath)}.tmp.${process.pid}.${crypto.randomUUID()}`);
+    const fd = fs.openSync(tmpPath, 'w', mode);
+    try {
+        const buf = typeof content === 'string' ? Buffer.from(content, 'utf8') : Buffer.from(content);
+        let offset = 0;
+        while (offset < buf.length) {
+            offset += fs.writeSync(fd, buf, offset, buf.length - offset);
+        }
+        fs.fchmodSync(fd, mode);
+        fs.fsyncSync(fd);
+    } catch (err) {
+        try {
+            fs.closeSync(fd);
+        } catch {}
+        try {
+            fs.unlinkSync(tmpPath);
+        } catch {}
+        throw err;
+    }
+    fs.closeSync(fd);
+    try {
+        fs.renameSync(tmpPath, filePath);
+    } catch (err) {
+        try {
+            fs.unlinkSync(tmpPath);
+        } catch {}
+        throw err;
+    }
+    try {
+        const dirFd = fs.openSync(dir, 'r');
+        try {
+            fs.fsyncSync(dirFd);
+        } finally {
+            fs.closeSync(dirFd);
+        }
+    } catch {}
+}
+
+function acquireTakeoverDir(takeoverDir, staleMs) {
+    try {
+        fs.mkdirSync(takeoverDir);
+        return;
+    } catch (err) {
+        if (err?.code !== 'EEXIST') throw err;
+    }
+    let st;
+    try {
+        st = fs.statSync(takeoverDir);
+    } catch (err) {
+        if (err?.code === 'ENOENT') {
+            fs.mkdirSync(takeoverDir);
+            return;
+        }
+        throw err;
+    }
+    if (Date.now() - st.mtimeMs > staleMs) {
+        try {
+            fs.rmdirSync(takeoverDir);
+        } catch (rmErr) {
+            if (rmErr?.code !== 'ENOENT') throw rmErr;
+        }
+        fs.mkdirSync(takeoverDir);
+        return;
+    }
+    throw new Error(`stale lock takeover already in progress (${takeoverDir})`);
+}
+
+function writeLockTempFile(lockPath, lockBody) {
+    const dir = path.dirname(lockPath);
+    const tmpPath = path.join(dir, `.${path.basename(lockPath)}.tmp.${process.pid}.${crypto.randomUUID()}`);
+    const fd = fs.openSync(tmpPath, 'w', 0o600);
+    try {
+        const buf = Buffer.from(lockBody, 'utf8');
+        let offset = 0;
+        while (offset < buf.length) {
+            offset += fs.writeSync(fd, buf, offset, buf.length - offset);
+        }
+        fs.fchmodSync(fd, 0o600);
+        fs.fsyncSync(fd);
+    } catch (err) {
+        try {
+            fs.closeSync(fd);
+        } catch {}
+        try {
+            fs.unlinkSync(tmpPath);
+        } catch {}
+        throw err;
+    }
+    fs.closeSync(fd);
+    return tmpPath;
+}
+
+/**
+ * Acquires an exclusive lockfile via fsynced temp file + atomic linkSync publish and mutually
+ * exclusive stale-PID takeover, running `fn` and releasing in `finally`.
+ */
+export async function withFileLock(
+    lockPath,
+    fn,
+    { wallClock = () => new Date(), hostname = os.hostname(), takeoverStaleMs = 10_000 } = {},
+) {
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    const lockBody =
+        JSON.stringify({
+            pid: process.pid,
+            host: hostname,
+            startedAt: wallClock().toISOString(),
+            token: crypto.randomUUID(),
+        }) + '\n';
+
+    const tmpPath = writeLockTempFile(lockPath, lockBody);
+
+    const tryPublish = () => {
+        fs.linkSync(tmpPath, lockPath);
+    };
+
+    const acquire = () => {
+        try {
+            tryPublish();
+            return lockBody;
+        } catch (err) {
+            if (err?.code !== 'EEXIST') throw err;
+        }
+
+        let raw;
+        try {
+            raw = fs.readFileSync(lockPath, 'utf8');
+        } catch (err) {
+            if (err?.code === 'ENOENT') {
+                try {
+                    tryPublish();
+                    return lockBody;
+                } catch (retryErr) {
+                    if (retryErr?.code === 'EEXIST') {
+                        throw new Error(`lockfile ${lockPath} is held by another worker`);
+                    }
+                    throw retryErr;
+                }
+            }
+            throw err;
+        }
+
+        let existing;
+        try {
+            existing = JSON.parse(raw);
+        } catch {
+            throw new Error(`corrupt lockfile ${lockPath}; remove manually if no worker is running`);
+        }
+        const pid = existing?.pid;
+        if (!Number.isInteger(pid) || pid <= 0) {
+            throw new Error(`invalid pid in lockfile ${lockPath}`);
+        }
+        if (existing.host && existing.host !== hostname) {
+            throw new Error(`lockfile ${lockPath} is held by host ${existing.host} (pid ${pid})`);
+        }
+        if (isPidAlive(pid)) {
+            throw new Error(`lockfile ${lockPath} is already held by active process ${pid}`);
+        }
+
+        const takeoverDir = `${lockPath}.takeover`;
+        acquireTakeoverDir(takeoverDir, takeoverStaleMs);
+        try {
+            let currentRaw;
+            try {
+                currentRaw = fs.readFileSync(lockPath, 'utf8');
+            } catch (err) {
+                if (err?.code === 'ENOENT') {
+                    try {
+                        tryPublish();
+                    } catch (linkErr) {
+                        if (linkErr?.code === 'EEXIST') {
+                            throw new Error(`lockfile ${lockPath} was claimed concurrently`);
+                        }
+                        throw linkErr;
+                    }
+                    if (fs.readFileSync(lockPath, 'utf8') !== lockBody) {
+                        throw new Error(`lockfile ${lockPath} was claimed concurrently`);
+                    }
+                    return lockBody;
+                }
+                throw err;
+            }
+            if (currentRaw !== raw) {
+                throw new Error(`lockfile ${lockPath} changed during stale takeover`);
+            }
+            if (isPidAlive(pid)) {
+                throw new Error(`lockfile ${lockPath} is already held by active process ${pid}`);
+            }
+            try {
+                fs.unlinkSync(lockPath);
+            } catch (err) {
+                if (err?.code !== 'ENOENT') throw err;
+            }
+            try {
+                tryPublish();
+            } catch (err) {
+                if (err?.code === 'EEXIST') {
+                    throw new Error(`lockfile ${lockPath} is held by another worker`);
+                }
+                throw err;
+            }
+            if (fs.readFileSync(lockPath, 'utf8') !== lockBody) {
+                throw new Error(`lockfile ${lockPath} was claimed concurrently`);
+            }
+            return lockBody;
+        } finally {
+            try {
+                fs.rmdirSync(takeoverDir);
+            } catch (err) {
+                if (err?.code !== 'ENOENT') throw err;
+            }
+        }
+    };
+
+    let acquired;
+    try {
+        acquired = acquire();
+    } finally {
+        try {
+            fs.unlinkSync(tmpPath);
+        } catch (err) {
+            if (err?.code !== 'ENOENT') throw err;
+        }
+    }
+
+    try {
+        return await fn();
+    } finally {
+        try {
+            if (fs.readFileSync(lockPath, 'utf8') === acquired) {
+                fs.unlinkSync(lockPath);
+            }
+        } catch (err) {
+            if (err?.code !== 'ENOENT') throw err;
+        }
+    }
+}
+
+/** Pure policy predicate determining whether unanchored records meet record-count or monotonic time thresholds. */
+export function shouldAnchor({ localSeq, anchoredSeq, lastAnchorMs, nowMs, everyRecords, everySeconds }) {
+    if (localSeq <= anchoredSeq) return false;
+    if (everyRecords !== null && everyRecords !== undefined && localSeq - anchoredSeq >= everyRecords) {
+        return true;
+    }
+    if (everySeconds !== null && everySeconds !== undefined) {
+        if (lastAnchorMs === null || lastAnchorMs === undefined) return true;
+        if (nowMs - lastAnchorMs >= everySeconds * 1000) return true;
+    }
+    return false;
+}
+
+function defaultSubmitAnchor({ data, signer, nodeClient, onSigned, expectedNonce }) {
+    const pollOpts = {};
+    if (onSigned) pollOpts.onSigned = onSigned;
+    if (expectedNonce !== undefined) pollOpts.expectedNonce = expectedNonce;
+    return sendRegisterData(data, signer, nodeClient, Object.keys(pollOpts).length > 0 ? pollOpts : undefined).then((res) => ({
+        txHash: res.hash,
+        sender: signer.address,
+    }));
+}
+
+function validateEveryRecords(val) {
+    if (val === undefined || val === null) return null;
+    if (!Number.isSafeInteger(val) || val <= 0) {
+        throw new Error(`everyRecords must be a positive safe integer or null, got ${val}`);
+    }
+    return val;
+}
+
+function validatePositiveNumber(val, name, allowNull = false) {
+    if (allowNull && (val === undefined || val === null)) return null;
+    if (typeof val !== 'number' || !Number.isFinite(val) || val <= 0) {
+        throw new Error(`${name} must be a positive finite number, got ${val}`);
+    }
+    return val;
+}
+
+function isTxRefObj(v) {
+    return (
+        v !== null &&
+        typeof v === 'object' &&
+        !Array.isArray(v) &&
+        TX_RE.test(v.txHash ?? '') &&
+        (v.expiryEpochSeconds === undefined ||
+            v.expiryEpochSeconds === null ||
+            (typeof v.expiryEpochSeconds === 'number' && Number.isFinite(v.expiryEpochSeconds) && v.expiryEpochSeconds >= 0))
+    );
+}
+
+/**
+ * Stream-driven worker that incrementally syncs UNITARES checkpoints into a canonical trail file
+ * and submits crash-recoverable Concordium testnet anchors when configured thresholds are reached.
+ */
+export class AnchorWorker {
+    constructor(opts = {}) {
+        const {
+            uuid,
+            tokenId,
+            trailPath,
+            statePath,
+            lockPath,
+            tokenLockDir,
+            psql,
+            psqlTimeoutMs = 30000,
+            psqlBatchSize = 5000,
+            everyRecords = null,
+            everySeconds = null,
+            pollSeconds = 15,
+            maxBackoffSeconds = 300,
+            dryRun = false,
+            once = false,
+            node,
+            nodeInsecure = false,
+            nodeClient = null,
+            signer = null,
+            loadSignerFn = loadSigner,
+            source,
+            submitAnchor = defaultSubmitAnchor,
+            setMetadata = sendSetMetadata,
+            now = () => performance.now(),
+            wallClock = () => new Date(),
+            sleep,
+            random = Math.random,
+            log = console.log,
+            signal,
+        } = opts;
+
+        if (typeof uuid !== 'string' || !UUID_RE.test(uuid)) {
+            throw new Error(`invalid agent UUID: ${uuid}`);
+        }
+        const tokenStr = tokenId === undefined || tokenId === null ? '' : String(tokenId);
+        if (!/^[0-9]+$/.test(tokenStr) || BigInt(tokenStr) > 0xffffffffffffffffn) {
+            throw new Error(`invalid tokenId: ${tokenId}`);
+        }
+        if (typeof trailPath !== 'string' || trailPath.trim().length === 0) {
+            throw new Error('trailPath must be a non-empty string');
+        }
+
+        this.uuid = uuid;
+        this.tokenId = tokenStr;
+        const canonicalTrail = canonicalTrailPath(trailPath);
+        this.trailPath = canonicalTrail;
+        this.statePath = canonicalStatePath(canonicalTrail, statePath);
+        this.legacyStatePath = null;
+        if (statePath === undefined || statePath === null) {
+            this.legacyStatePath = legacySidecarPath(trailPath, this.statePath);
+        }
+        this.lockPath = lockPath ? canonicalTrailPath(lockPath) : trailLockPath(canonicalTrail);
+        this.tokenLockPath = tokenLockPath(this.tokenId, { tokenLockDir });
+        assertDistinctPaths([
+            ['trailPath', this.trailPath],
+            ['statePath', this.statePath],
+            ['lockPath', this.lockPath],
+            ['tokenLockPath', this.tokenLockPath],
+        ]);
+        if (this.legacyStatePath) {
+            assertDistinctPaths([
+                ['trailPath', this.trailPath],
+                ['legacyStatePath', this.legacyStatePath],
+                ['lockPath', this.lockPath],
+                ['tokenLockPath', this.tokenLockPath],
+            ]);
+        }
+
+        this.psql = psql;
+        this.psqlTimeoutMs = psqlTimeoutMs;
+        this.psqlBatchSize = psqlBatchSize;
+        this.everyRecords = validateEveryRecords(everyRecords);
+        this.everySeconds = validatePositiveNumber(everySeconds, 'everySeconds', true);
+        this.once = Boolean(once);
+        if (!this.once && this.everyRecords === null && this.everySeconds === null) {
+            throw new Error('at least one of everyRecords or everySeconds must be set unless once is true');
+        }
+        this.pollSeconds = validatePositiveNumber(pollSeconds, 'pollSeconds', false);
+        this.maxBackoffSeconds = validatePositiveNumber(maxBackoffSeconds, 'maxBackoffSeconds', false);
+        this.dryRun = Boolean(dryRun);
+        this.nodeClient = nodeClient;
+        if (!this.nodeClient && (node || nodeInsecure)) {
+            applyNodeOptions(node, Boolean(nodeInsecure));
+        }
+        this.signer = signer;
+        this._loadSigner = loadSignerFn;
+        this.source =
+            source ??
+            ((afterSeq) =>
+                fetchCheckpointsAfter({
+                    uuid: this.uuid,
+                    afterSeq,
+                    psql: this.psql,
+                    timeoutMs: this.psqlTimeoutMs,
+                    batchSize: this.psqlBatchSize,
+                }));
+        this.submitAnchor = submitAnchor;
+        this.setMetadata = setMetadata;
+        this.now = now;
+        this.wallClock = wallClock;
+        this.customSleep = sleep ?? null;
+        this.random = random;
+        this.log = log;
+        this.signal = signal ?? null;
+
+        this.trail = null;
+        this.lastAnchorMs = null;
+        this._lastSeenAnchorTxHash = null;
+        this._verifiedTip = null;
+        this._activeCall = null;
+    }
+
+    _resolveSigner() {
+        if (!this.signer) this.signer = this._loadSigner();
+        return this.signer;
+    }
+
+    _seedLastAnchorMs(blockTimeIso) {
+        if (!blockTimeIso) return;
+        const blockMs = Date.parse(blockTimeIso);
+        if (!Number.isFinite(blockMs)) return;
+        const elapsedMs = Math.max(0, this.wallClock().getTime() - blockMs);
+        this.lastAnchorMs = this.now() - elapsedMs;
+    }
+
+    _reconcileLegacyState() {
+        if (!this.legacyStatePath) return this.statePath;
+        const legacyExists = fs.existsSync(this.legacyStatePath);
+        const canonExists = fs.existsSync(this.statePath);
+        if (legacyExists && canonExists) {
+            const stLegacy = fs.statSync(this.legacyStatePath);
+            const stCanon = fs.statSync(this.statePath);
+            const sameInode = stLegacy.dev === stCanon.dev && stLegacy.ino === stCanon.ino;
+            const canonRaw = fs.readFileSync(this.statePath);
+            if (!sameInode) {
+                const legacyRaw = fs.readFileSync(this.legacyStatePath);
+                if (Buffer.compare(legacyRaw, canonRaw) !== 0) {
+                    throw new Error(
+                        `conflicting state files exist at both legacy path (${this.legacyStatePath}) and canonical path (${this.statePath}); resolve manually`,
+                    );
+                }
+            }
+            if (!this.dryRun) {
+                if ((stCanon.mode & 0o777) !== 0o600 || sameInode) {
+                    writeFileAtomic(this.statePath, canonRaw, { mode: 0o600 });
+                }
+                fs.unlinkSync(this.legacyStatePath);
+                this.log(`removed already-migrated legacy state file ${this.legacyStatePath}`);
+            }
+            return this.statePath;
+        }
+        if (legacyExists && !canonExists) {
+            if (this.dryRun) {
+                return this.legacyStatePath;
+            }
+            const raw = fs.readFileSync(this.legacyStatePath);
+            writeFileAtomic(this.statePath, raw, { mode: 0o600 });
+            fs.unlinkSync(this.legacyStatePath);
+            this.log(`migrated legacy state file ${this.legacyStatePath} -> ${this.statePath}`);
+        }
+        return this.statePath;
+    }
+
+    _readState() {
+        const targetStatePath = this._reconcileLegacyState();
+        if (!fs.existsSync(targetStatePath)) return null;
+        let parsed;
+        try {
+            parsed = JSON.parse(fs.readFileSync(targetStatePath, 'utf8'));
+        } catch (err) {
+            throw new Error(`corrupt anchor state file ${targetStatePath}: ${err.message}`);
+        }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            throw new Error(`invalid anchor state file ${targetStatePath}: expected JSON object`);
+        }
+        if (parsed.agentUuid !== undefined && parsed.agentUuid !== this.uuid) {
+            throw new Error(`state file ${targetStatePath} agentUuid ${parsed.agentUuid} does not match ${this.uuid}`);
+        }
+        if (parsed.tokenId !== undefined && String(parsed.tokenId) !== this.tokenId) {
+            throw new Error(`state file ${targetStatePath} tokenId ${parsed.tokenId} does not match ${this.tokenId}`);
+        }
+        if (parsed.pendingAnchor !== undefined && parsed.pendingAnchor !== null) {
+            const p = parsed.pendingAnchor;
+            if (
+                typeof p !== 'object' ||
+                Array.isArray(p) ||
+                !TX_RE.test(p.txHash ?? '') ||
+                !Number.isSafeInteger(p.toSeq) ||
+                p.toSeq <= 0 ||
+                !TX_RE.test(p.commitment ?? '') ||
+                (p.prevAnchorTx !== null && !TX_RE.test(p.prevAnchorTx ?? ''))
+            ) {
+                throw new Error(`corrupt pendingAnchor in ${targetStatePath}`);
+            }
+            if (p.tokenId !== undefined && String(p.tokenId) !== this.tokenId) {
+                throw new Error(`pendingAnchor tokenId ${p.tokenId} does not match ${this.tokenId}`);
+            }
+            if (p.metadataTx !== undefined && p.metadataTx !== null && !isTxRefObj(p.metadataTx)) {
+                throw new Error(`corrupt pendingAnchor.metadataTx in ${targetStatePath}`);
+            }
+        }
+        if (parsed.trailAppend !== undefined && parsed.trailAppend !== null) {
+            const ta = parsed.trailAppend;
+            if (
+                typeof ta !== 'object' ||
+                Array.isArray(ta) ||
+                !Number.isSafeInteger(ta.baseSize) ||
+                ta.baseSize <= 0 ||
+                !Number.isSafeInteger(ta.targetSeq) ||
+                ta.targetSeq <= 0
+            ) {
+                throw new Error(`corrupt trailAppend in ${targetStatePath}`);
+            }
+        }
+        return parsed;
+    }
+
+    _updateState(patch) {
+        const current = this._readState() ?? {};
+        const payload = {
+            version: 1,
+            agentUuid: this.uuid,
+            tokenId: this.tokenId,
+            lastAnchoredSeq: 0,
+            lastAnchoredTxHash: null,
+            lastAnchoredCommitment: null,
+            lastAnchoredAt: null,
+            pendingAnchor: null,
+            trailAppend: null,
+            ...current,
+            ...patch,
+            updatedAt: this.wallClock().toISOString(),
+        };
+        writeFileAtomic(this.statePath, JSON.stringify(payload, null, 2) + '\n', { mode: 0o600 });
+        return payload;
+    }
+
+    _assertHeaderMatchesConfig(header) {
+        const r = header.registry ?? {};
+        if (
+            header.agent_uuid !== this.uuid ||
+            header.token_id !== this.tokenId ||
+            r.network !== NETWORK ||
+            r.index !== REGISTRY.index ||
+            r.subindex !== REGISTRY.subindex
+        ) {
+            throw new Error(
+                `trail header (${header.agent_uuid}, token ${header.token_id}, ${r.network} <${r.index},${r.subindex}>) does not match worker config`,
+            );
+        }
+    }
+
+    _loadOrRecoverExistingTrail() {
+        const readAndValidate = () => {
+            const { header, records } = readTrail(this.trailPath);
+            this._assertHeaderMatchesConfig(header);
+            const wanted = new Set(records.map((_, i) => i + 1));
+            const { last, count, at } = commitments(header, records, wanted);
+            return {
+                header,
+                records,
+                lastSeq: count,
+                lastCheckpointId: records.at(-1)?.checkpoint_id ?? null,
+                commitment: last,
+                commitmentsBySeq: at,
+            };
+        };
+
+        let loaded;
+        let trailReadErr = null;
+        try {
+            loaded = readAndValidate();
+        } catch (readErr) {
+            trailReadErr = readErr;
+        }
+
+        if (!trailReadErr) {
+            const existingState = this._readState();
+            if (existingState?.trailAppend && !this.dryRun) {
+                this._updateState({ trailAppend: null });
+            }
+            return loaded;
+        }
+
+        const existingState = this._readState();
+        const ta = existingState?.trailAppend;
+        if (!ta) throw trailReadErr;
+
+        const curSize = fs.statSync(this.trailPath).size;
+        if (curSize <= ta.baseSize) throw trailReadErr;
+
+        const prefixBuf = Buffer.alloc(ta.baseSize);
+        const fd = fs.openSync(this.trailPath, 'r');
+        try {
+            let totalRead = 0;
+            while (totalRead < ta.baseSize) {
+                const n = fs.readSync(fd, prefixBuf, totalRead, ta.baseSize - totalRead, totalRead);
+                if (n === 0) break;
+                totalRead += n;
+            }
+            if (totalRead !== ta.baseSize) throw trailReadErr;
+        } finally {
+            fs.closeSync(fd);
+        }
+
+        const parsedPrefix = parseTrailBuffer(prefixBuf);
+        this._assertHeaderMatchesConfig(parsedPrefix.header);
+        commitments(parsedPrefix.header, parsedPrefix.records);
+
+        this.log(`recovering interrupted trail append: truncating ${this.trailPath} from ${curSize} to ${ta.baseSize} bytes`);
+        const truncFd = fs.openSync(this.trailPath, 'r+');
+        try {
+            fs.ftruncateSync(truncFd, ta.baseSize);
+            fs.fsyncSync(truncFd);
+        } finally {
+            fs.closeSync(truncFd);
+        }
+        if (!this.dryRun) {
+            this._updateState({ trailAppend: null });
+        }
+        return readAndValidate();
+    }
+
+    /** Initializes or reads/verifies the trail file, then fetches and durably appends any new checkpoints. */
+    async syncTrail() {
+        this._reconcileLegacyState();
+        let baseTrail;
+        if (!fs.existsSync(this.trailPath)) {
+            const header = checkHeader({
+                schema: SCHEMA,
+                source: 'unitares core.checkpoints',
+                agent_uuid: this.uuid,
+                token_id: this.tokenId,
+                registry: { network: NETWORK, ...REGISTRY },
+            });
+            writeFileAtomic(this.trailPath, canonical(header) + '\n', { mode: 0o600 });
+            baseTrail = {
+                header,
+                records: [],
+                lastSeq: 0,
+                lastCheckpointId: null,
+                commitment: genesisHash(header),
+                commitmentsBySeq: new Map(),
+            };
+        } else {
+            baseTrail = this._loadOrRecoverExistingTrail();
+        }
+
+        this.trail = {
+            header: baseTrail.header,
+            lastSeq: baseTrail.lastSeq,
+            lastCheckpointId: baseTrail.lastCheckpointId,
+            commitment: baseTrail.commitment,
+            commitmentsBySeq: baseTrail.commitmentsBySeq,
+        };
+        const rows = await this.source(baseTrail.lastSeq);
+        if (!Array.isArray(rows)) {
+            throw new Error('checkpoint source must return an array');
+        }
+        if (rows.length === 0) {
+            return { ...this.trail, added: 0 };
+        }
+
+        let nextSeq = baseTrail.lastSeq;
+        let nextCheckpointId = baseTrail.lastCheckpointId;
+        let nextCommitment = baseTrail.commitment;
+        const nextCommitments = new Map(baseTrail.commitmentsBySeq);
+        const lines = [];
+
+        for (const row of rows) {
+            nextSeq += 1;
+            checkRecord(row, nextSeq, nextCheckpointId);
+            nextCommitment = stepHash(nextCommitment, row);
+            nextCheckpointId = row.checkpoint_id;
+            nextCommitments.set(nextSeq, nextCommitment);
+            lines.push(canonical(row) + '\n');
+        }
+
+        try {
+            if (this.dryRun) {
+                const fullText = serializeTrail(baseTrail.header, [...baseTrail.records, ...rows]);
+                writeFileAtomic(this.trailPath, fullText, { mode: trailFileMode(this.trailPath) });
+            } else {
+                const payload = Buffer.from(lines.join(''), 'utf8');
+                const originalSize = fs.statSync(this.trailPath).size;
+                this._updateState({ trailAppend: { baseSize: originalSize, targetSeq: nextSeq } });
+                const fd = fs.openSync(this.trailPath, 'a');
+                try {
+                    let offset = 0;
+                    while (offset < payload.length) {
+                        offset += fs.writeSync(fd, payload, offset, payload.length - offset);
+                    }
+                    fs.fsyncSync(fd);
+                } catch (err) {
+                    try {
+                        fs.ftruncateSync(fd, originalSize);
+                    } catch {}
+                    throw err;
+                } finally {
+                    fs.closeSync(fd);
+                }
+                this._updateState({ trailAppend: null });
+            }
+            this.trail = {
+                header: baseTrail.header,
+                lastSeq: nextSeq,
+                lastCheckpointId: nextCheckpointId,
+                commitment: nextCommitment,
+                commitmentsBySeq: nextCommitments,
+            };
+            return { ...this.trail, added: rows.length };
+        } catch (err) {
+            this.trail = {
+                header: baseTrail.header,
+                lastSeq: baseTrail.lastSeq,
+                lastCheckpointId: baseTrail.lastCheckpointId,
+                commitment: baseTrail.commitment,
+                commitmentsBySeq: baseTrail.commitmentsBySeq,
+            };
+            throw err;
+        }
+    }
+
+    _syncTipFromAnchor(anchorRecord, agentOwnerAccount) {
+        this._verifiedTip = {
+            pointer: anchorRecord?.txHash ?? null,
+            ownerAccount: agentOwnerAccount,
+            anchoredSeq: anchorRecord?.toSeq ?? 0,
+            anchoredCommitment: anchorRecord?.commitment ?? null,
+        };
+        if (anchorRecord?.txHash) {
+            this._lastSeenAnchorTxHash = anchorRecord.txHash;
+        }
+    }
+
+    /** Syncs trail, reconciles chain history and pending anchors, and anchors if threshold is met. */
+    async reconcileAndAnchor() {
+        const syncResult = await this.syncTrail();
+        const state = this._readState();
+
+        const c = this.nodeClient ?? (await client());
+        await assertTestnet(c);
+
+        const loadFinalizedSnapshot = async () => {
+            const freshCs = await withRpcRetry(() => c.getConsensusStatus());
+            const freshBh = freshCs.lastFinalizedBlock;
+            const freshHeight = freshCs.lastFinalizedBlockHeight;
+            const freshAgent = await readAgentOf(this.tokenId, { blockHash: freshBh, nodeClient: c });
+            if (!freshAgent) throw new Error(`registry token ${this.tokenId} is not registered`);
+            if (freshAgent.status !== 'Active') {
+                throw new Error(`registry token ${this.tokenId} status is ${freshAgent.status ?? 'unknown'}; refusing to anchor`);
+            }
+            const freshUuid = await readMetadataText(this.tokenId, UUID_KEY, { blockHash: freshBh, nodeClient: c });
+            if (freshUuid !== this.uuid) {
+                throw new Error(`on-chain ${UUID_KEY} (${freshUuid ?? 'not set'}) does not match worker uuid ${this.uuid}`);
+            }
+            const freshCurrent = await readMetadataText(this.tokenId, ANCHOR_KEY, { blockHash: freshBh, nodeClient: c });
+            if (freshCurrent !== null && !TX_RE.test(freshCurrent)) {
+                throw new Error(`metadata ${ANCHOR_KEY} is not a transaction hash`);
+            }
+            const freshHistory = await readRegistryHistory(this.tokenId, {
+                tipBlockHash: freshBh,
+                tipBlockHeight: freshHeight,
+                agent: freshAgent,
+                hintAnchorTxHashes: freshCurrent ? [freshCurrent] : [],
+                nodeClient: c,
+            });
+            const freshExisting = await loadAnchorsFromHistory(freshHistory, c, freshHeight);
+            const freshPrev = verifyExistingAnchors(freshExisting, {
+                tokenId: this.tokenId,
+                ownerAccount: freshAgent.ownerAccount,
+                commitmentAt: this.trail.commitmentsBySeq,
+                currentPointer: freshCurrent,
+            });
+            return {
+                tipBlockHash: freshBh,
+                tipBlockHeight: freshHeight,
+                agent: freshAgent,
+                current: freshCurrent,
+                history: freshHistory,
+                existing: freshExisting,
+                prev: freshPrev,
+                remainingOwnerBudget: freshHistory.maxOwnerTxs - freshHistory.ownerNonceSpan,
+            };
+        };
+
+        const cs = await withRpcRetry(() => c.getConsensusStatus());
+        let tipBlockHash = cs.lastFinalizedBlock;
+        let tipBlockHeight = cs.lastFinalizedBlockHeight;
+
+        let agent = await readAgentOf(this.tokenId, { blockHash: tipBlockHash, nodeClient: c });
+        if (!agent) throw new Error(`registry token ${this.tokenId} is not registered`);
+        if (agent.status !== 'Active') {
+            throw new Error(`registry token ${this.tokenId} status is ${agent.status ?? 'unknown'}; refusing to anchor`);
+        }
+
+        const onChainUuid = await readMetadataText(this.tokenId, UUID_KEY, { blockHash: tipBlockHash, nodeClient: c });
+        if (onChainUuid !== this.uuid) {
+            throw new Error(`on-chain ${UUID_KEY} (${onChainUuid ?? 'not set'}) does not match worker uuid ${this.uuid}`);
+        }
+
+        let current = await readMetadataText(this.tokenId, ANCHOR_KEY, { blockHash: tipBlockHash, nodeClient: c });
+        if (current !== null && !TX_RE.test(current)) {
+            throw new Error(`metadata ${ANCHOR_KEY} is not a transaction hash`);
+        }
+
+        const localSeq = this.trail.lastSeq;
+        const noThresholds = this.everyRecords === null && this.everySeconds === null;
+
+        // Idle-poll fast path: verify cached pointer, owner, commitment, and !due before skipping history scans.
+        if (
+            this._verifiedTip !== null &&
+            !state?.pendingAnchor &&
+            current === this._verifiedTip.pointer &&
+            agent.ownerAccount === this._verifiedTip.ownerAccount &&
+            localSeq >= this._verifiedTip.anchoredSeq
+        ) {
+            const cachedAnchoredSeq = this._verifiedTip.anchoredSeq;
+            const cachedCommitmentMatches =
+                cachedAnchoredSeq === 0
+                    ? this._verifiedTip.anchoredCommitment === null
+                    : this.trail.commitmentsBySeq.get(cachedAnchoredSeq)?.toString('hex') === this._verifiedTip.anchoredCommitment;
+            if (cachedCommitmentMatches) {
+                const dueFast =
+                    shouldAnchor({
+                        localSeq,
+                        anchoredSeq: cachedAnchoredSeq,
+                        lastAnchorMs: this.lastAnchorMs,
+                        nowMs: this.now(),
+                        everyRecords: this.everyRecords,
+                        everySeconds: this.everySeconds,
+                    }) ||
+                    (this.once && noThresholds && localSeq > cachedAnchoredSeq);
+                if (!dueFast) {
+                    return {
+                        synced: syncResult.added,
+                        localSeq,
+                        anchoredSeq: cachedAnchoredSeq,
+                        anchored: false,
+                        dryRun: this.dryRun,
+                    };
+                }
+            }
+        }
+
+        let history = await readRegistryHistory(this.tokenId, {
+            tipBlockHash,
+            tipBlockHeight,
+            agent,
+            hintAnchorTxHashes: current ? [current] : [],
+            nodeClient: c,
+        });
+        let existing = await loadAnchorsFromHistory(history, c, tipBlockHeight);
+        let prev = verifyExistingAnchors(existing, {
+            tokenId: this.tokenId,
+            ownerAccount: agent.ownerAccount,
+            commitmentAt: this.trail.commitmentsBySeq,
+            currentPointer: current,
+        });
+        if (prev && prev.txHash !== this._lastSeenAnchorTxHash) {
+            this._seedLastAnchorMs(prev.blockTime);
+            this._lastSeenAnchorTxHash = prev.txHash;
+        }
+        this._syncTipFromAnchor(prev, agent.ownerAccount);
+
+        let remainingOwnerBudget = history.maxOwnerTxs - history.ownerNonceSpan;
+        let resumedPendingOnThisTick = false;
+
+        const applyRefreshedSnapshot = async ({ preserveTimerForTxHash = null } = {}) => {
+            const snap = await loadFinalizedSnapshot();
+            tipBlockHash = snap.tipBlockHash;
+            tipBlockHeight = snap.tipBlockHeight;
+            agent = snap.agent;
+            current = snap.current;
+            history = snap.history;
+            existing = snap.existing;
+            prev = snap.prev;
+            remainingOwnerBudget = snap.remainingOwnerBudget;
+            if (prev) {
+                if (prev.txHash === preserveTimerForTxHash) {
+                    this._lastSeenAnchorTxHash = prev.txHash;
+                } else if (prev.txHash !== this._lastSeenAnchorTxHash) {
+                    this._seedLastAnchorMs(prev.blockTime);
+                    this._lastSeenAnchorTxHash = prev.txHash;
+                }
+            }
+            this._syncTipFromAnchor(prev, agent.ownerAccount);
+        };
+
+        if (state?.pendingAnchor) {
+            let pending = state.pendingAnchor;
+            const clearPending = (extraPatch = {}) => {
+                if (!this.dryRun) {
+                    this._updateState({ pendingAnchor: null, ...extraPatch });
+                }
+            };
+            const tipBlock = await withRpcRetry(() => c.getBlockInfo(tipBlockHash));
+            const finalizedChainEpochSec = Math.floor(tipBlock.blockSlotTime.getTime() / 1000);
+
+            if (current === pending.txHash) {
+                if (
+                    !prev ||
+                    prev.toSeq !== pending.toSeq ||
+                    prev.commitment !== pending.commitment ||
+                    prev.prevAnchorTx !== pending.prevAnchorTx
+                ) {
+                    throw new Error(`pending anchor ${pending.txHash} disagrees with on-chain anchor record`);
+                }
+                this._seedLastAnchorMs(prev.blockTime ?? this.wallClock().toISOString());
+                this._lastSeenAnchorTxHash = prev.txHash;
+                this.log(`pending anchor ${pending.txHash} (seq 1..${prev.toSeq}) already landed on chain; clearing pending state`);
+                clearPending({
+                    lastAnchoredSeq: prev.toSeq,
+                    lastAnchoredTxHash: prev.txHash,
+                    lastAnchoredCommitment: prev.commitment,
+                    lastAnchoredAt: prev.blockTime ?? this.wallClock().toISOString(),
+                });
+            } else if (existing.some((a) => a.txHash === pending.txHash)) {
+                this.log(`pending anchor ${pending.txHash} is already in on-chain history; clearing pending state`);
+                clearPending({
+                    lastAnchoredSeq: prev?.toSeq ?? 0,
+                    lastAnchoredTxHash: prev?.txHash ?? null,
+                    lastAnchoredCommitment: prev?.commitment ?? null,
+                    lastAnchoredAt: prev?.blockTime ?? null,
+                });
+            } else {
+                let metadataHandled = false;
+                if (pending.metadataTx) {
+                    const metaTx = pending.metadataTx;
+                    let metaStatus = await getTransactionState(metaTx.txHash, c);
+
+                    if (metaStatus.state === 'absent') {
+                        if (finalizedChainEpochSec <= (metaTx.expiryEpochSeconds ?? Infinity)) {
+                            throw new Error(
+                                `pending metadata tx ${metaTx.txHash} in-flight/ambiguous until finalized chain time passes expiry ${metaTx.expiryEpochSeconds} (chain=${finalizedChainEpochSec})`,
+                            );
+                        }
+                        metaStatus = await getTransactionState(metaTx.txHash, c);
+                        if (metaStatus.state === 'absent') {
+                            this.log(`pending metadata tx ${metaTx.txHash} expired at chain time ${finalizedChainEpochSec}; clearing metadataTx`);
+                            pending = { ...pending, metadataTx: null };
+                            if (!this.dryRun) this._updateState({ pendingAnchor: pending });
+                        }
+                    }
+
+                    const finishLandedMetadata = async () => {
+                        const anchoredAt = this.wallClock().toISOString();
+                        clearPending({
+                            lastAnchoredSeq: pending.toSeq,
+                            lastAnchoredTxHash: pending.txHash,
+                            lastAnchoredCommitment: pending.commitment,
+                            lastAnchoredAt: anchoredAt,
+                        });
+                        this.lastAnchorMs = this.now();
+                        this.log(`resumed pending metadata tx ${metaTx.txHash} for anchor ${pending.txHash}`);
+                        metadataHandled = true;
+                        resumedPendingOnThisTick = true;
+                        await applyRefreshedSnapshot({ preserveTimerForTxHash: pending.txHash });
+                    };
+
+                    if (metaStatus.state === 'pending' || metaStatus.state === 'committed') {
+                        if (this.dryRun) {
+                            const plan = {
+                                action: 'wait_metadata_finalization',
+                                tokenId: this.tokenId,
+                                txHash: pending.txHash,
+                                metadataTxHash: metaTx.txHash,
+                                toSeq: pending.toSeq,
+                            };
+                            this.log(`[dry-run] pending metadata recovery plan ${JSON.stringify(plan)}`);
+                            return {
+                                synced: syncResult.added,
+                                localSeq,
+                                anchoredSeq: prev?.toSeq ?? 0,
+                                anchored: false,
+                                dryRun: true,
+                                plan,
+                            };
+                        }
+                        let waitSucceeded = false;
+                        try {
+                            await waitForFinalizedPolling(c, metaTx.txHash);
+                            waitSucceeded = true;
+                        } catch (waitErr) {
+                            if (/was rejected:/.test(waitErr.message)) {
+                                this.log(`pending metadata tx ${metaTx.txHash} rejected; clearing metadataTx`);
+                                pending = { ...pending, metadataTx: null };
+                                this._updateState({ pendingAnchor: pending });
+                            } else {
+                                throw waitErr;
+                            }
+                        }
+                        if (waitSucceeded) {
+                            const latestCurrent = await readMetadataText(this.tokenId, ANCHOR_KEY, { nodeClient: c });
+                            if (latestCurrent === pending.txHash) {
+                                await finishLandedMetadata();
+                            } else if (latestCurrent !== (prev?.txHash ?? null)) {
+                                this.log(`pending metadata tx ${metaTx.txHash} landed and pointer moved concurrently; clearing pending state`);
+                                clearPending();
+                                return {
+                                    synced: syncResult.added,
+                                    localSeq,
+                                    anchoredSeq: prev?.toSeq ?? 0,
+                                    anchored: false,
+                                    dryRun: this.dryRun,
+                                };
+                            }
+                        }
+                    } else if (metaStatus.state === 'finalized') {
+                        const failed = metaStatus.summary?.transactionType === 'failed' || Boolean(metaStatus.summary?.rejectReason);
+                        if (failed) {
+                            this.log(`pending metadata tx ${metaTx.txHash} failed on chain; clearing metadataTx`);
+                            pending = { ...pending, metadataTx: null };
+                            if (!this.dryRun) this._updateState({ pendingAnchor: pending });
+                        } else {
+                            const latestCurrent = await readMetadataText(this.tokenId, ANCHOR_KEY, { nodeClient: c });
+                            if (latestCurrent === pending.txHash) {
+                                await finishLandedMetadata();
+                            } else if (latestCurrent !== (prev?.txHash ?? null)) {
+                                this.log(`pending metadata tx ${metaTx.txHash} landed and pointer moved concurrently; clearing pending state`);
+                                clearPending();
+                                return {
+                                    synced: syncResult.added,
+                                    localSeq,
+                                    anchoredSeq: prev?.toSeq ?? 0,
+                                    anchored: false,
+                                    dryRun: this.dryRun,
+                                };
+                            }
+                        }
+                    }
+                }
+
+                if (!metadataHandled) {
+                    let rdStatus = await getTransactionState(pending.txHash, c);
+                    let pendingCleared = false;
+                    let waitedForPendingRd = false;
+
+                    if (rdStatus.state === 'absent') {
+                        if (finalizedChainEpochSec <= (pending.expiryEpochSeconds ?? Infinity)) {
+                            throw new Error(
+                                `pending registerData tx ${pending.txHash} ambiguous until finalized chain time passes expiry ${pending.expiryEpochSeconds ?? 'unknown'} (chain=${finalizedChainEpochSec})`,
+                            );
+                        }
+                        rdStatus = await getTransactionState(pending.txHash, c);
+                        if (rdStatus.state === 'absent') {
+                            this.log(`pending registerData tx ${pending.txHash} expired at chain time ${finalizedChainEpochSec}; clearing pending state`);
+                            clearPending();
+                            pendingCleared = true;
+                        }
+                    }
+
+                    if (!pendingCleared && (rdStatus.state === 'pending' || rdStatus.state === 'committed')) {
+                        if (this.dryRun) {
+                            const plan = {
+                                action: 'wait_anchor_finalization',
+                                tokenId: this.tokenId,
+                                txHash: pending.txHash,
+                                toSeq: pending.toSeq,
+                            };
+                            this.log(`[dry-run] pending anchor recovery plan ${JSON.stringify(plan)}`);
+                            return {
+                                synced: syncResult.added,
+                                localSeq,
+                                anchoredSeq: prev?.toSeq ?? 0,
+                                anchored: false,
+                                dryRun: true,
+                                plan,
+                            };
+                        }
+                        try {
+                            await waitForFinalizedPolling(c, pending.txHash);
+                            waitedForPendingRd = true;
+                        } catch (waitErr) {
+                            if (/was rejected:/.test(waitErr.message)) {
+                                this.log(`pending registerData tx ${pending.txHash} rejected; clearing pending state`);
+                                clearPending();
+                                pendingCleared = true;
+                            } else {
+                                throw waitErr;
+                            }
+                        }
+                    } else if (!pendingCleared && rdStatus.state === 'finalized') {
+                        const failed = rdStatus.summary?.transactionType === 'failed' || Boolean(rdStatus.summary?.rejectReason);
+                        if (failed) {
+                            this.log(`pending registerData tx ${pending.txHash} failed on chain; clearing pending state`);
+                            clearPending();
+                            pendingCleared = true;
+                        }
+                    }
+
+                    if (!pendingCleared) {
+                        const rd = await readRegisterData(pending.txHash, c);
+                        if (waitedForPendingRd || rd.blockHeight > Number(tipBlockHeight)) {
+                            await applyRefreshedSnapshot();
+                        }
+                        const d = decodeAnchor(rd.data);
+                        const expectedPrevTx = prev?.txHash ?? null;
+                        const expectedCommitment = this.trail.commitmentsBySeq.get(d.toSeq)?.toString('hex');
+                        const integrityOk =
+                            d.tokenId === this.tokenId &&
+                            d.toSeq === pending.toSeq &&
+                            d.toSeq <= localSeq &&
+                            Boolean(expectedCommitment) &&
+                            d.commitment === expectedCommitment &&
+                            d.commitment === pending.commitment &&
+                            isSameAccount(rd.sender, agent.ownerAccount) &&
+                            (!pending.sender || isSameAccount(rd.sender, pending.sender));
+                        if (!integrityOk) {
+                            throw new Error(
+                                `pending anchor ${pending.txHash} disagrees with current trail/owner state; refusing to resume`,
+                            );
+                        }
+
+                        const superseded =
+                            pending.prevAnchorTx !== expectedPrevTx ||
+                            d.prevAnchorTx !== expectedPrevTx ||
+                            d.toSeq <= (prev?.toSeq ?? 0);
+                        if (superseded) {
+                            this.log(
+                                `orphaned pending anchor ${pending.txHash} (seq 1..${d.toSeq}) superseded by chain pointer ${expectedPrevTx ?? 'none'} (seq ${prev?.toSeq ?? 0}); clearing pending state`,
+                            );
+                            clearPending({
+                                lastAnchoredSeq: prev?.toSeq ?? 0,
+                                lastAnchoredTxHash: prev?.txHash ?? null,
+                                lastAnchoredCommitment: prev?.commitment ?? null,
+                                lastAnchoredAt: prev?.blockTime ?? null,
+                            });
+                        } else if (this.dryRun) {
+                            const plan = {
+                                action: 'resume_set_metadata',
+                                tokenId: this.tokenId,
+                                txHash: pending.txHash,
+                                toSeq: d.toSeq,
+                                commitment: d.commitment,
+                                prevAnchorTx: expectedPrevTx,
+                            };
+                            this.log(`[dry-run] pending anchor recovery plan ${JSON.stringify(plan)}`);
+                            return {
+                                synced: syncResult.added,
+                                localSeq,
+                                anchoredSeq: prev?.toSeq ?? 0,
+                                anchored: false,
+                                dryRun: true,
+                                plan,
+                            };
+                        } else {
+                            if (remainingOwnerBudget < 1) {
+                                throw new Error(
+                                    `owner nonce span ${history.ownerNonceSpan} + 1 exceeds maxOwnerTxs=${history.maxOwnerTxs}; refusing to resume setMetadata`,
+                                );
+                            }
+                            const signer = this._resolveSigner();
+                            if (signer.address !== agent.ownerAccount) {
+                                throw new Error(
+                                    `signer ${signer.address} must exactly match registered owner ${agent.ownerAccount} (CIS-8004.setMetadata rejects account aliases)`,
+                                );
+                            }
+                            if (!isSameAccount(rd.sender, signer.address)) {
+                                throw new Error(
+                                    `pending anchor ${pending.txHash} sender ${rd.sender} does not match signer ${signer.address}`,
+                                );
+                            }
+
+                            const latestBeforeSet = await readMetadataText(this.tokenId, ANCHOR_KEY, { nodeClient: c });
+                            if (latestBeforeSet !== expectedPrevTx) {
+                                throw new Error('countersign.anchor moved concurrently; refusing to overwrite pointer');
+                            }
+
+                            const accForSet = await withRpcRetry(() => c.getAccountInfo(signer.sender, tipBlockHash));
+                            const expectedSetNonce = BigInt(accForSet.accountNonce.value);
+
+                            const onMetadataSigned = ({ txHash: metaTxHash, expiryEpochSeconds: metaExpiry }) => {
+                                pending = {
+                                    ...pending,
+                                    status: 'finalized',
+                                    metadataTx: { txHash: metaTxHash, expiryEpochSeconds: metaExpiry },
+                                };
+                                this._updateState({ pendingAnchor: pending });
+                            };
+
+                            await this.setMetadata(this.tokenId, ANCHOR_KEY, pending.txHash, signer, c, {
+                                onSigned: onMetadataSigned,
+                                expectedNonce: expectedSetNonce,
+                            });
+                            resumedPendingOnThisTick = true;
+                            const anchoredAt = this.wallClock().toISOString();
+                            clearPending({
+                                lastAnchoredSeq: d.toSeq,
+                                lastAnchoredTxHash: pending.txHash,
+                                lastAnchoredCommitment: d.commitment,
+                                lastAnchoredAt: anchoredAt,
+                            });
+                            this.lastAnchorMs = this.now();
+                            this.log(`resumed pending anchor seq 1..${d.toSeq}: ${EXPLORER_TX(pending.txHash)}`);
+                            await applyRefreshedSnapshot({ preserveTimerForTxHash: pending.txHash });
+                        }
+                    }
+                }
+            }
+        }
+
+        const anchoredSeq = prev?.toSeq ?? 0;
+        const due =
+            shouldAnchor({
+                localSeq,
+                anchoredSeq,
+                lastAnchorMs: this.lastAnchorMs,
+                nowMs: this.now(),
+                everyRecords: this.everyRecords,
+                everySeconds: this.everySeconds,
+            }) ||
+            (this.once && noThresholds && localSeq > anchoredSeq);
+
+        if (!due) {
+            return {
+                synced: syncResult.added,
+                localSeq,
+                anchoredSeq,
+                anchored: false,
+                dryRun: this.dryRun,
+            };
+        }
+
+        const toSeq = localSeq;
+        const commitmentBuf = this.trail.commitmentsBySeq.get(toSeq);
+        const commitmentHex = commitmentBuf.toString('hex');
+        const prevAnchorTx = prev?.txHash ?? null;
+        const data = encodeAnchor({
+            tokenId: this.tokenId,
+            toSeq,
+            commitment: commitmentBuf,
+            prevAnchorTx,
+        });
+
+        if (this.dryRun) {
+            const plan = {
+                action: 'anchor',
+                tokenId: this.tokenId,
+                fromSeq: anchoredSeq + 1,
+                toSeq,
+                commitment: commitmentHex,
+                prevAnchorTx,
+                bytes: data.length,
+            };
+            this.log(`[dry-run] anchor plan ${JSON.stringify(plan)}`);
+            return {
+                synced: syncResult.added,
+                localSeq,
+                anchoredSeq,
+                anchored: false,
+                dryRun: true,
+                plan,
+            };
+        }
+
+        if (remainingOwnerBudget < 2) {
+            throw new Error(
+                `owner nonce span ${history.ownerNonceSpan} + 2 exceeds maxOwnerTxs=${history.maxOwnerTxs}; refusing to submit anchor`,
+            );
+        }
+
+        const signer = this._resolveSigner();
+        if (signer.address !== agent.ownerAccount) {
+            throw new Error(
+                `signer ${signer.address} must exactly match registered owner ${agent.ownerAccount} (CIS-8004.setMetadata rejects account aliases)`,
+            );
+        }
+
+        const latestBeforeAnchor = await readMetadataText(this.tokenId, ANCHOR_KEY, { nodeClient: c });
+        if (latestBeforeAnchor !== prevAnchorTx) {
+            throw new Error('countersign.anchor moved concurrently; refusing to overwrite pointer');
+        }
+
+        const anchorNonceBlockHash = resumedPendingOnThisTick
+            ? (await withRpcRetry(() => c.getConsensusStatus())).lastFinalizedBlock
+            : tipBlockHash;
+        const accForAnchor = await withRpcRetry(() => c.getAccountInfo(signer.sender, anchorNonceBlockHash));
+        const expectedAnchorNonce = BigInt(accForAnchor.accountNonce.value);
+
+        let signedAnchorMeta = null;
+        let currentPending = null;
+        const onAnchorSigned = ({ txHash: signedHash, expiryEpochSeconds }) => {
+            signedAnchorMeta = { txHash: signedHash, expiryEpochSeconds };
+            currentPending = {
+                txHash: signedHash,
+                status: 'signed',
+                expiryEpochSeconds,
+                tokenId: this.tokenId,
+                toSeq,
+                commitment: commitmentHex,
+                prevAnchorTx,
+                sender: signer.address,
+                submittedAt: this.wallClock().toISOString(),
+                metadataTx: null,
+            };
+            this._updateState({
+                lastAnchoredSeq: anchoredSeq,
+                lastAnchoredTxHash: prevAnchorTx,
+                lastAnchoredCommitment: prev?.commitment ?? null,
+                lastAnchoredAt: prev?.blockTime ?? null,
+                pendingAnchor: currentPending,
+            });
+        };
+
+        const submitted = await this.submitAnchor({
+            tokenId: this.tokenId,
+            toSeq,
+            commitment: commitmentHex,
+            prevAnchorTx,
+            data,
+            signer,
+            nodeClient: c,
+            onSigned: onAnchorSigned,
+            expectedNonce: expectedAnchorNonce,
+        });
+        const txHash = submitted?.txHash ?? submitted?.hash;
+        if (!TX_RE.test(txHash ?? '')) {
+            throw new Error(`submitAnchor returned invalid txHash: ${txHash}`);
+        }
+        const sender = submitted?.sender ?? signer.address;
+
+        currentPending = {
+            txHash,
+            status: 'finalized',
+            expiryEpochSeconds: signedAnchorMeta?.txHash === txHash ? signedAnchorMeta.expiryEpochSeconds : null,
+            tokenId: this.tokenId,
+            toSeq,
+            commitment: commitmentHex,
+            prevAnchorTx,
+            sender,
+            submittedAt: currentPending?.submittedAt ?? this.wallClock().toISOString(),
+            metadataTx: null,
+        };
+        this._updateState({
+            lastAnchoredSeq: anchoredSeq,
+            lastAnchoredTxHash: prevAnchorTx,
+            lastAnchoredCommitment: prev?.commitment ?? null,
+            lastAnchoredAt: prev?.blockTime ?? null,
+            pendingAnchor: currentPending,
+        });
+        this.log(`anchored seq 1..${toSeq}: ${EXPLORER_TX(txHash)}`);
+
+        const latestBeforeSet = await readMetadataText(this.tokenId, ANCHOR_KEY, { nodeClient: c });
+        if (latestBeforeSet !== prevAnchorTx) {
+            throw new Error('countersign.anchor moved concurrently; refusing to overwrite pointer');
+        }
+
+        const expectedSetNonce = expectedAnchorNonce + 1n;
+        const onMetadataSigned = ({ txHash: metaTxHash, expiryEpochSeconds: metaExpiry }) => {
+            currentPending = {
+                ...currentPending,
+                metadataTx: { txHash: metaTxHash, expiryEpochSeconds: metaExpiry },
+            };
+            this._updateState({ pendingAnchor: currentPending });
+        };
+
+        await this.setMetadata(this.tokenId, ANCHOR_KEY, txHash, signer, c, {
+            onSigned: onMetadataSigned,
+            expectedNonce: expectedSetNonce,
+        });
+        const anchoredAt = this.wallClock().toISOString();
+        this._updateState({
+            lastAnchoredSeq: toSeq,
+            lastAnchoredTxHash: txHash,
+            lastAnchoredCommitment: commitmentHex,
+            lastAnchoredAt: anchoredAt,
+            pendingAnchor: null,
+        });
+        this.lastAnchorMs = this.now();
+        this._syncTipFromAnchor(
+            {
+                txHash,
+                toSeq,
+                commitment: commitmentHex,
+            },
+            agent.ownerAccount,
+        );
+        this.log(`registry entry now points at seq 1..${toSeq}: ${EXPLORER_TX(txHash)}`);
+
+        return {
+            synced: syncResult.added,
+            localSeq,
+            anchoredSeq: toSeq,
+            anchored: true,
+            txHash,
+            dryRun: false,
+        };
+    }
+
+    _withWorkerLocks(fn) {
+        return withFileLock(
+            this.lockPath,
+            () => withFileLock(this.tokenLockPath, fn, { wallClock: this.wallClock }),
+            { wallClock: this.wallClock },
+        );
+    }
+
+    /** Executes one locked tick (sync trail + reconcile/anchor). */
+    async tick() {
+        if (this._activeCall) {
+            throw new Error(`AnchorWorker ${this._activeCall} already active on this instance`);
+        }
+        this._activeCall = 'tick';
+        try {
+            return await this._withWorkerLocks(() => this.reconcileAndAnchor());
+        } finally {
+            this._activeCall = null;
+        }
+    }
+
+    async _sleepWithAbort(ms) {
+        if (ms <= 0 || this.signal?.aborted) return;
+        if (this.customSleep) {
+            await this.customSleep(ms, this.signal);
+            return;
+        }
+        await new Promise((resolve) => {
+            let settled = false;
+            const finish = () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                this.signal?.removeEventListener('abort', finish);
+                resolve();
+            };
+            const timer = setTimeout(finish, ms);
+            this.signal?.addEventListener('abort', finish, { once: true });
+        });
+    }
+
+    /** Runs either a single locked tick (--once) or continuous locked polling loop until AbortSignal aborts. */
+    async run() {
+        if (this._activeCall) {
+            throw new Error(`AnchorWorker ${this._activeCall} already active on this instance`);
+        }
+        this._activeCall = 'run';
+        try {
+            return await this._withWorkerLocks(async () => {
+                if (this.signal?.aborted) return null;
+                if (this.once) {
+                    return this.reconcileAndAnchor();
+                }
+
+                let consecutiveFailures = 0;
+                while (!this.signal?.aborted) {
+                    let delaySec;
+                    try {
+                        await this.reconcileAndAnchor();
+                        consecutiveFailures = 0;
+                        delaySec = this.pollSeconds;
+                    } catch (err) {
+                        if (this.signal?.aborted) break;
+                        consecutiveFailures += 1;
+                        const expWait = Math.min(this.maxBackoffSeconds, this.pollSeconds * 2 ** (consecutiveFailures - 1));
+                        const jitter = 0.5 + 0.5 * this.random();
+                        delaySec = Math.min(this.maxBackoffSeconds, expWait * jitter);
+                        this.log(`watch error (attempt ${consecutiveFailures}): ${err.message}; retrying in ${delaySec.toFixed(1)}s`);
+                    }
+                    if (this.signal?.aborted) break;
+                    await this._sleepWithAbort(Math.max(1, Math.round(delaySec * 1000)));
+                }
+                return null;
+            });
+        } finally {
+            this._activeCall = null;
+        }
+    }
+}
+
+/** Instantiates and runs an AnchorWorker with the provided options. */
+export function runAnchorWorker(opts) {
+    return new AnchorWorker(opts).run();
+}
