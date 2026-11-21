@@ -200,7 +200,7 @@ function decodePsqlText(raw) {
 
 function parseHighWaterSeq(raw) {
     const text = decodePsqlText(raw);
-    const trimmed = text.endsWith('\n') ? text.slice(0, -1) : text;
+    const trimmed = text.replace(/\r?\n$/, '');
     if (!/^(?:0|[1-9][0-9]*)$/.test(trimmed)) {
         throw new Error(`invalid high-water seq from psql: ${JSON.stringify(text)}`);
     }
@@ -215,12 +215,12 @@ function parseAndValidateRows(raw, afterSeq, prevCheckpointId) {
     const text = decodePsqlText(raw);
 
     if (text.length === 0) return [];
-    const trimmed = text.endsWith('\n') ? text.slice(0, -1) : text;
+    const trimmed = text.replace(/\r?\n$/, '');
     if (trimmed.length === 0) {
         throw new Error('unexpected empty row from psql');
     }
 
-    const lines = trimmed.split('\n');
+    const lines = trimmed.split(/\r?\n/);
     const rows = [];
     let expectedPrevId = afterSeq === 0 ? null : prevCheckpointId;
 

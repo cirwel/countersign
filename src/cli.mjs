@@ -36,6 +36,7 @@ import { SCHEMA, commitments, decodeAnchor, encodeAnchor, readTrail, serializeTr
 import {
     canonicalStatePath,
     canonicalTrailPath,
+    legacySidecarPath,
     runAnchorWorker,
     tokenLockPath,
     trailFileMode,
@@ -156,10 +157,7 @@ export const commands = {
         const resolvedStatePath = canonicalStatePath(targetTrail, explicitState);
         const legacyStatePath =
             explicitState === undefined || explicitState === null
-                ? (() => {
-                    const cand = canonicalTrailPath(`${path.resolve(trail)}.anchor-state.json`);
-                    return cand !== resolvedStatePath ? cand : null;
-                })()
+                ? legacySidecarPath(trail, resolvedStatePath)
                 : null;
         const trailLock = trailLockPath(targetTrail);
         if (
@@ -179,7 +177,10 @@ export const commands = {
                 if (legacyStatePath && fs.existsSync(legacyStatePath) && fs.existsSync(resolvedStatePath)) {
                     const stLegacy = fs.statSync(legacyStatePath);
                     const stCanon = fs.statSync(resolvedStatePath);
-                    if (stLegacy.dev !== stCanon.dev || stLegacy.ino !== stCanon.ino) {
+                    if (
+                        (stLegacy.dev !== stCanon.dev || stLegacy.ino !== stCanon.ino) &&
+                        Buffer.compare(fs.readFileSync(legacyStatePath), fs.readFileSync(resolvedStatePath)) !== 0
+                    ) {
                         throw new Error(
                             `conflicting anchor state files exist at both legacy path (${legacyStatePath}) and canonical path (${resolvedStatePath}); resolve manually`,
                         );

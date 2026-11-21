@@ -2124,7 +2124,7 @@ test('AnchorWorker enforces maxOwnerTxs budget (+2 fresh, +1 resume) cleanly at 
     }
 });
 
-test('canonical paths, collision guards, 0644 trail mode, isolated journal cleanup, dry-run atomic write, idle commitment check, and symlink export', async (t) => {
+test('canonical paths, collision guards, 0600 trail mode, isolated journal cleanup, dry-run atomic write, idle commitment check, and symlink export', async (t) => {
     const dir = makeTempDir();
 
     // 1. Canonical default statePath & collision rejection
@@ -2591,8 +2591,11 @@ test('legacy sidecar recovery beside symlinked trail migrates on live tick, pres
     assert.equal(fs.existsSync(legacySidecar), true);
     assert.equal(fs.existsSync(canonicalSidecar), false);
 
-    // 3. Conflicting canonical + legacy sidecars fail closed
-    fs.writeFileSync(canonicalSidecar, pendingState);
+    // 3. Conflicting differing canonical + legacy sidecars fail closed, while identical interrupted migration completes cleanly
+    fs.writeFileSync(
+        canonicalSidecar,
+        JSON.stringify({ version: 1, agentUuid: AGENT_UUID, tokenId: TOKEN_ID, lastAnchoredSeq: 99 }),
+    );
     await assert.rejects(
         () =>
             runAnchorWorker({
@@ -2607,6 +2610,29 @@ test('legacy sidecar recovery beside symlinked trail migrates on live tick, pres
             }),
         /conflicting state files/,
     );
+    // Identical bytes (simulating interrupted write-before-unlink) complete migration & resume cleanly!
+    fs.writeFileSync(canonicalSidecar, pendingState);
+    const resumeIdenticalLog = console.log;
+    console.log = () => {};
+    try {
+        // Run with dryRun first to ensure interrupted identical copy doesn't fail closed
+        const dryResume = await runAnchorWorker({
+            uuid: AGENT_UUID,
+            tokenId: TOKEN_ID,
+            trailPath: symTrail,
+            once: true,
+            dryRun: true,
+            nodeClient: node,
+            loadSignerFn: () => {
+                throw new Error('dryRun must not load signer');
+            },
+            source: () => [],
+            log: () => {},
+        });
+        assert.equal(dryResume.plan.action, 'resume_set_metadata');
+    } finally {
+        console.log = resumeIdenticalLog;
+    }
     fs.unlinkSync(canonicalSidecar);
 
     // 4. Live tick migrates legacy -> canonical, unlinks legacy, and resumes setMetadata cleanly
@@ -2630,6 +2656,139 @@ test('legacy sidecar recovery beside symlinked trail migrates on live tick, pres
     assert.equal(fs.existsSync(legacySidecar), false);
     assert.equal(fs.existsSync(canonicalSidecar), true);
     assert.equal(JSON.parse(fs.readFileSync(canonicalSidecar, 'utf8')).pendingAnchor, null);
+
+    // 5. Symlinked legacy sidecar preserves symlink target file, and symlinked canonical sidecar on non-alias trail starts cleanly
+    const extTarget = path.join(dir, 'external-state.json');
+    const symCanonTrail = path.join(realDir, 'non-alias.jsonl');
+    const symCanonSidecar = `${canonicalTrailPath(symCanonTrail)}.anchor-state.json`;
+    writeTrail(symCanonTrail, header, recs);
+    fs.writeFileSync(extTarget, '{}');
+    fs.symlinkSync(extTarget, symCanonSidecar);
+    const nonAliasWorker = new AnchorWorker({ uuid: AGENT_UUID, tokenId: TOKEN_ID, trailPath: symCanonTrail, once: true });
+    assert.equal(nonAliasWorker.legacyStatePath, null);
+
+    const extLegacyTarget = path.join(dir, 'external-legacy-target.json');
+    fs.writeFileSync(extLegacyTarget, JSON.stringify({ version: 1, agentUuid: AGENT_UUID, tokenId: TOKEN_ID, lastAnchoredSeq: 1 }));
+    fs.unlinkSync(canonicalSidecar);
+    fs.symlinkSync(extLegacyTarget, legacySidecar);
+    fs.chmodSync(extLegacyTarget, 0o644);
+    const migWorker = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath: symTrail,
+        once: true,
+        source: () => [],
+        log: () => {},
+    });
+    await migWorker.syncTrail();
+    assert.equal(fs.existsSync(extLegacyTarget), true, 'must preserve legacy symlink target file');
+    assert.equal(fs.lstatSync(legacySidecar, { throwIfNoEntry: false }), undefined, 'legacy symlink entry removed');
+    assert.equal(JSON.parse(fs.readFileSync(canonicalSidecar, 'utf8')).lastAnchoredSeq, 1);
+});
+
+test('refresh re-seeds --every-seconds timer on newer chain anchor and parseHighWaterSeq handles CRLF', async () => {
+    const dir = makeTempDir();
+    const trailPath = path.join(dir, 'reseed-refresh.jsonl');
+    const statePath = `${trailPath}.anchor-state.json`;
+    const header = {
+        schema: 'countersign.trail.v1',
+        source: 'test',
+        agent_uuid: AGENT_UUID,
+        token_id: TOKEN_ID,
+        registry: { network: 'testnet', ...REGISTRY },
+    };
+    const recs = [makeRecord(1), makeRecord(2), makeRecord(3)];
+    writeTrail(trailPath, header, recs);
+    const { at } = commitments(header, recs, new Set([1, 2]));
+
+    // Pending rd anchored seq 1..1 at an old time, while a newer external anchor for seq 1..2 lands at height 2005
+    // (blockSlotTime = wallClock - 10s, well within everySeconds=3600).
+    const node = createMutableMockNode();
+    const staleRd = node.addRegisterData({
+        sender: OWNER_A,
+        height: 1500n,
+        data: encodeAnchor({ tokenId: TOKEN_ID, toSeq: 1, commitment: at.get(1), prevAnchorTx: null }),
+    });
+    fs.writeFileSync(
+        statePath,
+        JSON.stringify({
+            version: 1,
+            agentUuid: AGENT_UUID,
+            tokenId: TOKEN_ID,
+            pendingAnchor: {
+                txHash: staleRd.txHash,
+                status: 'finalized',
+                tokenId: TOKEN_ID,
+                toSeq: 1,
+                commitment: at.get(1).toString('hex'),
+                prevAnchorTx: null,
+                sender: OWNER_A,
+            },
+        }),
+    );
+
+    const extRd = node.addRegisterData({
+        sender: OWNER_A,
+        height: 2004n,
+        data: encodeAnchor({ tokenId: TOKEN_ID, toSeq: 2, commitment: at.get(2), prevAnchorTx: null }),
+    });
+    // Simulate extRd's setMetadata finalizing right when polling staleRd (after initial tip 2004)
+    const origGetStatus = node.getBlockItemStatus.bind(node);
+    node.getBlockItemStatus = async (txHash) => {
+        if (txHash.toString() === staleRd.txHash) {
+            if (!node.state.metadata['countersign.anchor']) {
+                node.addSetMetadata({ sender: OWNER_A, value: extRd.txHash, height: 2005n });
+            }
+            return { status: 'committed' };
+        }
+        return origGetStatus(txHash);
+    };
+    // Make polling return finalized on 2nd call for staleRd cleanly
+    let stalePolls = 0;
+    const prevGetStatus = node.getBlockItemStatus;
+    node.getBlockItemStatus = async (txHash) => {
+        if (txHash.toString() === staleRd.txHash) {
+            stalePolls += 1;
+            if (stalePolls === 1) return prevGetStatus(txHash);
+            return origGetStatus(txHash);
+        }
+        return origGetStatus(txHash);
+    };
+
+    const newAnchorMs = 1700000000000 + 2004 * 2000;
+    const worker = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath,
+        statePath,
+        everySeconds: 3600,
+        nodeClient: node,
+        signer: makeSigner(OWNER_A),
+        source: () => [],
+        now: () => 50_000,
+        wallClock: () => new Date(newAnchorMs + 10_000), // only 10s elapsed since new external anchor!
+        log: () => {},
+    });
+
+    const res = await worker.tick();
+    assert.equal(res.anchored, false, 'must NOT fire premature anchor from old timer when refresh sees newer anchor');
+    assert.equal(res.anchoredSeq, 2);
+    assert.equal(node.submitted.length, 0);
+
+    // Also test parseHighWaterSeq CRLF tolerance
+    const r2 = fetchCheckpointsAfter({
+        uuid: AGENT_UUID,
+        afterSeq: 0,
+        batchSize: 1,
+        execFile: (_bin, args) => {
+            const sql = args[args.length - 1];
+            if (sql.includes('MAX(o.seq)')) return '2\r\n';
+            if (sql.includes('o.seq > 0')) return `${JSON.stringify(makeRecord(1))}\r\n`;
+            if (sql.includes('o.seq > 1 AND o.seq <= 2')) return `${JSON.stringify(makeRecord(2))}\r\n`;
+            return '';
+        },
+    });
+    assert.equal(r2.length, 2);
 });
 
 test('fetchCheckpointsAfter handles 4000+ rows with batchSize=1 iteratively and caps at high-water mark', () => {

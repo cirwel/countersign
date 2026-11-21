@@ -90,6 +90,19 @@ export function tokenLockPath(tokenId, opts = {}) {
     return path.join(canonicalTrailPath(lockDir), `token-${REGISTRY.index}-${REGISTRY.subindex}-${tokenStr}.lock`);
 }
 
+/** Resolves parent directories canonically while preserving the leaf filename (safe for leaf symlinks). */
+export function canonicalParentFilePath(filePath) {
+    const abs = path.resolve(filePath);
+    return path.join(canonicalTrailPath(path.dirname(abs)), path.basename(abs));
+}
+
+/** Resolves any legacy non-canonical sidecar path beside a symlinked trail when statePath is omitted. */
+export function legacySidecarPath(trailPath, resolvedCanonicalStatePath) {
+    const absTrail = path.resolve(trailPath);
+    const cand = canonicalParentFilePath(`${absTrail}.anchor-state.json`);
+    return cand !== canonicalParentFilePath(resolvedCanonicalStatePath) ? cand : null;
+}
+
 /** Returns the existing file mode for a trail file, or 0o600 for a newly created trail. */
 export function trailFileMode(filePath) {
     try {
@@ -463,29 +476,29 @@ export class AnchorWorker {
 
         this.uuid = uuid;
         this.tokenId = tokenStr;
-        const resolvedTrail = path.resolve(trailPath);
         const canonicalTrail = canonicalTrailPath(trailPath);
         this.trailPath = canonicalTrail;
         this.statePath = canonicalStatePath(canonicalTrail, statePath);
         this.legacyStatePath = null;
         if (statePath === undefined || statePath === null) {
-            const legacyCandidate = canonicalTrailPath(`${resolvedTrail}.anchor-state.json`);
-            if (legacyCandidate !== this.statePath) {
-                this.legacyStatePath = legacyCandidate;
-            }
+            this.legacyStatePath = legacySidecarPath(trailPath, this.statePath);
         }
         this.lockPath = lockPath ? canonicalTrailPath(lockPath) : trailLockPath(canonicalTrail);
         this.tokenLockPath = tokenLockPath(this.tokenId, { tokenLockDir });
-        const distinctEntries = [
+        assertDistinctPaths([
             ['trailPath', this.trailPath],
             ['statePath', this.statePath],
             ['lockPath', this.lockPath],
             ['tokenLockPath', this.tokenLockPath],
-        ];
+        ]);
         if (this.legacyStatePath) {
-            distinctEntries.push(['legacyStatePath', this.legacyStatePath]);
+            assertDistinctPaths([
+                ['trailPath', this.trailPath],
+                ['legacyStatePath', this.legacyStatePath],
+                ['lockPath', this.lockPath],
+                ['tokenLockPath', this.tokenLockPath],
+            ]);
         }
-        assertDistinctPaths(distinctEntries);
 
         this.psql = psql;
         this.psqlTimeoutMs = psqlTimeoutMs;
@@ -552,14 +565,34 @@ export class AnchorWorker {
             const stLegacy = fs.statSync(this.legacyStatePath);
             const stCanon = fs.statSync(this.statePath);
             if (stLegacy.dev !== stCanon.dev || stLegacy.ino !== stCanon.ino) {
-                throw new Error(
-                    `conflicting state files exist at both legacy path (${this.legacyStatePath}) and canonical path (${this.statePath}); resolve manually`,
-                );
+                const legacyRaw = fs.readFileSync(this.legacyStatePath);
+                const canonRaw = fs.readFileSync(this.statePath);
+                if (Buffer.compare(legacyRaw, canonRaw) !== 0) {
+                    throw new Error(
+                        `conflicting state files exist at both legacy path (${this.legacyStatePath}) and canonical path (${this.statePath}); resolve manually`,
+                    );
+                }
+                if (!this.dryRun) {
+                    fs.unlinkSync(this.legacyStatePath);
+                    this.log(`removed already-migrated legacy state file ${this.legacyStatePath}`);
+                }
             }
+            return this.statePath;
         }
         if (legacyExists && !canonExists) {
             if (this.dryRun) {
                 return this.legacyStatePath;
+            }
+            const isSymlink = fs.lstatSync(this.legacyStatePath).isSymbolicLink();
+            if (!isSymlink) {
+                try {
+                    fs.renameSync(this.legacyStatePath, this.statePath);
+                    fs.chmodSync(this.statePath, 0o600);
+                    this.log(`migrated legacy state file ${this.legacyStatePath} -> ${this.statePath}`);
+                    return this.statePath;
+                } catch (err) {
+                    if (err?.code !== 'EXDEV') throw err;
+                }
             }
             const raw = fs.readFileSync(this.legacyStatePath);
             writeFileAtomic(this.statePath, raw, { mode: 0o600 });
@@ -984,7 +1017,8 @@ export class AnchorWorker {
             existing = snap.existing;
             prev = snap.prev;
             remainingOwnerBudget = snap.remainingOwnerBudget;
-            if (prev) {
+            if (prev && prev.txHash !== this._lastSeenAnchorTxHash) {
+                this._seedLastAnchorMs(prev.blockTime);
                 this._lastSeenAnchorTxHash = prev.txHash;
             }
             this._syncTipFromAnchor(prev, agent.ownerAccount);
