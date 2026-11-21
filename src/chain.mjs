@@ -34,6 +34,10 @@ import { decodeAnchor } from './trail.mjs';
 
 export { TESTNET_GENESIS };
 export const EXPLORER_TX = (hash) => `https://ccdexplorer.io/testnet/transaction/${hash}`;
+export const UUID_KEY = 'unitares.agent_uuid';
+export const ANCHOR_KEY = 'countersign.anchor';
+export const TX_RE = /^[0-9a-f]{64}$/;
+const utf8Fatal = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 const DEFAULT_NODE_HOST = 'grpc.testnet.concordium.com';
 const DEFAULT_NODE_PORT = 20000;
 const DEFAULT_RPC_TIMEOUT_MS = 30000;
@@ -267,6 +271,14 @@ export function configureNode(opts) {
     cachedPromiseKey = undefined;
     explicitConfig = normalizeNodeConfig(opts);
     return effectiveNodeConfig();
+}
+
+/** Applies CLI/worker node and TLS options to the shared node configuration when specified. */
+export function applyNodeOptions(node, nodeInsecure) {
+    if (!node && !nodeInsecure) return;
+    const cfg = typeof node === 'string' ? { host: node } : (node && typeof node === 'object' ? { ...node } : {});
+    if (nodeInsecure) cfg.tls = false;
+    configureNode(cfg);
 }
 
 /** Instantiates a ConcordiumGRPCNodeClient for the configured endpoint without issuing RPCs yet. */
@@ -1017,4 +1029,53 @@ export async function readRegistryHistory(
         scannedBlocks: discoveredHeights.length,
         events: collected,
     };
+}
+
+export const chainIsUnbroken = (anchors) => anchors.every((a, i) => a.prevAnchorTx === (i === 0 ? null : anchors[i - 1].txHash));
+export const coverageGrows = (anchors) => anchors.every((a, i) => a.toSeq > (i === 0 ? 0 : anchors[i - 1].toSeq));
+
+/** Loads and decodes every register-data anchor transaction referenced in MetadataSet history. */
+export async function loadAnchorsFromHistory(history, nodeClient, tipBlockHeight) {
+    const pointers = history.events.filter((e) => e.key === ANCHOR_KEY);
+    const pool = createRpcPool(5);
+    return pool.map(pointers, async (p) => {
+        const txHash = utf8Fatal.decode(p.value);
+        if (!TX_RE.test(txHash)) {
+            throw new Error(`the pointer was once set to a value that is not a transaction hash (in ${p.txHash})`);
+        }
+        const tx = await readRegisterData(txHash, nodeClient);
+        if (tipBlockHeight !== undefined && tx.blockHeight > Number(tipBlockHeight)) {
+            throw new Error(`anchor transaction ${txHash} at block ${tx.blockHeight} is after pinned tip block ${tipBlockHeight}`);
+        }
+        return {
+            txHash,
+            ...decodeAnchor(tx.data),
+            sender: tx.sender,
+            blockTime: tx.blockTime,
+            blockHeight: tx.blockHeight,
+        };
+    });
+}
+
+/** Verifies chain continuity, ownership, trail commitments, and current pointer alignment across existing anchors. */
+export function verifyExistingAnchors(existing, { tokenId, ownerAccount, commitmentAt, currentPointer }) {
+    if (!chainIsUnbroken(existing) || !coverageGrows(existing)) {
+        throw new Error('the existing anchors do not form one chain; refusing to add to it');
+    }
+    const getCommitment = typeof commitmentAt === 'function' ? commitmentAt : (seq) => commitmentAt.get(seq);
+    for (const a of existing) {
+        if (!isSameAccount(a.sender, ownerAccount) || a.tokenId !== tokenId) {
+            throw new Error(`existing anchor ${a.txHash} does not belong to owner ${ownerAccount} / token ${tokenId}`);
+        }
+        const got = getCommitment(a.toSeq);
+        const gotHex = Buffer.isBuffer(got) ? got.toString('hex') : got;
+        if (gotHex !== a.commitment) {
+            throw new Error(`this trail does not match the anchor covering records 1..${a.toSeq} (${a.txHash}); refusing to anchor`);
+        }
+    }
+    const prev = existing.at(-1) ?? null;
+    if (currentPointer !== (prev?.txHash ?? null)) {
+        throw new Error('the current pointer is not the last one in the event history yet; retry shortly');
+    }
+    return prev;
 }

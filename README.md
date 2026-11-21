@@ -72,9 +72,14 @@ node src/cli.mjs card --token <id> --name ... --url ... --out agent-card/<name>.
 node src/cli.mjs pin-card --token <id> --url ... --file agent-card/<name>.json
 node src/cli.mjs export --uuid <uuid> --token <id> --out trail/<name>.jsonl
 node src/cli.mjs anchor --trail trail/<name>.jsonl
+node src/cli.mjs watch --uuid <uuid> --token <id> --trail trail/<name>.jsonl --every-records 10 --every-seconds 3600
 ```
 
-`anchor` and `verify` make zero calls to the hosted Agent Registry MCP server: `anchor` reads history directly from the testnet node, re-checks `countersign.anchor` immediately before submitting `registerData` and again before `setMetadata`, builds `CIS-8004.setMetadata` locally with energy estimated via dry-run `invokeContract` (capped at 100,000 energy), and polls `getBlockItemStatus` for finalization. `register`, `card`, and `pin-card` use the hosted MCP server to construct unsigned payloads (`register` polls `agents_by_owner` and derives the printed badge locally; `register` and `pin-card` refuse any unsigned payload not targeting `<12802,0>` on testnet with the expected entrypoint; `pin-card` fetches the hosted card via the same SSRF-hardened `fetchAgentCard`).
+`export` and `watch` read UNITARES `core.checkpoint_outbox` (`event_schema = 'checkpoint.recorded.v1'`) joined with `core.checkpoints` in read-only single-line JSON mode (`psql -v ON_ERROR_STOP=1 -At -c`, defaulting to `psql -d governance` unless `DATABASE_URL` or `PGDATABASE` is set, or `--psql <cmd>`).
+
+`watch` runs continuously (or once with `--once`, polling every `--poll-seconds 15` with capped jittered backoff up to `--max-backoff-seconds 300`), atomically creating or incrementally appending verified records to `--trail`, guarding single-writer access via `<state>.lock`, and persisting a crash-recovery state file (`<trail>.anchor-state.json`, override with `--state`) so an interrupted `registerData` -> `CIS-8004.setMetadata` sequence resumes `setMetadata` without sending a duplicate `registerData` transaction. Pass `--dry-run` to sync/validate the trail and log the planned anchor without loading a signer or writing to chain or the anchor-state file.
+
+`anchor`, `watch`, and `verify` make zero calls to the hosted Agent Registry MCP server: `anchor` and `watch` read history directly from the testnet node, re-check `countersign.anchor` immediately before submitting `registerData` and again before `setMetadata`, build `CIS-8004.setMetadata` locally with energy estimated via dry-run `invokeContract` (capped at 100,000 energy), and poll `getBlockItemStatus` for finalization. `register`, `card`, and `pin-card` use the hosted MCP server to construct unsigned payloads (`register` polls `agents_by_owner` and derives the printed badge locally; `register` and `pin-card` refuse any unsigned payload not targeting `<12802,0>` on testnet with the expected entrypoint; `pin-card` fetches the hosted card via the same SSRF-hardened `fetchAgentCard`).
 
 ## What this proves, and what it does not
 
