@@ -5,8 +5,22 @@ import { checkRecord } from './trail.mjs';
 export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const utf8Fatal = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
+const LIBPQ_URI_PARAM_MAP = new Map([
+    ['host', 'PGHOST'],
+    ['port', 'PGPORT'],
+    ['user', 'PGUSER'],
+    ['password', 'PGPASSWORD'],
+    ['dbname', 'PGDATABASE'],
+    ['sslmode', 'PGSSLMODE'],
+    ['sslrootcert', 'PGSSLROOTCERT'],
+    ['sslcert', 'PGSSLCERT'],
+    ['sslkey', 'PGSSLKEY'],
+    ['connect_timeout', 'PGCONNECT_TIMEOUT'],
+    ['application_name', 'PGAPPNAME'],
+]);
+
 /** Extracts libpq PG* environment variables from a postgres:// or postgresql:// DATABASE_URL without leaking secrets to argv. */
-export function parseDatabaseUrlToPgEnv(databaseUrl) {
+export function parseDatabaseUrlToPgEnv(databaseUrl, baseEnv = {}) {
     let u;
     try {
         u = new URL(databaseUrl);
@@ -16,19 +30,35 @@ export function parseDatabaseUrlToPgEnv(databaseUrl) {
     if (u.protocol !== 'postgres:' && u.protocol !== 'postgresql:') {
         throw new Error(`unsupported DATABASE_URL scheme ${u.protocol}; expected postgres:// or postgresql://`);
     }
+    if (u.hostname.includes(',') || (u.searchParams.get('host') ?? '').includes(',')) {
+        throw new Error('multi-host DATABASE_URL is not supported');
+    }
+
     const pgEnv = {};
-    const hostParam = u.searchParams.get('host');
     const hostname = u.hostname ? u.hostname.replace(/^\[(.*)\]$/, '$1') : '';
-    const host = hostParam || hostname;
-    if (host) pgEnv.PGHOST = host;
+    if (hostname) pgEnv.PGHOST = hostname;
     if (u.port) pgEnv.PGPORT = u.port;
     if (u.username) pgEnv.PGUSER = decodeURIComponent(u.username);
     if (u.password) pgEnv.PGPASSWORD = decodeURIComponent(u.password);
     const pathDb = u.pathname.startsWith('/') ? u.pathname.slice(1) : u.pathname;
-    const dbname = u.searchParams.get('dbname') || (pathDb ? decodeURIComponent(pathDb) : '');
-    if (dbname) pgEnv.PGDATABASE = dbname;
-    const sslmode = u.searchParams.get('sslmode');
-    if (sslmode) pgEnv.PGSSLMODE = sslmode;
+    if (pathDb) pgEnv.PGDATABASE = decodeURIComponent(pathDb);
+
+    const seenParams = new Set();
+    for (const [k, v] of u.searchParams.entries()) {
+        const envKey = LIBPQ_URI_PARAM_MAP.get(k);
+        if (!envKey) {
+            throw new Error(`unsupported DATABASE_URL query parameter: ${k}`);
+        }
+        if (seenParams.has(k)) {
+            throw new Error(`duplicate DATABASE_URL query parameter: ${k}`);
+        }
+        seenParams.add(k);
+        if (v !== '') pgEnv[envKey] = v;
+    }
+
+    if (!pgEnv.PGDATABASE && !baseEnv?.PGDATABASE) {
+        pgEnv.PGDATABASE = 'governance';
+    }
     return pgEnv;
 }
 
@@ -39,7 +69,7 @@ export function parseDatabaseUrlToPgEnv(databaseUrl) {
 export function parsePsqlCommand(psqlSpec, env = process.env) {
     if (psqlSpec === undefined || psqlSpec === null) {
         if (env?.DATABASE_URL) {
-            parseDatabaseUrlToPgEnv(env.DATABASE_URL);
+            parseDatabaseUrlToPgEnv(env.DATABASE_URL, env);
             return ['psql'];
         }
         return env?.PGDATABASE ? ['psql'] : ['psql', '-d', 'governance'];
@@ -106,14 +136,17 @@ export function parsePsqlCommand(psqlSpec, env = process.env) {
 }
 
 /** Builds a read-only SQL query over core.checkpoint_outbox joined with core.checkpoints for one agent after `afterSeq`. */
-export function buildCheckpointStreamSql({ uuid, afterSeq = 0 }) {
+export function buildCheckpointStreamSql({ uuid, afterSeq = 0, limit = null }) {
     if (typeof uuid !== 'string' || !UUID_RE.test(uuid)) {
         throw new Error(`invalid agent UUID: ${uuid}`);
     }
     if (!Number.isSafeInteger(afterSeq) || afterSeq < 0) {
         throw new Error(`afterSeq must be a non-negative safe integer, got ${afterSeq}`);
     }
-    return [
+    if (limit !== null && limit !== undefined && (!Number.isSafeInteger(limit) || limit <= 0)) {
+        throw new Error(`limit must be a positive safe integer or null, got ${limit}`);
+    }
+    const parts = [
         'SELECT json_build_object(',
         "'seq', c.seq,",
         "'checkpoint_id', c.checkpoint_id,",
@@ -127,7 +160,11 @@ export function buildCheckpointStreamSql({ uuid, afterSeq = 0 }) {
         'JOIN core.identities i ON i.identity_id = o.identity_id',
         `WHERE i.agent_id = '${uuid}' AND o.event_schema = 'checkpoint.recorded.v1' AND o.seq > ${afterSeq}`,
         'ORDER BY o.seq ASC',
-    ].join(' ');
+    ];
+    if (limit !== null && limit !== undefined) {
+        parts.push(`LIMIT ${limit}`);
+    }
+    return parts.join(' ');
 }
 
 function parseAndValidateRows(raw, afterSeq, prevCheckpointId) {
@@ -187,8 +224,8 @@ function parseAndValidateRows(raw, afterSeq, prevCheckpointId) {
 }
 
 /**
- * Executes the checkpoint stream SQL query via `psql` and parses/validates strictly contiguous,
- * link-continuous trail records after `afterSeq`.
+ * Executes the checkpoint stream SQL query via `psql` in keyset-paginated batches and parses/validates
+ * strictly contiguous, link-continuous trail records after `afterSeq`.
  */
 export function fetchCheckpointsAfter({
     uuid,
@@ -197,16 +234,19 @@ export function fetchCheckpointsAfter({
     psql,
     execFile = execFileSync,
     timeoutMs = 30000,
+    batchSize = 5000,
     env = process.env,
 }) {
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
         throw new Error(`timeoutMs must be a positive safe integer, got ${timeoutMs}`);
     }
-    const sql = buildCheckpointStreamSql({ uuid, afterSeq });
+    if (!Number.isSafeInteger(batchSize) || batchSize <= 0) {
+        throw new Error(`batchSize must be a positive safe integer, got ${batchSize}`);
+    }
     const [bin, ...psqlArgs] = parsePsqlCommand(psql, env);
     const childEnv = { ...env };
     if ((psql === undefined || psql === null) && env?.DATABASE_URL) {
-        Object.assign(childEnv, parseDatabaseUrlToPgEnv(env.DATABASE_URL));
+        Object.assign(childEnv, parseDatabaseUrlToPgEnv(env.DATABASE_URL, env));
     }
     childEnv.PGCLIENTENCODING = 'UTF8';
     const basePgOptions = String(childEnv.PGOPTIONS ?? '').trim();
@@ -214,14 +254,28 @@ export function fetchCheckpointsAfter({
     childEnv.PGOPTIONS = basePgOptions
         ? (basePgOptions.includes('default_transaction_read_only=on') ? basePgOptions : `${basePgOptions} ${readOnlyFlag}`)
         : readOnlyFlag;
-    const out = execFile(bin, [...psqlArgs, '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-At', '-c', sql], {
+    const execOpts = {
         encoding: 'utf8',
         maxBuffer: 1 << 30,
         timeout: timeoutMs,
         env: childEnv,
-    });
-    if (out && typeof out.then === 'function') {
-        return out.then((resolved) => parseAndValidateRows(resolved, afterSeq, prevCheckpointId));
-    }
-    return parseAndValidateRows(out, afterSeq, prevCheckpointId);
+    };
+
+    const allRows = [];
+    const runBatch = (cursor, expectedPrev) => {
+        const sql = buildCheckpointStreamSql({ uuid, afterSeq: cursor, limit: batchSize });
+        const out = execFile(bin, [...psqlArgs, '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-At', '-c', sql], execOpts);
+        const handleResult = (raw) => {
+            const batch = parseAndValidateRows(raw, cursor, expectedPrev);
+            allRows.push(...batch);
+            if (batch.length < batchSize) return allRows;
+            const last = batch.at(-1);
+            return runBatch(last.seq, last.checkpoint_id);
+        };
+        if (out && typeof out.then === 'function') {
+            return out.then(handleResult);
+        }
+        return handleResult(out);
+    };
+    return runBatch(afterSeq, afterSeq === 0 ? null : prevCheckpointId);
 }

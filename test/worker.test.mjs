@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, test } from 'node:test';
+import { after, afterEach, test } from 'node:test';
 import { AccountAddress, ReturnValue, Transaction, TransactionHash, buildBasicAccountSigner } from '@concordium/web-sdk';
 import { TESTNET_GENESIS } from '../src/chain.mjs';
 import {
@@ -17,7 +17,16 @@ import { encodeBadge, encodeTokenId } from '../src/cis8004.mjs';
 import { commands } from '../src/cli.mjs';
 import { REGISTRY, REGISTRY_MODULE_REF } from '../src/registry.mjs';
 import { canonical, commitments, decodeAnchor, encodeAnchor, readTrail, writeTrail } from '../src/trail.mjs';
-import { AnchorWorker, runAnchorWorker, shouldAnchor, trailLockPath, withFileLock } from '../src/worker.mjs';
+import {
+    AnchorWorker,
+    canonicalStatePath,
+    canonicalTrailPath,
+    runAnchorWorker,
+    shouldAnchor,
+    tokenLockPath,
+    trailLockPath,
+    withFileLock,
+} from '../src/worker.mjs';
 
 const AGENT_UUID = '907e3195-c649-49db-b753-1edc1a105f33';
 const TOKEN_ID = '1315';
@@ -27,11 +36,20 @@ const OWNER_A = '4NAnnhZUSYiyJLM9k6H7dVPn1uuPGStu2LZEety7zmp1LBYw41';
 const OWNER_A_ALIAS = AccountAddress.getAlias(AccountAddress.fromBase58(OWNER_A), 1).address;
 const OWNER_B = '3dt3UMPzRASZndjmKpSWgCP2HhmoxZrgs8FDPtZjNHZzj13hhB';
 
+const ISOLATED_LOCK_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'countersign-locks-'));
+const ORIG_LOCK_DIR = process.env.COUNTERSIGN_LOCK_DIR;
+process.env.COUNTERSIGN_LOCK_DIR = ISOLATED_LOCK_DIR;
+
 const tempDirs = [];
 afterEach(() => {
     while (tempDirs.length > 0) {
         fs.rmSync(tempDirs.pop(), { recursive: true, force: true });
     }
+});
+after(() => {
+    if (ORIG_LOCK_DIR === undefined) delete process.env.COUNTERSIGN_LOCK_DIR;
+    else process.env.COUNTERSIGN_LOCK_DIR = ORIG_LOCK_DIR;
+    fs.rmSync(ISOLATED_LOCK_DIR, { recursive: true, force: true });
 });
 
 function makeTempDir() {
@@ -151,6 +169,8 @@ function createMutableMockNode({
     status = 'Active',
     uuid = AGENT_UUID,
     includeUuidMetadata = true,
+    allFinal = true,
+    tipSlotTimeMs = null,
     onInvokeContract = null,
     onSendTransaction = null,
     statusForHash = null,
@@ -170,6 +190,8 @@ function createMutableMockNode({
 
     const state = {
         tipHeight,
+        allFinal,
+        tipSlotTimeMs,
         metadata: includeUuidMetadata ? { 'unitares.agent_uuid': uuid } : {},
         txsByHeight: new Map(),
         registerDataByHash: new Map(),
@@ -227,7 +249,8 @@ function createMutableMockNode({
         },
         async getBlockInfo(bh) {
             const h = heightFromBlockHash(bh);
-            return { blockHeight: h, blockSlotTime: new Date(timeForHeight(h)) };
+            const ms = h === state.tipHeight && state.tipSlotTimeMs !== null ? state.tipSlotTimeMs : timeForHeight(h);
+            return { blockHeight: h, blockSlotTime: new Date(ms) };
         },
         async getAccountInfo(acct, bh) {
             onRpc?.('getAccountInfo', bh);
@@ -244,7 +267,7 @@ function createMutableMockNode({
             for (const nc of state.nonceChanges) {
                 if (nc.sender === acct.address) count += 1n;
             }
-            return { nonce: { value: count } };
+            return { nonce: { value: count }, allFinal: state.allFinal };
         },
         async getInstanceInfo() {
             onRpc?.('getInstanceInfo');
@@ -1432,14 +1455,15 @@ test('pre-broadcast pendingAnchor & metadataTx handle absent before/after expiry
             assert.ok(saved.pendingAnchor.expiryEpochSeconds > 0);
             const firstSignedHash = saved.pendingAnchor.txHash;
 
-            // Restart BEFORE expiry while tx is absent -> throws retryable ambiguous error, 0 new broadcasts
+            // Restart BEFORE chain slot expiry (even if local wallClock is way ahead!) -> refuses cleanly with 0 broadcasts
             let sendCalls = 0;
             const node2 = createMutableMockNode({
+                tipSlotTimeMs: (saved.pendingAnchor.expiryEpochSeconds - 10) * 1000,
                 onSendTransaction: () => {
                     sendCalls += 1;
                 },
             });
-            nowSec = saved.pendingAnchor.expiryEpochSeconds - 10;
+            nowSec = saved.pendingAnchor.expiryEpochSeconds + 1000; // fast local clock must NOT expire absent tx
             const w2 = new AnchorWorker({
                 uuid: AGENT_UUID,
                 tokenId: TOKEN_ID,
@@ -1452,12 +1476,12 @@ test('pre-broadcast pendingAnchor & metadataTx handle absent before/after expiry
                 wallClock: () => new Date(nowSec * 1000),
                 log: () => {},
             });
-            await assert.rejects(() => w2.tick(), /ambiguous before expiry/);
+            await assert.rejects(() => w2.tick(), /ambiguous until finalized chain time passes expiry/);
             assert.equal(sendCalls, 0);
 
-            // Restart AFTER expiry while tx is still absent -> clears expired pendingAnchor and submits cleanly
+            // Restart AFTER finalized chain slot time passes expiry while tx is still absent -> clears expired pendingAnchor and submits cleanly
             node2.state.nonceChanges.push({ sender: OWNER_A, height: 1100n });
-            nowSec = saved.pendingAnchor.expiryEpochSeconds + 5;
+            node2.state.tipSlotTimeMs = (saved.pendingAnchor.expiryEpochSeconds + 5) * 1000;
             const res = await w2.tick();
             assert.equal(res.anchored, true);
             assert.equal(res.anchoredSeq, 1);
@@ -1593,9 +1617,10 @@ test('pre-broadcast pendingAnchor & metadataTx handle absent before/after expiry
             assert.ok(saved.pendingAnchor?.metadataTx?.txHash);
             const metaExpiry = saved.pendingAnchor.metadataTx.expiryEpochSeconds;
 
-            // Before expiry with absent metadataTx -> throws ambiguous error, 0 broadcasts
-            nowSec = metaExpiry - 5;
-            await assert.rejects(() => w1.tick(), /in-flight\/ambiguous until expiry/);
+            // Before finalized chain slot expiry with absent metadataTx (even with fast local wallClock) -> throws ambiguous error
+            node.state.tipSlotTimeMs = (metaExpiry - 5) * 1000;
+            nowSec = metaExpiry + 1000;
+            await assert.rejects(() => w1.tick(), /in-flight\/ambiguous until finalized chain time passes expiry/);
 
             // If metadataTx actually enters 'committed' and finalizes on node -> polls it with 0 duplicate setMetadata!
             const metaHash = saved.pendingAnchor.metadataTx.txHash;
@@ -1878,4 +1903,442 @@ test('AnchorWorker seeds --every-seconds from prev.blockTime across restarts, re
         log: () => {},
     });
     await assert.rejects(() => wMissing.tick(), /on-chain unitares\.agent_uuid/);
+});
+
+test('per-token lock, nonce CAS (allFinal/mismatch), and cli anchor pending-state guard prevent double-anchors', async () => {
+    const dir = makeTempDir();
+    const tokenLockDir = path.join(dir, 'token-locks');
+    const trail1 = path.join(dir, 'trail-1.jsonl');
+    const trail2 = path.join(dir, 'trail-2.jsonl');
+    const header = {
+        schema: 'countersign.trail.v1',
+        source: 'test',
+        agent_uuid: AGENT_UUID,
+        token_id: TOKEN_ID,
+        registry: { network: 'testnet', ...REGISTRY },
+    };
+    writeTrail(trail1, header, [makeRecord(1)]);
+    writeTrail(trail2, header, [makeRecord(1)]);
+
+    // 1. Two writers on the same tokenId but DIFFERENT trail paths share tokenLockPath
+    const tLock = tokenLockPath(TOKEN_ID, { tokenLockDir });
+    assert.equal(path.basename(tLock), `token-${REGISTRY.index}-${REGISTRY.subindex}-${TOKEN_ID}.lock`);
+    assert.equal(fs.statSync(path.dirname(tLock)).mode & 0o777, 0o700);
+
+    let entered;
+    const enteredPromise = new Promise((r) => {
+        entered = r;
+    });
+    let release;
+    const holdPromise = new Promise((r) => {
+        release = r;
+    });
+    const w1 = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath: trail1,
+        tokenLockDir,
+        once: true,
+        dryRun: true,
+        nodeClient: createMutableMockNode(),
+        source: async () => {
+            entered();
+            await holdPromise;
+            return [];
+        },
+        log: () => {},
+    });
+    const w2 = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath: trail2,
+        tokenLockDir,
+        once: true,
+        dryRun: true,
+        nodeClient: createMutableMockNode(),
+        source: () => [],
+        log: () => {},
+    });
+
+    const p1 = w1.tick();
+    await enteredPromise;
+    await assert.rejects(() => w2.tick(), /already held by active process/);
+    release();
+    await p1;
+
+    // 2. Nonce CAS rejects when allFinal === false or next nonce mismatches finalized accountNonce
+    const origLog = console.log;
+    console.log = () => {};
+    try {
+        const mempoolNode = createMutableMockNode({ allFinal: false });
+        const wCas1 = new AnchorWorker({
+            uuid: AGENT_UUID,
+            tokenId: TOKEN_ID,
+            trailPath: trail1,
+            tokenLockDir,
+            once: true,
+            nodeClient: mempoolNode,
+            signer: makeSigner(OWNER_A),
+            source: () => [],
+            log: () => {},
+        });
+        await assert.rejects(() => wCas1.tick(), /owner nonce CAS failed.*allFinal=false/);
+        assert.equal(mempoolNode.submitted.length, 0);
+
+        const mismatchNode = createMutableMockNode();
+        mismatchNode.getNextAccountNonce = async () => ({ nonce: { value: 99n }, allFinal: true });
+        const wCas2 = new AnchorWorker({
+            uuid: AGENT_UUID,
+            tokenId: TOKEN_ID,
+            trailPath: trail1,
+            tokenLockDir,
+            once: true,
+            nodeClient: mismatchNode,
+            signer: makeSigner(OWNER_A),
+            source: () => [],
+            log: () => {},
+        });
+        await assert.rejects(() => wCas2.tick(), /owner nonce CAS failed/);
+        assert.equal(mismatchNode.submitted.length, 0);
+    } finally {
+        console.log = origLog;
+    }
+
+    // 3. cli anchor refuses to broadcast a new registerData when state.pendingAnchor exists
+    const statePath = canonicalStatePath(trail1);
+    fs.writeFileSync(
+        statePath,
+        JSON.stringify({
+            version: 1,
+            agentUuid: AGENT_UUID,
+            tokenId: TOKEN_ID,
+            pendingAnchor: {
+                txHash: txHashFor('existing-pending'),
+                toSeq: 1,
+                commitment: txHashFor('c'),
+                prevAnchorTx: null,
+            },
+        }),
+    );
+    await assert.rejects(
+        () =>
+            commands.anchor({
+                trail: trail1,
+                tokenLockDir,
+                nodeClient: createMutableMockNode(),
+                who: makeSigner(OWNER_A),
+            }),
+        /pending anchor .* exists/,
+    );
+});
+
+test('AnchorWorker enforces maxOwnerTxs budget (+2 fresh, +1 resume) cleanly at 1998/1999 boundaries', async () => {
+    const dir = makeTempDir();
+    const header = {
+        schema: 'countersign.trail.v1',
+        source: 'test',
+        agent_uuid: AGENT_UUID,
+        token_id: TOKEN_ID,
+        registry: { network: 'testnet', ...REGISTRY },
+    };
+    const recs = [makeRecord(1), makeRecord(2)];
+    const { last } = commitments(header, recs);
+    const origLog = console.log;
+    console.log = () => {};
+
+    try {
+        // ownerNonceSpan === 1999: fresh anchor (+2 = 2001 > 2000) REJECTS, resume (+1 = 2000 <= 2000) ALLOWS!
+        {
+            const trailPath = path.join(dir, 'budget-1999.jsonl');
+            const statePath = `${trailPath}.anchor-state.json`;
+            writeTrail(trailPath, header, recs);
+            const node = createMutableMockNode();
+            for (let i = 0; i < 1999; i += 1) {
+                node.state.nonceChanges.push({ sender: OWNER_A, height: 1500n });
+            }
+            const wFresh = new AnchorWorker({
+                uuid: AGENT_UUID,
+                tokenId: TOKEN_ID,
+                trailPath,
+                statePath,
+                once: true,
+                nodeClient: node,
+                signer: makeSigner(OWNER_A),
+                source: () => [],
+                log: () => {},
+            });
+            await assert.rejects(() => wFresh.tick(), /1999 \+ 2 exceeds maxOwnerTxs=2000/);
+            assert.equal(node.submitted.length, 0);
+
+            // Resume finalized registerData via setMetadata (+1 = 2000 <= 2000) SUCCEEDS!
+            const data = encodeAnchor({ tokenId: TOKEN_ID, toSeq: 2, commitment: last, prevAnchorTx: null });
+            const rd = node.addRegisterData({ sender: OWNER_A, data, height: 1500n }); // now span=2000? Wait: keep span=1999!
+            node.state.nonceChanges.pop(); // ensure exact span = 1999 for boundary test
+            fs.writeFileSync(
+                statePath,
+                JSON.stringify({
+                    version: 1,
+                    agentUuid: AGENT_UUID,
+                    tokenId: TOKEN_ID,
+                    pendingAnchor: {
+                        txHash: rd.txHash,
+                        status: 'finalized',
+                        tokenId: TOKEN_ID,
+                        toSeq: 2,
+                        commitment: last.toString('hex'),
+                        prevAnchorTx: null,
+                        sender: OWNER_A,
+                    },
+                }),
+            );
+            const res = await wFresh.tick();
+            assert.equal(res.anchoredSeq, 2);
+            assert.equal(node.submitted.length, 1);
+            assert.equal(node.submitted[0].payload.receiveName.value, 'CIS-8004.setMetadata');
+        }
+
+        // ownerNonceSpan === 1998: fresh anchor (+2 = 2000 <= 2000) ALLOWS!
+        {
+            const trailPath = path.join(dir, 'budget-1998.jsonl');
+            writeTrail(trailPath, header, recs);
+            const node = createMutableMockNode();
+            for (let i = 0; i < 1998; i += 1) {
+                node.state.nonceChanges.push({ sender: OWNER_A, height: 1500n });
+            }
+            const wOk = new AnchorWorker({
+                uuid: AGENT_UUID,
+                tokenId: TOKEN_ID,
+                trailPath,
+                once: true,
+                nodeClient: node,
+                signer: makeSigner(OWNER_A),
+                source: () => [],
+                log: () => {},
+            });
+            const res = await wOk.tick();
+            assert.equal(res.anchored, true);
+            assert.equal(res.anchoredSeq, 2);
+            assert.equal(node.submitted.length, 2);
+        }
+    } finally {
+        console.log = origLog;
+    }
+});
+
+test('canonical paths, collision guards, 0644 trail mode, isolated journal cleanup, dry-run atomic write, idle commitment check, and symlink export', async (t) => {
+    const dir = makeTempDir();
+
+    // 1. Canonical default statePath & collision rejection
+    const realTrail = path.join(dir, 'real-trail.jsonl');
+    const symTrail = path.join(dir, 'sym-trail.jsonl');
+    fs.writeFileSync(realTrail, '');
+    fs.symlinkSync(realTrail, symTrail);
+
+    assert.throws(
+        () => new AnchorWorker({ uuid: AGENT_UUID, tokenId: TOKEN_ID, trailPath: symTrail, statePath: realTrail, once: true }),
+        /must not collide/,
+    );
+    assert.throws(
+        () =>
+            new AnchorWorker({
+                uuid: AGENT_UUID,
+                tokenId: TOKEN_ID,
+                trailPath: symTrail,
+                statePath: trailLockPath(realTrail),
+                once: true,
+            }),
+        /must not collide/,
+    );
+
+    const wSym = new AnchorWorker({ uuid: AGENT_UUID, tokenId: TOKEN_ID, trailPath: symTrail, once: true });
+    assert.equal(wSym.trailPath, canonicalTrailPath(realTrail));
+    assert.equal(wSym.statePath, `${canonicalTrailPath(realTrail)}.anchor-state.json`);
+
+    // 2. Trail mode 0644 on creation + preserved existing mode, while state file stays 0600
+    const trail644 = path.join(dir, 'mode.jsonl');
+    const node = createMutableMockNode();
+    const origLog = console.log;
+    console.log = () => {};
+    try {
+        await runAnchorWorker({
+            uuid: AGENT_UUID,
+            tokenId: TOKEN_ID,
+            trailPath: trail644,
+            once: true,
+            nodeClient: node,
+            signer: makeSigner(OWNER_A),
+            source: (afterSeq) => (afterSeq === 0 ? [makeRecord(1)] : []),
+            log: () => {},
+        });
+        assert.equal(fs.statSync(trail644).mode & 0o777, 0o644);
+        assert.equal(fs.statSync(`${trail644}.anchor-state.json`).mode & 0o777, 0o600);
+
+        // Dry-run appends atomically via writeFileAtomic and preserves custom existing trail mode (0640)
+        fs.chmodSync(trail644, 0o640);
+        await runAnchorWorker({
+            uuid: AGENT_UUID,
+            tokenId: TOKEN_ID,
+            trailPath: trail644,
+            once: true,
+            dryRun: true,
+            nodeClient: node,
+            source: (afterSeq) => (afterSeq === 1 ? [makeRecord(2)] : []),
+            log: () => {},
+        });
+        assert.equal(readTrail(trail644).records.length, 2);
+        assert.equal(fs.statSync(trail644).mode & 0o777, 0o640);
+    } finally {
+        console.log = origLog;
+    }
+
+    // 3. Isolated journal cleanup: state write failure after valid readTrail does NOT truncate trail!
+    {
+        const trailIso = path.join(dir, 'isolated.jsonl');
+        const stateIso = `${trailIso}.anchor-state.json`;
+        const header = {
+            schema: 'countersign.trail.v1',
+            source: 'test',
+            agent_uuid: AGENT_UUID,
+            token_id: TOKEN_ID,
+            registry: { network: 'testnet', ...REGISTRY },
+        };
+        writeTrail(trailIso, header, [makeRecord(1), makeRecord(2)]);
+        const origTrailBytes = fs.readFileSync(trailIso, 'utf8');
+        fs.writeFileSync(
+            stateIso,
+            JSON.stringify({
+                version: 1,
+                agentUuid: AGENT_UUID,
+                tokenId: TOKEN_ID,
+                trailAppend: { baseSize: 10, targetSeq: 2 },
+            }),
+        );
+        const wIso = new AnchorWorker({
+            uuid: AGENT_UUID,
+            tokenId: TOKEN_ID,
+            trailPath: trailIso,
+            statePath: stateIso,
+            once: true,
+            source: () => [],
+            log: () => {},
+        });
+        const origRename = fs.renameSync;
+        const renameMock = t.mock.method(fs, 'renameSync', (from, to) => {
+            if (to === wIso.statePath) throw new Error('simulated state disk error');
+            return origRename(from, to);
+        });
+        await assert.rejects(() => wIso.syncTrail(), /simulated state disk error/);
+        renameMock.mock.restore();
+        assert.equal(fs.readFileSync(trailIso, 'utf8'), origTrailBytes, 'valid trail must NOT be truncated');
+    }
+
+    // 4. Idle-poll fast path catches edited same-length trail immediately via cached commitment check!
+    {
+        const trailIdle = path.join(dir, 'idle-tamper.jsonl');
+        const header = {
+            schema: 'countersign.trail.v1',
+            source: 'test',
+            agent_uuid: AGENT_UUID,
+            token_id: TOKEN_ID,
+            registry: { network: 'testnet', ...REGISTRY },
+        };
+        const r1 = makeRecord(1, null, 'aaaa');
+        const r2 = makeRecord(2, 'cp-1', 'bbbb');
+        writeTrail(trailIdle, header, [r1, r2]);
+        const { at } = commitments(header, [r1, r2], new Set([2]));
+        const idleNode = createMutableMockNode();
+        const rd = idleNode.addRegisterData({
+            sender: OWNER_A,
+            data: encodeAnchor({ tokenId: TOKEN_ID, toSeq: 2, commitment: at.get(2), prevAnchorTx: null }),
+        });
+        idleNode.addSetMetadata({ sender: OWNER_A, value: rd.txHash });
+
+        const wIdle = new AnchorWorker({
+            uuid: AGENT_UUID,
+            tokenId: TOKEN_ID,
+            trailPath: trailIdle,
+            everyRecords: 5,
+            nodeClient: idleNode,
+            signer: makeSigner(OWNER_A),
+            source: () => [],
+            log: () => {},
+        });
+        const t1 = await wIdle.tick();
+        assert.equal(t1.anchoredSeq, 2);
+
+        // Replace record 2 with equal-length tampered text between ticks
+        writeTrail(trailIdle, header, [r1, makeRecord(2, 'cp-1', 'bbbc')]);
+        await assert.rejects(() => wIdle.tick(), /does not match the anchor/);
+    }
+
+    // 5. cli export preserves symlink targets and writes mode 0644
+    {
+        const target = path.join(dir, 'export-target.jsonl');
+        const link = path.join(dir, 'export-link.jsonl');
+        fs.writeFileSync(target, '', { mode: 0o644 });
+        fs.symlinkSync(target, link);
+        const r1 = makeRecord(1);
+        const orig = console.log;
+        console.log = () => {};
+        try {
+            await commands.export({
+                uuid: AGENT_UUID,
+                token: TOKEN_ID,
+                out: link,
+                execFile: () => `${JSON.stringify(r1)}\n`,
+            });
+        } finally {
+            console.log = orig;
+        }
+        assert.equal(fs.lstatSync(link).isSymbolicLink(), true, 'export must preserve symlink');
+        assert.equal(readTrail(target).records.length, 1);
+        assert.equal(fs.statSync(target).mode & 0o777, 0o644);
+    }
+});
+
+test('DATABASE_URL preserves all libpq params, rejects multi-host/unsupported params, defaults governance, and keyset-batches fetchCheckpointsAfter', () => {
+    assert.deepEqual(
+        parseDatabaseUrlToPgEnv(
+            'postgresql://alice:pw@pg.host:5433/?sslmode=verify-full&sslrootcert=/ca.pem&sslcert=/c.pem&sslkey=/k.pem&connect_timeout=5&application_name=cs',
+        ),
+        {
+            PGHOST: 'pg.host',
+            PGPORT: '5433',
+            PGUSER: 'alice',
+            PGPASSWORD: 'pw',
+            PGSSLMODE: 'verify-full',
+            PGSSLROOTCERT: '/ca.pem',
+            PGSSLCERT: '/c.pem',
+            PGSSLKEY: '/k.pem',
+            PGCONNECT_TIMEOUT: '5',
+            PGAPPNAME: 'cs',
+            PGDATABASE: 'governance',
+        },
+    );
+
+    assert.throws(() => parseDatabaseUrlToPgEnv('postgresql://h1,h2/gov'), /multi-host/);
+    assert.throws(() => parseDatabaseUrlToPgEnv('postgresql:///gov?host=h1,h2'), /multi-host/);
+    assert.throws(() => parseDatabaseUrlToPgEnv('postgresql://h1/gov?target_session_attrs=any'), /unsupported DATABASE_URL query parameter/);
+    assert.throws(() => parseDatabaseUrlToPgEnv('postgresql://h1/gov?sslmode=require&sslmode=disable'), /duplicate DATABASE_URL/);
+
+    const batchSqls = [];
+    const all5 = [makeRecord(1), makeRecord(2), makeRecord(3), makeRecord(4), makeRecord(5)];
+    const rows = fetchCheckpointsAfter({
+        uuid: AGENT_UUID,
+        afterSeq: 0,
+        batchSize: 2,
+        execFile: (_bin, args) => {
+            const sql = args[args.length - 1];
+            batchSqls.push(sql);
+            if (sql.includes('o.seq > 0')) return `${JSON.stringify(all5[0])}\n${JSON.stringify(all5[1])}\n`;
+            if (sql.includes('o.seq > 2')) return `${JSON.stringify(all5[2])}\n${JSON.stringify(all5[3])}\n`;
+            if (sql.includes('o.seq > 4')) return `${JSON.stringify(all5[4])}\n`;
+            return '';
+        },
+    });
+    assert.equal(rows.length, 5);
+    assert.equal(batchSqls.length, 3);
+    assert.match(batchSqls[0], /o\.seq > 0 ORDER BY o\.seq ASC LIMIT 2$/);
+    assert.match(batchSqls[1], /o\.seq > 2 ORDER BY o\.seq ASC LIMIT 2$/);
+    assert.match(batchSqls[2], /o\.seq > 4 ORDER BY o\.seq ASC LIMIT 2$/);
 });

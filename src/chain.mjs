@@ -14,6 +14,7 @@ import {
     Parameter,
     ReceiveName,
     ReturnValue,
+    SequenceNumber,
     Transaction,
     TransactionHash,
     buildBasicAccountSigner,
@@ -418,11 +419,22 @@ export async function getTransactionState(txHash, nodeClient) {
 }
 
 async function signSendWait(builder, who, nodeClient, pollOpts = {}) {
-    const { onSigned, ...waitOpts } = pollOpts ?? {};
+    const { onSigned, expectedNonce, ...waitOpts } = pollOpts ?? {};
     const c = nodeClient ?? (await client());
     await assertTestnet(c);
-    const { nonce } = await withRpcRetry(() => c.getNextAccountNonce(who.sender));
-    const tx = builder.addMetadata({ sender: who.sender, nonce }).build();
+    const next = await withRpcRetry(() => c.getNextAccountNonce(who.sender));
+    let txNonce = next.nonce;
+    if (expectedNonce !== undefined && expectedNonce !== null) {
+        const exp = BigInt(expectedNonce);
+        const nextVal = BigInt(next.nonce?.value ?? next.nonce);
+        if (next.allFinal !== true || nextVal !== exp) {
+            throw new Error(
+                `owner nonce CAS failed for ${who.address}: expected finalized nonce ${exp}, got ${nextVal} (allFinal=${next.allFinal})`,
+            );
+        }
+        txNonce = SequenceNumber.create(exp);
+    }
+    const tx = builder.addMetadata({ sender: who.sender, nonce: txNonce }).build();
     const signed = await Transaction.signAndFinalize(tx, who.signer);
     const txHash = Buffer.from(Transaction.getAccountTransactionHash(signed)).toString('hex');
     const expiryEpochSeconds = Number(signed.header?.expiry?.expiryEpochSeconds ?? 0);
@@ -950,7 +962,8 @@ export async function readRegistryHistory(
     };
 
     // 5. Check owner (and admin if distinct) nonce span BEFORE following hint links.
-    await checkAccountNonceSpan(ownerAddr, maxOwnerTxs, 'owner');
+    const ownerNonceSpanCheck = await checkAccountNonceSpan(ownerAddr, maxOwnerTxs, 'owner');
+    const ownerNonceSpan = Number(ownerNonceSpanCheck.nEnd - ownerNonceSpanCheck.nStart);
     if (adminAddr) await checkAccountNonceSpan(adminAddr, maxAdminTxs, 'admin');
 
     // 6. Follow hintAnchorTxHashes / prevAnchorTx links (bounded & owner/token/height-validated) to get split hints.
@@ -1060,6 +1073,8 @@ export async function readRegistryHistory(
         mintTxHash: mintHit.txHash,
         owner,
         scannedBlocks: discoveredHeights.length,
+        ownerNonceSpan,
+        maxOwnerTxs,
         events: collected,
     };
 }

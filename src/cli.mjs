@@ -32,7 +32,16 @@ import { UUID_RE, fetchCheckpointsAfter } from './checkpoints.mjs';
 import { decodeBadge, encodeBadge, fetchAgentCard, verifyAgentCardBytes } from './cis8004.mjs';
 import { NETWORK, REGISTRY, mcp } from './registry.mjs';
 import { SCHEMA, commitments, decodeAnchor, encodeAnchor, readTrail, serializeTrail } from './trail.mjs';
-import { runAnchorWorker, trailLockPath, withFileLock, writeFileAtomic } from './worker.mjs';
+import {
+    canonicalStatePath,
+    canonicalTrailPath,
+    runAnchorWorker,
+    tokenLockPath,
+    trailFileMode,
+    trailLockPath,
+    withFileLock,
+    writeFileAtomic,
+} from './worker.mjs';
 
 const hex = (s) => Buffer.from(s, 'utf8').toString('hex');
 const sha256hex = (b) => crypto.createHash('sha256').update(b).digest('hex');
@@ -115,14 +124,24 @@ export const commands = {
     },
 
     /** Operator side: read an agent's checkpoints from the UNITARES database (read-only) into a canonical trail file. */
-    async export({ uuid, token, out, psql, execFile }) {
+    async export({ uuid, token, out, psql, execFile, ...opts }) {
         if (!UUID_RE.test(uuid ?? '')) throw new Error('--uuid is required');
         if (!/^[0-9]+$/.test(token ?? '')) throw new Error('--token <id> is required');
         if (!out) throw new Error('--out <path> is required');
-        return withFileLock(trailLockPath(out), async () => {
-            const rows = await fetchCheckpointsAfter({ uuid, afterSeq: 0, psql, ...(execFile ? { execFile } : {}) });
+        const timeoutMs = parseOptionalPositiveInt(opts.psqlTimeoutMs ?? opts['psql-timeout-ms'] ?? opts['psql-timeout'], '--psql-timeout');
+        const batchSize = parseOptionalPositiveInt(opts.batchSize ?? opts['psql-batch-size'], '--psql-batch-size');
+        const targetOut = canonicalTrailPath(out);
+        return withFileLock(trailLockPath(targetOut), async () => {
+            const rows = await fetchCheckpointsAfter({
+                uuid,
+                afterSeq: 0,
+                psql,
+                ...(timeoutMs ? { timeoutMs } : {}),
+                ...(batchSize ? { batchSize } : {}),
+                ...(execFile ? { execFile } : {}),
+            });
             const header = { schema: SCHEMA, source: 'unitares core.checkpoints', agent_uuid: uuid, token_id: String(token), registry: { network: NETWORK, ...REGISTRY } };
-            writeFileAtomic(out, serializeTrail(header, rows));
+            writeFileAtomic(targetOut, serializeTrail(header, rows), { mode: trailFileMode(targetOut) });
             const { last, count } = commitments(header, rows);
             console.log(`exported ${count} records to ${out}; commitment ${last.toString('hex')}`);
         });
@@ -131,74 +150,100 @@ export const commands = {
     /** Write the trail's current commitment to testnet and point the registry entry at it. */
     async anchor({ trail, tx, node, nodeClient, who: providedWho, ...opts }) {
         if (!trail) throw new Error('--trail <path> is required');
-        return withFileLock(trailLockPath(trail), async () => {
+        const targetTrail = canonicalTrailPath(trail);
+        const resolvedStatePath = canonicalStatePath(targetTrail, opts.state ?? opts.statePath);
+        const trailLock = trailLockPath(targetTrail);
+        if (resolvedStatePath === targetTrail || resolvedStatePath === trailLock) {
+            throw new Error(`statePath (${resolvedStatePath}) must not collide with trailPath or lockPath`);
+        }
+        return withFileLock(trailLock, async () => {
             const nodeInsecure = Boolean(opts.nodeInsecure ?? opts['node-insecure']);
             applyNodeOptions(node, nodeInsecure);
             const who = providedWho ?? loadSigner();
-            const { header, records } = readTrail(trail);
+            const { header, records } = readTrail(targetTrail);
             const tokenId = header.token_id;
-            const c = nodeClient ?? (await client());
-            await assertTestnet(c);
-            const cs = await withRpcRetry(() => c.getConsensusStatus());
-            const tipBlockHash = cs.lastFinalizedBlock;
-            const tipBlockHeight = cs.lastFinalizedBlockHeight;
+            return withFileLock(tokenLockPath(tokenId, { tokenLockDir: opts.tokenLockDir }), async () => {
+                if (!tx && fs.existsSync(resolvedStatePath)) {
+                    let parsedState;
+                    try {
+                        parsedState = JSON.parse(fs.readFileSync(resolvedStatePath, 'utf8'));
+                    } catch (err) {
+                        throw new Error(`corrupt anchor state file ${resolvedStatePath}: ${err.message}`);
+                    }
+                    if (parsedState?.pendingAnchor) {
+                        throw new Error(
+                            `pending anchor ${parsedState.pendingAnchor.txHash} exists in ${resolvedStatePath}; finish it with "countersign anchor --trail ${trail} --tx ${parsedState.pendingAnchor.txHash}" or "countersign watch --once" before broadcasting a new registerData`,
+                        );
+                    }
+                }
 
-            const agent = await readAgentOf(tokenId, { blockHash: tipBlockHash, nodeClient: c });
-            if (!agent) throw new Error(`registry token ${tokenId} is not registered`);
-            if (who.address !== agent.ownerAccount) {
-                throw new Error(
-                    `signer ${who.address} must exactly match registered owner ${agent.ownerAccount} (CIS-8004.setMetadata rejects account aliases)`,
-                );
-            }
-            const current = await readMetadataText(tokenId, ANCHOR_KEY, { blockHash: tipBlockHash, nodeClient: c });
-            if (current !== null && !TX_RE.test(current)) throw new Error(`metadata ${ANCHOR_KEY} is not a transaction hash`);
+                const c = nodeClient ?? (await client());
+                await assertTestnet(c);
+                const cs = await withRpcRetry(() => c.getConsensusStatus());
+                const tipBlockHash = cs.lastFinalizedBlock;
+                const tipBlockHeight = cs.lastFinalizedBlockHeight;
 
-            const history = await readRegistryHistory(tokenId, {
-                tipBlockHash,
-                tipBlockHeight,
-                agent,
-                hintAnchorTxHashes: current ? [current] : [],
-                nodeClient: c,
-            });
-            const existing = await loadAnchorsFromHistory(history, c, tipBlockHeight);
-            const { last, count, at } = commitments(header, records, new Set(existing.map((a) => a.toSeq)));
-            // Never extend a chain this trail no longer agrees with: a new anchor over a drifted record would break every earlier one.
-            const prev = verifyExistingAnchors(existing, {
-                tokenId,
-                ownerAccount: agent.ownerAccount,
-                commitmentAt: at,
-                currentPointer: current,
-            });
-            if (prev && prev.toSeq >= count) throw new Error(`the latest anchor already covers seq ${prev.toSeq}; nothing new to anchor`);
+                const agent = await readAgentOf(tokenId, { blockHash: tipBlockHash, nodeClient: c });
+                if (!agent) throw new Error(`registry token ${tokenId} is not registered`);
+                if (who.address !== agent.ownerAccount) {
+                    throw new Error(
+                        `signer ${who.address} must exactly match registered owner ${agent.ownerAccount} (CIS-8004.setMetadata rejects account aliases)`,
+                    );
+                }
+                const current = await readMetadataText(tokenId, ANCHOR_KEY, { blockHash: tipBlockHash, nodeClient: c });
+                if (current !== null && !TX_RE.test(current)) throw new Error(`metadata ${ANCHOR_KEY} is not a transaction hash`);
 
-            let hash = tx; // --tx <hash>: an anchor that was sent but whose pointer update did not land
-            if (hash) {
-                if (!TX_RE.test(hash)) throw new Error('--tx must be a transaction hash');
-                const sent = await readRegisterData(hash, c);
-                const d = decodeAnchor(sent.data);
-                const ok =
-                    isSameAccount(sent.sender, who.address) &&
-                    d.tokenId === tokenId &&
-                    d.toSeq === count &&
-                    d.commitment === last.toString('hex') &&
-                    d.prevAnchorTx === (prev?.txHash ?? null);
-                if (!ok) throw new Error('--tx is not the next anchor for this trail');
-            } else {
-                const latestBeforeAnchor = await readMetadataText(tokenId, ANCHOR_KEY, { nodeClient: c });
-                if (latestBeforeAnchor !== (prev?.txHash ?? null)) {
+                const history = await readRegistryHistory(tokenId, {
+                    tipBlockHash,
+                    tipBlockHeight,
+                    agent,
+                    hintAnchorTxHashes: current ? [current] : [],
+                    nodeClient: c,
+                });
+                const existing = await loadAnchorsFromHistory(history, c, tipBlockHeight);
+                const { last, count, at } = commitments(header, records, new Set(existing.map((a) => a.toSeq)));
+                // Never extend a chain this trail no longer agrees with: a new anchor over a drifted record would break every earlier one.
+                const prev = verifyExistingAnchors(existing, {
+                    tokenId,
+                    ownerAccount: agent.ownerAccount,
+                    commitmentAt: at,
+                    currentPointer: current,
+                });
+                if (prev && prev.toSeq >= count) throw new Error(`the latest anchor already covers seq ${prev.toSeq}; nothing new to anchor`);
+
+                const acc = await withRpcRetry(() => c.getAccountInfo(who.sender, tipBlockHash));
+                const expectedAnchorNonce = BigInt(acc.accountNonce.value);
+
+                let hash = tx; // --tx <hash>: an anchor that was sent but whose pointer update did not land
+                if (hash) {
+                    if (!TX_RE.test(hash)) throw new Error('--tx must be a transaction hash');
+                    const sent = await readRegisterData(hash, c);
+                    const d = decodeAnchor(sent.data);
+                    const ok =
+                        isSameAccount(sent.sender, who.address) &&
+                        d.tokenId === tokenId &&
+                        d.toSeq === count &&
+                        d.commitment === last.toString('hex') &&
+                        d.prevAnchorTx === (prev?.txHash ?? null);
+                    if (!ok) throw new Error('--tx is not the next anchor for this trail');
+                } else {
+                    const latestBeforeAnchor = await readMetadataText(tokenId, ANCHOR_KEY, { nodeClient: c });
+                    if (latestBeforeAnchor !== (prev?.txHash ?? null)) {
+                        throw new Error('countersign.anchor moved concurrently; refusing to overwrite pointer');
+                    }
+                    const data = encodeAnchor({ tokenId, toSeq: count, commitment: last, prevAnchorTx: prev?.txHash ?? null });
+                    ({ hash } = await sendRegisterData(data, who, c, { expectedNonce: expectedAnchorNonce }));
+                    console.log(`anchored seq 1..${count}: ${EXPLORER_TX(hash)}`);
+                }
+
+                const latestBeforeSet = await readMetadataText(tokenId, ANCHOR_KEY, { nodeClient: c });
+                if (latestBeforeSet !== (prev?.txHash ?? null)) {
                     throw new Error('countersign.anchor moved concurrently; refusing to overwrite pointer');
                 }
-                const data = encodeAnchor({ tokenId, toSeq: count, commitment: last, prevAnchorTx: prev?.txHash ?? null });
-                ({ hash } = await sendRegisterData(data, who, c));
-                console.log(`anchored seq 1..${count}: ${EXPLORER_TX(hash)}`);
-            }
-
-            const latestBeforeSet = await readMetadataText(tokenId, ANCHOR_KEY, { nodeClient: c });
-            if (latestBeforeSet !== (prev?.txHash ?? null)) {
-                throw new Error('countersign.anchor moved concurrently; refusing to overwrite pointer');
-            }
-            const set = await sendSetMetadata(tokenId, ANCHOR_KEY, hash, who, c);
-            console.log('registry entry now points at the anchor:', EXPLORER_TX(set.hash));
+                const expectedSetNonce = tx ? expectedAnchorNonce : expectedAnchorNonce + 1n;
+                const set = await sendSetMetadata(tokenId, ANCHOR_KEY, hash, who, c, { expectedNonce: expectedSetNonce });
+                console.log('registry entry now points at the anchor:', EXPLORER_TX(set.hash));
+            });
         });
     },
 
@@ -355,6 +400,11 @@ export const commands = {
             '--max-backoff-seconds',
             300,
         );
+        const psqlTimeoutMs = parseOptionalPositiveInt(
+            opts.psqlTimeoutMs ?? opts['psql-timeout-ms'] ?? opts['psql-timeout'],
+            '--psql-timeout',
+        );
+        const psqlBatchSize = parseOptionalPositiveInt(opts.batchSize ?? opts['psql-batch-size'], '--psql-batch-size');
         const once = Boolean(opts.once);
         const dryRun = Boolean(opts.dryRun ?? opts['dry-run']);
         const nodeInsecure = Boolean(opts.nodeInsecure ?? opts['node-insecure']);
@@ -384,7 +434,10 @@ export const commands = {
                 tokenId: String(resolvedToken),
                 trailPath: resolvedTrail,
                 statePath: state ?? statePath,
+                ...(opts.tokenLockDir ? { tokenLockDir: opts.tokenLockDir } : {}),
                 psql,
+                ...(psqlTimeoutMs ? { psqlTimeoutMs } : {}),
+                ...(psqlBatchSize ? { psqlBatchSize } : {}),
                 everyRecords,
                 everySeconds,
                 pollSeconds,
@@ -455,6 +508,8 @@ if (isMainEntry()) {
         'every-seconds',
         'poll-seconds',
         'max-backoff-seconds',
+        'psql-timeout',
+        'psql-batch-size',
     ];
     const boolOpts = ['node-insecure', 'allow-private-card', 'once', 'dry-run'];
     const { values } = parseArgs({

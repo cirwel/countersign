@@ -38,6 +38,7 @@ import {
     genesisHash,
     parseTrailBuffer,
     readTrail,
+    serializeTrail,
     stepHash,
 } from './trail.mjs';
 
@@ -67,23 +68,70 @@ export function canonicalTrailPath(trailPath) {
     return suffix.length > 0 ? path.join(realBase, ...suffix) : realBase;
 }
 
-/** Returns the canonical exclusive lockfile path derived from the trail file path. */
+/** Returns the canonical exclusive lockfile path derived from the canonical trail file path. */
 export function trailLockPath(trailPath) {
     return `${canonicalTrailPath(trailPath)}.lock`;
 }
 
-/** Atomically writes bytes or UTF-8 string via same-directory temp file + fsync + rename. */
-export function writeFileAtomic(filePath, content) {
+/** Resolves the canonical anchor-state path for a trail file and optional override. */
+export function canonicalStatePath(trailPath, statePath) {
+    const canonicalTrail = canonicalTrailPath(trailPath);
+    return statePath ? canonicalTrailPath(statePath) : `${canonicalTrail}.anchor-state.json`;
+}
+
+/** Returns the per-token exclusive lockfile path under COUNTERSIGN_LOCK_DIR or ~/.config/countersign/locks. */
+export function tokenLockPath(tokenId, opts = {}) {
+    const tokenStr = tokenId === undefined || tokenId === null ? '' : String(tokenId);
+    if (!/^[0-9]+$/.test(tokenStr)) {
+        throw new Error(`invalid tokenId for tokenLockPath: ${tokenId}`);
+    }
+    const lockDir = opts.tokenLockDir ?? process.env.COUNTERSIGN_LOCK_DIR ?? path.join(os.homedir(), '.config', 'countersign', 'locks');
+    fs.mkdirSync(lockDir, { mode: 0o700, recursive: true });
+    return path.join(canonicalTrailPath(lockDir), `token-${REGISTRY.index}-${REGISTRY.subindex}-${tokenStr}.lock`);
+}
+
+/** Returns the existing file mode for a trail file, or 0o644 for a newly created trail. */
+export function trailFileMode(filePath) {
+    try {
+        return fs.statSync(filePath).mode & 0o777;
+    } catch (err) {
+        if (err?.code === 'ENOENT') return 0o644;
+        throw err;
+    }
+}
+
+function assertDistinctPaths(entries) {
+    for (let i = 0; i < entries.length; i += 1) {
+        for (let j = i + 1; j < entries.length; j += 1) {
+            const [labelA, pathA] = entries[i];
+            const [labelB, pathB] = entries[j];
+            if (pathA === pathB) {
+                throw new Error(`${labelA} (${pathA}) must not collide with ${labelB}`);
+            }
+            if (fs.existsSync(pathA) && fs.existsSync(pathB)) {
+                const stA = fs.statSync(pathA);
+                const stB = fs.statSync(pathB);
+                if (stA.dev === stB.dev && stA.ino === stB.ino) {
+                    throw new Error(`${labelA} (${pathA}) and ${labelB} (${pathB}) resolve to the same file inode`);
+                }
+            }
+        }
+    }
+}
+
+/** Atomically writes bytes or UTF-8 string via same-directory temp file + fsync + chmod + rename. */
+export function writeFileAtomic(filePath, content, { mode = 0o600 } = {}) {
     const dir = path.dirname(filePath);
     fs.mkdirSync(dir, { recursive: true });
     const tmpPath = path.join(dir, `.${path.basename(filePath)}.tmp.${process.pid}.${crypto.randomUUID()}`);
-    const fd = fs.openSync(tmpPath, 'w', 0o600);
+    const fd = fs.openSync(tmpPath, 'w', mode);
     try {
         const buf = typeof content === 'string' ? Buffer.from(content, 'utf8') : Buffer.from(content);
         let offset = 0;
         while (offset < buf.length) {
             offset += fs.writeSync(fd, buf, offset, buf.length - offset);
         }
+        fs.fchmodSync(fd, mode);
         fs.fsyncSync(fd);
     } catch (err) {
         try {
@@ -142,7 +190,35 @@ function acquireTakeoverDir(takeoverDir, staleMs) {
     throw new Error(`stale lock takeover already in progress (${takeoverDir})`);
 }
 
-/** Acquires an exclusive lockfile with mutually exclusive stale-PID takeover and runs `fn`, releasing in finally. */
+function writeLockTempFile(lockPath, lockBody) {
+    const dir = path.dirname(lockPath);
+    const tmpPath = path.join(dir, `.${path.basename(lockPath)}.tmp.${process.pid}.${crypto.randomUUID()}`);
+    const fd = fs.openSync(tmpPath, 'w', 0o600);
+    try {
+        const buf = Buffer.from(lockBody, 'utf8');
+        let offset = 0;
+        while (offset < buf.length) {
+            offset += fs.writeSync(fd, buf, offset, buf.length - offset);
+        }
+        fs.fchmodSync(fd, 0o600);
+        fs.fsyncSync(fd);
+    } catch (err) {
+        try {
+            fs.closeSync(fd);
+        } catch {}
+        try {
+            fs.unlinkSync(tmpPath);
+        } catch {}
+        throw err;
+    }
+    fs.closeSync(fd);
+    return tmpPath;
+}
+
+/**
+ * Acquires an exclusive lockfile via fsynced temp file + atomic linkSync publish and mutually
+ * exclusive stale-PID takeover, running `fn` and releasing in `finally`.
+ */
 export async function withFileLock(
     lockPath,
     fn,
@@ -157,13 +233,15 @@ export async function withFileLock(
             token: crypto.randomUUID(),
         }) + '\n';
 
-    const tryCreate = () => {
-        fs.writeFileSync(lockPath, lockBody, { flag: 'wx', mode: 0o600 });
+    const tmpPath = writeLockTempFile(lockPath, lockBody);
+
+    const tryPublish = () => {
+        fs.linkSync(tmpPath, lockPath);
     };
 
     const acquire = () => {
         try {
-            tryCreate();
+            tryPublish();
             return lockBody;
         } catch (err) {
             if (err?.code !== 'EEXIST') throw err;
@@ -175,7 +253,7 @@ export async function withFileLock(
         } catch (err) {
             if (err?.code === 'ENOENT') {
                 try {
-                    tryCreate();
+                    tryPublish();
                     return lockBody;
                 } catch (retryErr) {
                     if (retryErr?.code === 'EEXIST') {
@@ -212,7 +290,14 @@ export async function withFileLock(
                 currentRaw = fs.readFileSync(lockPath, 'utf8');
             } catch (err) {
                 if (err?.code === 'ENOENT') {
-                    tryCreate();
+                    try {
+                        tryPublish();
+                    } catch (linkErr) {
+                        if (linkErr?.code === 'EEXIST') {
+                            throw new Error(`lockfile ${lockPath} was claimed concurrently`);
+                        }
+                        throw linkErr;
+                    }
                     if (fs.readFileSync(lockPath, 'utf8') !== lockBody) {
                         throw new Error(`lockfile ${lockPath} was claimed concurrently`);
                     }
@@ -232,7 +317,7 @@ export async function withFileLock(
                 if (err?.code !== 'ENOENT') throw err;
             }
             try {
-                tryCreate();
+                tryPublish();
             } catch (err) {
                 if (err?.code === 'EEXIST') {
                     throw new Error(`lockfile ${lockPath} is held by another worker`);
@@ -252,7 +337,17 @@ export async function withFileLock(
         }
     };
 
-    const acquired = acquire();
+    let acquired;
+    try {
+        acquired = acquire();
+    } finally {
+        try {
+            fs.unlinkSync(tmpPath);
+        } catch (err) {
+            if (err?.code !== 'ENOENT') throw err;
+        }
+    }
+
     try {
         return await fn();
     } finally {
@@ -279,8 +374,11 @@ export function shouldAnchor({ localSeq, anchoredSeq, lastAnchorMs, nowMs, every
     return false;
 }
 
-function defaultSubmitAnchor({ data, signer, nodeClient, onSigned }) {
-    return sendRegisterData(data, signer, nodeClient, onSigned ? { onSigned } : undefined).then((res) => ({
+function defaultSubmitAnchor({ data, signer, nodeClient, onSigned, expectedNonce }) {
+    const pollOpts = {};
+    if (onSigned) pollOpts.onSigned = onSigned;
+    if (expectedNonce !== undefined) pollOpts.expectedNonce = expectedNonce;
+    return sendRegisterData(data, signer, nodeClient, Object.keys(pollOpts).length > 0 ? pollOpts : undefined).then((res) => ({
         txHash: res.hash,
         sender: signer.address,
     }));
@@ -326,7 +424,10 @@ export class AnchorWorker {
             trailPath,
             statePath,
             lockPath,
+            tokenLockDir,
             psql,
+            psqlTimeoutMs = 30000,
+            psqlBatchSize = 5000,
             everyRecords = null,
             everySeconds = null,
             pollSeconds = 15,
@@ -362,10 +463,21 @@ export class AnchorWorker {
 
         this.uuid = uuid;
         this.tokenId = tokenStr;
-        this.trailPath = trailPath;
-        this.statePath = statePath ?? `${trailPath}.anchor-state.json`;
-        this.lockPath = lockPath ? canonicalTrailPath(lockPath) : trailLockPath(trailPath);
+        const canonicalTrail = canonicalTrailPath(trailPath);
+        this.trailPath = canonicalTrail;
+        this.statePath = canonicalStatePath(canonicalTrail, statePath);
+        this.lockPath = lockPath ? canonicalTrailPath(lockPath) : trailLockPath(canonicalTrail);
+        this.tokenLockPath = tokenLockPath(this.tokenId, { tokenLockDir });
+        assertDistinctPaths([
+            ['trailPath', this.trailPath],
+            ['statePath', this.statePath],
+            ['lockPath', this.lockPath],
+            ['tokenLockPath', this.tokenLockPath],
+        ]);
+
         this.psql = psql;
+        this.psqlTimeoutMs = psqlTimeoutMs;
+        this.psqlBatchSize = psqlBatchSize;
         this.everyRecords = validateEveryRecords(everyRecords);
         this.everySeconds = validatePositiveNumber(everySeconds, 'everySeconds', true);
         this.once = Boolean(once);
@@ -381,7 +493,16 @@ export class AnchorWorker {
         }
         this.signer = signer;
         this._loadSigner = loadSignerFn;
-        this.source = source ?? ((afterSeq) => fetchCheckpointsAfter({ uuid: this.uuid, afterSeq, psql: this.psql }));
+        this.source =
+            source ??
+            ((afterSeq) =>
+                fetchCheckpointsAfter({
+                    uuid: this.uuid,
+                    afterSeq,
+                    psql: this.psql,
+                    timeoutMs: this.psqlTimeoutMs,
+                    batchSize: this.psqlBatchSize,
+                }));
         this.submitAnchor = submitAnchor;
         this.setMetadata = setMetadata;
         this.now = now;
@@ -480,7 +601,7 @@ export class AnchorWorker {
             ...patch,
             updatedAt: this.wallClock().toISOString(),
         };
-        writeFileAtomic(this.statePath, JSON.stringify(payload, null, 2) + '\n');
+        writeFileAtomic(this.statePath, JSON.stringify(payload, null, 2) + '\n', { mode: 0o600 });
         return payload;
     }
 
@@ -507,6 +628,7 @@ export class AnchorWorker {
             const { last, count, at } = commitments(header, records, wanted);
             return {
                 header,
+                records,
                 lastSeq: count,
                 lastCheckpointId: records.at(-1)?.checkpoint_id ?? null,
                 commitment: last,
@@ -514,52 +636,59 @@ export class AnchorWorker {
             };
         };
 
+        let loaded;
+        let trailReadErr = null;
         try {
-            const loaded = readAndValidate();
+            loaded = readAndValidate();
+        } catch (readErr) {
+            trailReadErr = readErr;
+        }
+
+        if (!trailReadErr) {
             const existingState = this._readState();
             if (existingState?.trailAppend && !this.dryRun) {
                 this._updateState({ trailAppend: null });
             }
             return loaded;
-        } catch (readErr) {
-            const existingState = this._readState();
-            const ta = existingState?.trailAppend;
-            if (!ta) throw readErr;
-
-            const curSize = fs.statSync(this.trailPath).size;
-            if (curSize <= ta.baseSize) throw readErr;
-
-            const prefixBuf = Buffer.alloc(ta.baseSize);
-            const fd = fs.openSync(this.trailPath, 'r');
-            try {
-                let totalRead = 0;
-                while (totalRead < ta.baseSize) {
-                    const n = fs.readSync(fd, prefixBuf, totalRead, ta.baseSize - totalRead, totalRead);
-                    if (n === 0) break;
-                    totalRead += n;
-                }
-                if (totalRead !== ta.baseSize) throw readErr;
-            } finally {
-                fs.closeSync(fd);
-            }
-
-            const parsedPrefix = parseTrailBuffer(prefixBuf);
-            this._assertHeaderMatchesConfig(parsedPrefix.header);
-            commitments(parsedPrefix.header, parsedPrefix.records);
-
-            this.log(`recovering interrupted trail append: truncating ${this.trailPath} from ${curSize} to ${ta.baseSize} bytes`);
-            const truncFd = fs.openSync(this.trailPath, 'r+');
-            try {
-                fs.ftruncateSync(truncFd, ta.baseSize);
-                fs.fsyncSync(truncFd);
-            } finally {
-                fs.closeSync(truncFd);
-            }
-            if (!this.dryRun) {
-                this._updateState({ trailAppend: null });
-            }
-            return readAndValidate();
         }
+
+        const existingState = this._readState();
+        const ta = existingState?.trailAppend;
+        if (!ta) throw trailReadErr;
+
+        const curSize = fs.statSync(this.trailPath).size;
+        if (curSize <= ta.baseSize) throw trailReadErr;
+
+        const prefixBuf = Buffer.alloc(ta.baseSize);
+        const fd = fs.openSync(this.trailPath, 'r');
+        try {
+            let totalRead = 0;
+            while (totalRead < ta.baseSize) {
+                const n = fs.readSync(fd, prefixBuf, totalRead, ta.baseSize - totalRead, totalRead);
+                if (n === 0) break;
+                totalRead += n;
+            }
+            if (totalRead !== ta.baseSize) throw trailReadErr;
+        } finally {
+            fs.closeSync(fd);
+        }
+
+        const parsedPrefix = parseTrailBuffer(prefixBuf);
+        this._assertHeaderMatchesConfig(parsedPrefix.header);
+        commitments(parsedPrefix.header, parsedPrefix.records);
+
+        this.log(`recovering interrupted trail append: truncating ${this.trailPath} from ${curSize} to ${ta.baseSize} bytes`);
+        const truncFd = fs.openSync(this.trailPath, 'r+');
+        try {
+            fs.ftruncateSync(truncFd, ta.baseSize);
+            fs.fsyncSync(truncFd);
+        } finally {
+            fs.closeSync(truncFd);
+        }
+        if (!this.dryRun) {
+            this._updateState({ trailAppend: null });
+        }
+        return readAndValidate();
     }
 
     /** Initializes or reads/verifies the trail file, then fetches and durably appends any new checkpoints. */
@@ -573,9 +702,10 @@ export class AnchorWorker {
                 token_id: this.tokenId,
                 registry: { network: NETWORK, ...REGISTRY },
             });
-            writeFileAtomic(this.trailPath, canonical(header) + '\n');
+            writeFileAtomic(this.trailPath, canonical(header) + '\n', { mode: 0o644 });
             baseTrail = {
                 header,
+                records: [],
                 lastSeq: 0,
                 lastCheckpointId: null,
                 commitment: genesisHash(header),
@@ -585,13 +715,19 @@ export class AnchorWorker {
             baseTrail = this._loadOrRecoverExistingTrail();
         }
 
-        this.trail = baseTrail;
+        this.trail = {
+            header: baseTrail.header,
+            lastSeq: baseTrail.lastSeq,
+            lastCheckpointId: baseTrail.lastCheckpointId,
+            commitment: baseTrail.commitment,
+            commitmentsBySeq: baseTrail.commitmentsBySeq,
+        };
         const rows = await this.source(baseTrail.lastSeq);
         if (!Array.isArray(rows)) {
             throw new Error('checkpoint source must return an array');
         }
         if (rows.length === 0) {
-            return { ...baseTrail, added: 0 };
+            return { ...this.trail, added: 0 };
         }
 
         let nextSeq = baseTrail.lastSeq;
@@ -609,28 +745,29 @@ export class AnchorWorker {
             lines.push(canonical(row) + '\n');
         }
 
-        const payload = Buffer.from(lines.join(''), 'utf8');
         try {
-            const originalSize = fs.statSync(this.trailPath).size;
-            if (!this.dryRun) {
+            if (this.dryRun) {
+                const fullText = serializeTrail(baseTrail.header, [...baseTrail.records, ...rows]);
+                writeFileAtomic(this.trailPath, fullText, { mode: trailFileMode(this.trailPath) });
+            } else {
+                const payload = Buffer.from(lines.join(''), 'utf8');
+                const originalSize = fs.statSync(this.trailPath).size;
                 this._updateState({ trailAppend: { baseSize: originalSize, targetSeq: nextSeq } });
-            }
-            const fd = fs.openSync(this.trailPath, 'a');
-            try {
-                let offset = 0;
-                while (offset < payload.length) {
-                    offset += fs.writeSync(fd, payload, offset, payload.length - offset);
-                }
-                fs.fsyncSync(fd);
-            } catch (err) {
+                const fd = fs.openSync(this.trailPath, 'a');
                 try {
-                    fs.ftruncateSync(fd, originalSize);
-                } catch {}
-                throw err;
-            } finally {
-                fs.closeSync(fd);
-            }
-            if (!this.dryRun) {
+                    let offset = 0;
+                    while (offset < payload.length) {
+                        offset += fs.writeSync(fd, payload, offset, payload.length - offset);
+                    }
+                    fs.fsyncSync(fd);
+                } catch (err) {
+                    try {
+                        fs.ftruncateSync(fd, originalSize);
+                    } catch {}
+                    throw err;
+                } finally {
+                    fs.closeSync(fd);
+                }
                 this._updateState({ trailAppend: null });
             }
             this.trail = {
@@ -642,7 +779,13 @@ export class AnchorWorker {
             };
             return { ...this.trail, added: rows.length };
         } catch (err) {
-            this.trail = baseTrail;
+            this.trail = {
+                header: baseTrail.header,
+                lastSeq: baseTrail.lastSeq,
+                lastCheckpointId: baseTrail.lastCheckpointId,
+                commitment: baseTrail.commitment,
+                commitmentsBySeq: baseTrail.commitmentsBySeq,
+            };
             throw err;
         }
     }
@@ -652,6 +795,7 @@ export class AnchorWorker {
             pointer: anchorRecord?.txHash ?? null,
             ownerAccount: agentOwnerAccount,
             anchoredSeq: anchorRecord?.toSeq ?? 0,
+            anchoredCommitment: anchorRecord?.commitment ?? null,
         };
         if (anchorRecord?.txHash) {
             this._lastSeenAnchorTxHash = anchorRecord.txHash;
@@ -689,7 +833,7 @@ export class AnchorWorker {
         const localSeq = this.trail.lastSeq;
         const noThresholds = this.everyRecords === null && this.everySeconds === null;
 
-        // Idle-poll fast path: skip expensive history scans when pointer, owner, and pending state are unchanged and !due.
+        // Idle-poll fast path: verify cached pointer, owner, commitment, and !due before skipping history scans.
         if (
             this._verifiedTip !== null &&
             !state?.pendingAnchor &&
@@ -698,24 +842,30 @@ export class AnchorWorker {
             localSeq >= this._verifiedTip.anchoredSeq
         ) {
             const cachedAnchoredSeq = this._verifiedTip.anchoredSeq;
-            const dueFast =
-                shouldAnchor({
-                    localSeq,
-                    anchoredSeq: cachedAnchoredSeq,
-                    lastAnchorMs: this.lastAnchorMs,
-                    nowMs: this.now(),
-                    everyRecords: this.everyRecords,
-                    everySeconds: this.everySeconds,
-                }) ||
-                (this.once && noThresholds && localSeq > cachedAnchoredSeq);
-            if (!dueFast) {
-                return {
-                    synced: syncResult.added,
-                    localSeq,
-                    anchoredSeq: cachedAnchoredSeq,
-                    anchored: false,
-                    dryRun: this.dryRun,
-                };
+            const cachedCommitmentMatches =
+                cachedAnchoredSeq === 0
+                    ? this._verifiedTip.anchoredCommitment === null
+                    : this.trail.commitmentsBySeq.get(cachedAnchoredSeq)?.toString('hex') === this._verifiedTip.anchoredCommitment;
+            if (cachedCommitmentMatches) {
+                const dueFast =
+                    shouldAnchor({
+                        localSeq,
+                        anchoredSeq: cachedAnchoredSeq,
+                        lastAnchorMs: this.lastAnchorMs,
+                        nowMs: this.now(),
+                        everyRecords: this.everyRecords,
+                        everySeconds: this.everySeconds,
+                    }) ||
+                    (this.once && noThresholds && localSeq > cachedAnchoredSeq);
+                if (!dueFast) {
+                    return {
+                        synced: syncResult.added,
+                        localSeq,
+                        anchoredSeq: cachedAnchoredSeq,
+                        anchored: false,
+                        dryRun: this.dryRun,
+                    };
+                }
             }
         }
 
@@ -739,6 +889,9 @@ export class AnchorWorker {
         }
         this._syncTipFromAnchor(prev, agent.ownerAccount);
 
+        let remainingOwnerBudget = history.maxOwnerTxs - history.ownerNonceSpan;
+        let resumedPendingOnThisTick = false;
+
         if (state?.pendingAnchor) {
             let pending = state.pendingAnchor;
             const clearPending = (extraPatch = {}) => {
@@ -746,6 +899,8 @@ export class AnchorWorker {
                     this._updateState({ pendingAnchor: null, ...extraPatch });
                 }
             };
+            const tipBlock = await withRpcRetry(() => c.getBlockInfo(tipBlockHash));
+            const finalizedChainEpochSec = Math.floor(tipBlock.blockSlotTime.getTime() / 1000);
 
             if (current === pending.txHash) {
                 if (
@@ -777,7 +932,22 @@ export class AnchorWorker {
                 let metadataHandled = false;
                 if (pending.metadataTx) {
                     const metaTx = pending.metadataTx;
-                    const metaStatus = await getTransactionState(metaTx.txHash, c);
+                    let metaStatus = await getTransactionState(metaTx.txHash, c);
+
+                    if (metaStatus.state === 'absent') {
+                        if (finalizedChainEpochSec <= (metaTx.expiryEpochSeconds ?? Infinity)) {
+                            throw new Error(
+                                `pending metadata tx ${metaTx.txHash} in-flight/ambiguous until finalized chain time passes expiry ${metaTx.expiryEpochSeconds} (chain=${finalizedChainEpochSec})`,
+                            );
+                        }
+                        metaStatus = await getTransactionState(metaTx.txHash, c);
+                        if (metaStatus.state === 'absent') {
+                            this.log(`pending metadata tx ${metaTx.txHash} expired at chain time ${finalizedChainEpochSec}; clearing metadataTx`);
+                            pending = { ...pending, metadataTx: null };
+                            if (!this.dryRun) this._updateState({ pendingAnchor: pending });
+                        }
+                    }
+
                     const finishLandedMetadata = () => {
                         const anchoredAt = this.wallClock().toISOString();
                         clearPending({
@@ -800,6 +970,7 @@ export class AnchorWorker {
                         };
                         this._syncTipFromAnchor(prev, agent.ownerAccount);
                         metadataHandled = true;
+                        resumedPendingOnThisTick = true;
                     };
 
                     if (metaStatus.state === 'pending' || metaStatus.state === 'committed') {
@@ -872,24 +1043,28 @@ export class AnchorWorker {
                                 };
                             }
                         }
-                    } else if (metaStatus.state === 'absent') {
-                        const nowEpochSec = Math.floor(this.wallClock().getTime() / 1000);
-                        if (nowEpochSec <= (metaTx.expiryEpochSeconds ?? Infinity)) {
-                            throw new Error(
-                                `pending metadata tx ${metaTx.txHash} in-flight/ambiguous until expiry ${metaTx.expiryEpochSeconds}`,
-                            );
-                        }
-                        this.log(`pending metadata tx ${metaTx.txHash} expired without landing; clearing metadataTx`);
-                        pending = { ...pending, metadataTx: null };
-                        if (!this.dryRun) this._updateState({ pendingAnchor: pending });
                     }
                 }
 
                 if (!metadataHandled) {
-                    const rdStatus = await getTransactionState(pending.txHash, c);
+                    let rdStatus = await getTransactionState(pending.txHash, c);
                     let pendingCleared = false;
 
-                    if (rdStatus.state === 'pending' || rdStatus.state === 'committed') {
+                    if (rdStatus.state === 'absent') {
+                        if (finalizedChainEpochSec <= (pending.expiryEpochSeconds ?? Infinity)) {
+                            throw new Error(
+                                `pending registerData tx ${pending.txHash} ambiguous until finalized chain time passes expiry ${pending.expiryEpochSeconds ?? 'unknown'} (chain=${finalizedChainEpochSec})`,
+                            );
+                        }
+                        rdStatus = await getTransactionState(pending.txHash, c);
+                        if (rdStatus.state === 'absent') {
+                            this.log(`pending registerData tx ${pending.txHash} expired at chain time ${finalizedChainEpochSec}; clearing pending state`);
+                            clearPending();
+                            pendingCleared = true;
+                        }
+                    }
+
+                    if (!pendingCleared && (rdStatus.state === 'pending' || rdStatus.state === 'committed')) {
                         if (this.dryRun) {
                             const plan = {
                                 action: 'wait_anchor_finalization',
@@ -918,17 +1093,7 @@ export class AnchorWorker {
                                 throw waitErr;
                             }
                         }
-                    } else if (rdStatus.state === 'absent') {
-                        const nowEpochSec = Math.floor(this.wallClock().getTime() / 1000);
-                        if (nowEpochSec <= (pending.expiryEpochSeconds ?? Infinity)) {
-                            throw new Error(
-                                `pending registerData tx ${pending.txHash} ambiguous before expiry ${pending.expiryEpochSeconds ?? 'unknown'}`,
-                            );
-                        }
-                        this.log(`pending registerData tx ${pending.txHash} expired without landing; clearing pending state`);
-                        clearPending();
-                        pendingCleared = true;
-                    } else if (rdStatus.state === 'finalized') {
+                    } else if (!pendingCleared && rdStatus.state === 'finalized') {
                         const failed = rdStatus.summary?.transactionType === 'failed' || Boolean(rdStatus.summary?.rejectReason);
                         if (failed) {
                             this.log(`pending registerData tx ${pending.txHash} failed on chain; clearing pending state`);
@@ -990,6 +1155,11 @@ export class AnchorWorker {
                                 plan,
                             };
                         } else {
+                            if (remainingOwnerBudget < 1) {
+                                throw new Error(
+                                    `owner nonce span ${history.ownerNonceSpan} + 1 exceeds maxOwnerTxs=${history.maxOwnerTxs}; refusing to resume setMetadata`,
+                                );
+                            }
                             const signer = this._resolveSigner();
                             if (signer.address !== agent.ownerAccount) {
                                 throw new Error(
@@ -1007,6 +1177,9 @@ export class AnchorWorker {
                                 throw new Error('countersign.anchor moved concurrently; refusing to overwrite pointer');
                             }
 
+                            const accForSet = await withRpcRetry(() => c.getAccountInfo(signer.sender, tipBlockHash));
+                            const expectedSetNonce = BigInt(accForSet.accountNonce.value);
+
                             const onMetadataSigned = ({ txHash: metaTxHash, expiryEpochSeconds: metaExpiry }) => {
                                 pending = {
                                     ...pending,
@@ -1018,7 +1191,10 @@ export class AnchorWorker {
 
                             await this.setMetadata(this.tokenId, ANCHOR_KEY, pending.txHash, signer, c, {
                                 onSigned: onMetadataSigned,
+                                expectedNonce: expectedSetNonce,
                             });
+                            remainingOwnerBudget -= 1;
+                            resumedPendingOnThisTick = true;
                             const anchoredAt = this.wallClock().toISOString();
                             clearPending({
                                 lastAnchoredSeq: d.toSeq,
@@ -1099,6 +1275,12 @@ export class AnchorWorker {
             };
         }
 
+        if (remainingOwnerBudget < 2) {
+            throw new Error(
+                `owner nonce span ${history.ownerNonceSpan} + 2 exceeds maxOwnerTxs=${history.maxOwnerTxs}; refusing to submit anchor`,
+            );
+        }
+
         const signer = this._resolveSigner();
         if (signer.address !== agent.ownerAccount) {
             throw new Error(
@@ -1110,6 +1292,12 @@ export class AnchorWorker {
         if (latestBeforeAnchor !== prevAnchorTx) {
             throw new Error('countersign.anchor moved concurrently; refusing to overwrite pointer');
         }
+
+        const anchorNonceBlockHash = resumedPendingOnThisTick
+            ? (await withRpcRetry(() => c.getConsensusStatus())).lastFinalizedBlock
+            : tipBlockHash;
+        const accForAnchor = await withRpcRetry(() => c.getAccountInfo(signer.sender, anchorNonceBlockHash));
+        const expectedAnchorNonce = BigInt(accForAnchor.accountNonce.value);
 
         let signedAnchorMeta = null;
         let currentPending = null;
@@ -1145,6 +1333,7 @@ export class AnchorWorker {
             signer,
             nodeClient: c,
             onSigned: onAnchorSigned,
+            expectedNonce: expectedAnchorNonce,
         });
         const txHash = submitted?.txHash ?? submitted?.hash;
         if (!TX_RE.test(txHash ?? '')) {
@@ -1178,6 +1367,7 @@ export class AnchorWorker {
             throw new Error('countersign.anchor moved concurrently; refusing to overwrite pointer');
         }
 
+        const expectedSetNonce = expectedAnchorNonce + 1n;
         const onMetadataSigned = ({ txHash: metaTxHash, expiryEpochSeconds: metaExpiry }) => {
             currentPending = {
                 ...currentPending,
@@ -1188,6 +1378,7 @@ export class AnchorWorker {
 
         await this.setMetadata(this.tokenId, ANCHOR_KEY, txHash, signer, c, {
             onSigned: onMetadataSigned,
+            expectedNonce: expectedSetNonce,
         });
         const anchoredAt = this.wallClock().toISOString();
         this._updateState({
@@ -1202,6 +1393,7 @@ export class AnchorWorker {
             {
                 txHash,
                 toSeq,
+                commitment: commitmentHex,
             },
             agent.ownerAccount,
         );
@@ -1217,6 +1409,14 @@ export class AnchorWorker {
         };
     }
 
+    _withWorkerLocks(fn) {
+        return withFileLock(
+            this.lockPath,
+            () => withFileLock(this.tokenLockPath, fn, { wallClock: this.wallClock }),
+            { wallClock: this.wallClock },
+        );
+    }
+
     /** Executes one locked tick (sync trail + reconcile/anchor). */
     async tick() {
         if (this._activeCall) {
@@ -1224,7 +1424,7 @@ export class AnchorWorker {
         }
         this._activeCall = 'tick';
         try {
-            return await withFileLock(this.lockPath, () => this.reconcileAndAnchor(), { wallClock: this.wallClock });
+            return await this._withWorkerLocks(() => this.reconcileAndAnchor());
         } finally {
             this._activeCall = null;
         }
@@ -1257,36 +1457,32 @@ export class AnchorWorker {
         }
         this._activeCall = 'run';
         try {
-            return await withFileLock(
-                this.lockPath,
-                async () => {
-                    if (this.signal?.aborted) return null;
-                    if (this.once) {
-                        return this.reconcileAndAnchor();
-                    }
+            return await this._withWorkerLocks(async () => {
+                if (this.signal?.aborted) return null;
+                if (this.once) {
+                    return this.reconcileAndAnchor();
+                }
 
-                    let consecutiveFailures = 0;
-                    while (!this.signal?.aborted) {
-                        let delaySec;
-                        try {
-                            await this.reconcileAndAnchor();
-                            consecutiveFailures = 0;
-                            delaySec = this.pollSeconds;
-                        } catch (err) {
-                            if (this.signal?.aborted) break;
-                            consecutiveFailures += 1;
-                            const expWait = Math.min(this.maxBackoffSeconds, this.pollSeconds * 2 ** (consecutiveFailures - 1));
-                            const jitter = 0.5 + 0.5 * this.random();
-                            delaySec = Math.min(this.maxBackoffSeconds, expWait * jitter);
-                            this.log(`watch error (attempt ${consecutiveFailures}): ${err.message}; retrying in ${delaySec.toFixed(1)}s`);
-                        }
+                let consecutiveFailures = 0;
+                while (!this.signal?.aborted) {
+                    let delaySec;
+                    try {
+                        await this.reconcileAndAnchor();
+                        consecutiveFailures = 0;
+                        delaySec = this.pollSeconds;
+                    } catch (err) {
                         if (this.signal?.aborted) break;
-                        await this._sleepWithAbort(Math.max(1, Math.round(delaySec * 1000)));
+                        consecutiveFailures += 1;
+                        const expWait = Math.min(this.maxBackoffSeconds, this.pollSeconds * 2 ** (consecutiveFailures - 1));
+                        const jitter = 0.5 + 0.5 * this.random();
+                        delaySec = Math.min(this.maxBackoffSeconds, expWait * jitter);
+                        this.log(`watch error (attempt ${consecutiveFailures}): ${err.message}; retrying in ${delaySec.toFixed(1)}s`);
                     }
-                    return null;
-                },
-                { wallClock: this.wallClock },
-            );
+                    if (this.signal?.aborted) break;
+                    await this._sleepWithAbort(Math.max(1, Math.round(delaySec * 1000)));
+                }
+                return null;
+            });
         } finally {
             this._activeCall = null;
         }
