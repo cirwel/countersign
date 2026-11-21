@@ -1116,6 +1116,19 @@ test('anchor command covers happy path, concurrent pointer moves, --tx resume, d
         writeTrail(driftedTrail, s.header, driftedRecords);
         process.env.COUNTERSIGN_KEYFILE = makeTempKeyfile(s.dir, OWNER_A);
         await assert.rejects(() => runAnchorQuiet({ trail: driftedTrail, nodeClient: s.node }), /does not match the anchor/);
+
+        // 8. Alias signer refusal before submitting registerData
+        const sAliasSigner = buildScenario({ anchorHeights: [1050n], anchorToSeqs: [2] });
+        try {
+            process.env.COUNTERSIGN_KEYFILE = makeTempKeyfile(sAliasSigner.dir, OWNER_A_ALIAS);
+            await assert.rejects(
+                () => runAnchorQuiet({ trail: sAliasSigner.trailFile, nodeClient: sAliasSigner.node }),
+                /must exactly match registered owner/,
+            );
+            assert.equal(sAliasSigner.node.submitted.length, 0, 'must abort before submitting registerData');
+        } finally {
+            fs.rmSync(sAliasSigner.dir, { recursive: true });
+        }
     } finally {
         fs.rmSync(s.dir, { recursive: true });
     }
@@ -1427,13 +1440,19 @@ test('enforces wall-clock timeout even when in-flight getBlockItemStatus resolve
     const s = buildScenario({ anchorHeights: [], anchorToSeqs: [] });
     const slowNode = createMockNode({ tipHeight: 60000n, agent: s.agent });
     const origGetStatus = slowNode.getBlockItemStatus.bind(slowNode);
+    let releaseRpc;
+    let rpcSettled = false;
     slowNode.getBlockItemStatus = async (txHash) => {
-        await new Promise((r) => setTimeout(r, 120));
+        await new Promise((resolve) => {
+            releaseRpc = () => {
+                rpcSettled = true;
+                resolve();
+            };
+        });
         return origGetStatus(txHash);
     };
     const origLog = console.log;
     console.log = () => {};
-    const t0 = Date.now();
     try {
         const who = {
             address: OWNER_A,
@@ -1441,12 +1460,12 @@ test('enforces wall-clock timeout even when in-flight getBlockItemStatus resolve
             signer: (await import('@concordium/web-sdk')).buildBasicAccountSigner(crypto.randomBytes(32).toString('hex')),
         };
         await assert.rejects(
-            () => sendSetMetadata(TOKEN_ID, 'k', 'v', who, slowNode, { pollIntervalMs: 10, timeoutMs: 40 }),
-            /did not finalize within 40ms/,
+            () => sendSetMetadata(TOKEN_ID, 'k', 'v', who, slowNode, { pollIntervalMs: 10, timeoutMs: 25 }),
+            /did not finalize within 25ms/,
         );
-        const elapsed = Date.now() - t0;
-        assert.ok(elapsed < 100, `expected timeout around 40ms before 120ms RPC resolved, took ${elapsed}ms`);
+        assert.equal(rpcSettled, false, 'must reject while in-flight getBlockItemStatus is still pending');
     } finally {
+        releaseRpc?.();
         console.log = origLog;
         fs.rmSync(s.dir, { recursive: true });
     }

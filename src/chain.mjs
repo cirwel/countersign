@@ -363,6 +363,7 @@ async function waitForFinalizedPolling(c, hash, { timeoutMs = 180000, pollInterv
         } finally {
             clearTimeout(timer);
         }
+        if (Date.now() >= deadline) throw timeoutErr();
         if (status.status === 'finalized') {
             const summary = status.outcome?.summary;
             if (!summary) throw new Error(`transaction ${hash} finalized without outcome summary`);

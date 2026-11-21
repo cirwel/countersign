@@ -1,11 +1,8 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import https from 'node:https';
-import os from 'node:os';
-import path from 'node:path';
 import { test } from 'node:test';
 import zlib from 'node:zlib';
 import { AccountAddress, ContractAddress, tokenAddressToBase58 } from '@concordium/web-sdk';
@@ -647,29 +644,32 @@ test('decodeGetAdmin strictly decodes Option<AccountAddress>', () => {
     assert.throws(() => decodeGetAdmin(Buffer.from([2])), /Option tag/);
 });
 
+// Test-only self-signed certificate for localhost HTTPS tests; not a production credential.
+const TEST_KEY_PEM = [
+    '-----BEGIN PRIVATE KEY-----',
+    'MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgF56XJ48FMRYsOHWC',
+    'NqDoL0loPvvngib80k1KXAEJQWOhRANCAASq8DjbtP/qJrkzCqiwKBXnr2GAhdDU',
+    'HaiT68RNTyJmeg+I/lovawjxEKKpd0r3H9/kRWZAMfXMcpxAmfn4NNNM',
+    '-----END PRIVATE KEY-----',
+].join('\n');
+
+// Test-only self-signed certificate for localhost HTTPS tests; not a production credential.
+const TEST_CERT_PEM = [
+    '-----BEGIN CERTIFICATE-----',
+    'MIIBbzCCARWgAwIBAgIUXJzlUtgO20ilH++PuBHv7koafY0wCgYIKoZIzj0EAwIw',
+    'FDESMBAGA1UEAwwJMTI3LjAuMC4xMCAXDTI2MTEyMTE0MzYyMVoYDzIxMjYxMDI4',
+    'MTQzNjIxWjAUMRIwEAYDVQQDDAkxMjcuMC4wLjEwWTATBgcqhkjOPQIBBggqhkjO',
+    'PQMBBwNCAASq8DjbtP/qJrkzCqiwKBXnr2GAhdDUHaiT68RNTyJmeg+I/lovawjx',
+    'EKKpd0r3H9/kRWZAMfXMcpxAmfn4NNNMo0MwQTAdBgNVHQ4EFgQUBdYptiuVtIxf',
+    '4oc8EqRMIRb/eK8wDwYDVR0TAQH/BAUwAwEB/zAPBgNVHREECDAGhwR/AAABMAoG',
+    'CCqGSM49BAMCA0gAMEUCIBOhPq01U+jAOVCq+oRdlAxuQkMymwVNS3rz8G6v9N66',
+    'AiEAi6IDMAT7eEHRhRJq2ApJSuVK7BzY9SH+QdqlMoaJURg=',
+    '-----END CERTIFICATE-----',
+].join('\n');
+
 test('fetchAgentCard decodes gzip/br/deflate via real node:https and rejects zip bombs and unsupported encodings', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'countersign-https-test-'));
-    const keyPath = path.join(dir, 'key.pem');
-    const certPath = path.join(dir, 'cert.pem');
-    execFileSync('openssl', [
-        'req',
-        '-x509',
-        '-newkey',
-        'rsa:2048',
-        '-nodes',
-        '-keyout',
-        keyPath,
-        '-out',
-        certPath,
-        '-days',
-        '1',
-        '-subj',
-        '/CN=127.0.0.1',
-        '-addext',
-        'subjectAltName=IP:127.0.0.1',
-    ]);
-    const key = fs.readFileSync(keyPath);
-    const cert = fs.readFileSync(certPath);
+    const key = Buffer.from(TEST_KEY_PEM);
+    const cert = Buffer.from(TEST_CERT_PEM);
 
     const cardBytes = fs.readFileSync(new URL('../agent-card/watcher.json', import.meta.url));
     const bombBytes = Buffer.alloc(4096, 0x41); // compresses to <100 bytes, expands >1000 bytes
@@ -730,6 +730,5 @@ test('fetchAgentCard decodes gzip/br/deflate via real node:https and rejects zip
     } finally {
         server.closeAllConnections?.();
         await new Promise((resolve) => server.close(resolve));
-        fs.rmSync(dir, { recursive: true });
     }
 });

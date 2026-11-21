@@ -159,8 +159,10 @@ export const commands = {
 
         const agent = await readAgentOf(tokenId, { blockHash: tipBlockHash, nodeClient: c });
         if (!agent) throw new Error(`registry token ${tokenId} is not registered`);
-        if (!isSameAccount(agent.ownerAccount, who.address)) {
-            throw new Error(`signer ${who.address} does not own token ${tokenId} (owner is ${agent.ownerAccount})`);
+        if (who.address !== agent.ownerAccount) {
+            throw new Error(
+                `signer ${who.address} must exactly match registered owner ${agent.ownerAccount} (CIS-8004.setMetadata rejects account aliases)`,
+            );
         }
         const current = await readMetadataText(tokenId, ANCHOR_KEY, { blockHash: tipBlockHash, nodeClient: c });
         if (current !== null && !TX_RE.test(current)) throw new Error(`metadata ${ANCHOR_KEY} is not a transaction hash`);
