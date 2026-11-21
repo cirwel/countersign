@@ -8,22 +8,29 @@ import {
     EXPLORER_TX,
     TX_RE,
     UUID_KEY,
+    WITNESS_KEY,
     applyNodeOptions,
     assertTestnet,
+    buildSignedSponsoredSetMetadata,
     client,
+    extractWitnessState,
     getTransactionState,
     isSameAccount,
     loadAnchorsFromHistory,
     loadSigner,
+    loadSignerFromFile,
     readAgentOf,
     readMetadataText,
     readRegisterData,
     readRegistryHistory,
     sendRegisterData,
     sendSetMetadata,
+    sendTransferWithMemo,
     verifyExistingAnchors,
     waitForFinalizedPolling,
     withRpcRetry,
+    witnessMatchesOnChain,
+    writeFileAtomic,
 } from './chain.mjs';
 import { UUID_RE, fetchCheckpointsAfter } from './checkpoints.mjs';
 import { NETWORK, REGISTRY } from './registry.mjs';
@@ -41,6 +48,14 @@ import {
     serializeTrail,
     stepHash,
 } from './trail.mjs';
+import {
+    X402_VERSION,
+    fetchWitnessHealth,
+    requestSponsoredPointer,
+    requestWitnessAnchor,
+} from './x402.mjs';
+
+export { writeFileAtomic };
 
 function isPidAlive(pid) {
     try {
@@ -130,48 +145,6 @@ function assertDistinctPaths(entries) {
             }
         }
     }
-}
-
-/** Atomically writes bytes or UTF-8 string via same-directory temp file + fsync + chmod + rename. */
-export function writeFileAtomic(filePath, content, { mode = 0o600 } = {}) {
-    const dir = path.dirname(filePath);
-    fs.mkdirSync(dir, { recursive: true });
-    const tmpPath = path.join(dir, `.${path.basename(filePath)}.tmp.${process.pid}.${crypto.randomUUID()}`);
-    const fd = fs.openSync(tmpPath, 'w', mode);
-    try {
-        const buf = typeof content === 'string' ? Buffer.from(content, 'utf8') : Buffer.from(content);
-        let offset = 0;
-        while (offset < buf.length) {
-            offset += fs.writeSync(fd, buf, offset, buf.length - offset);
-        }
-        fs.fchmodSync(fd, mode);
-        fs.fsyncSync(fd);
-    } catch (err) {
-        try {
-            fs.closeSync(fd);
-        } catch {}
-        try {
-            fs.unlinkSync(tmpPath);
-        } catch {}
-        throw err;
-    }
-    fs.closeSync(fd);
-    try {
-        fs.renameSync(tmpPath, filePath);
-    } catch (err) {
-        try {
-            fs.unlinkSync(tmpPath);
-        } catch {}
-        throw err;
-    }
-    try {
-        const dirFd = fs.openSync(dir, 'r');
-        try {
-            fs.fsyncSync(dirFd);
-        } finally {
-            fs.closeSync(dirFd);
-        }
-    } catch {}
 }
 
 function acquireTakeoverDir(takeoverDir, staleMs) {
@@ -414,10 +387,20 @@ function validatePositiveNumber(val, name, allowNull = false) {
 }
 
 function isTxRefObj(v) {
+    if (v === null || typeof v !== 'object' || Array.isArray(v)) return false;
+    if (v.mode === 'sponsored') {
+        return (
+            typeof v.sponsorUrl === 'string' &&
+            v.sponsorUrl.length > 0 &&
+            (v.txHash === null || TX_RE.test(v.txHash ?? '')) &&
+            typeof v.expiryEpochSeconds === 'number' &&
+            Number.isFinite(v.expiryEpochSeconds) &&
+            v.expiryEpochSeconds >= 0 &&
+            (v.nonce === undefined || (Number.isSafeInteger(v.nonce) && v.nonce >= 0))
+        );
+    }
+    if (v.mode !== undefined && v.mode !== 'direct') return false;
     return (
-        v !== null &&
-        typeof v === 'object' &&
-        !Array.isArray(v) &&
         TX_RE.test(v.txHash ?? '') &&
         (v.expiryEpochSeconds === undefined ||
             v.expiryEpochSeconds === null ||
@@ -455,6 +438,17 @@ export class AnchorWorker {
             source,
             submitAnchor = defaultSubmitAnchor,
             setMetadata = sendSetMetadata,
+            witnessUrl = null,
+            allowPrivateWitness = false,
+            sponsorPointer,
+            paymentSignature = null,
+            payFn = null,
+            payerSigner = null,
+            payerKeyfile = null,
+            fetchWitnessHealthFn = fetchWitnessHealth,
+            requestWitnessAnchorFn = requestWitnessAnchor,
+            requestSponsoredPointerFn = requestSponsoredPointer,
+            buildSponsoredSetMetadataFn = buildSignedSponsoredSetMetadata,
             now = () => performance.now(),
             wallClock = () => new Date(),
             sleep,
@@ -529,7 +523,25 @@ export class AnchorWorker {
                     batchSize: this.psqlBatchSize,
                 }));
         this.submitAnchor = submitAnchor;
+        this.hasCustomSubmitAnchor = opts.submitAnchor !== undefined;
         this.setMetadata = setMetadata;
+        if (witnessUrl !== null && witnessUrl !== undefined && (typeof witnessUrl !== 'string' || witnessUrl.trim().length === 0)) {
+            throw new Error('witnessUrl must be a non-empty URL string');
+        }
+        this.witnessUrl = witnessUrl ? witnessUrl.trim() : null;
+        this.allowPrivateWitness = Boolean(allowPrivateWitness);
+        if (sponsorPointer !== undefined && typeof sponsorPointer !== 'boolean') {
+            throw new TypeError('sponsorPointer must be a boolean');
+        }
+        this.sponsorPointer = sponsorPointer === undefined ? true : sponsorPointer;
+        this.paymentSignature = paymentSignature ?? null;
+        this.payFn = payFn ?? null;
+        this.payerSigner = payerSigner ?? null;
+        this.payerKeyfile = payerKeyfile ?? null;
+        this.fetchWitnessHealthFn = fetchWitnessHealthFn;
+        this.requestWitnessAnchorFn = requestWitnessAnchorFn;
+        this.requestSponsoredPointerFn = requestSponsoredPointerFn;
+        this.buildSponsoredSetMetadataFn = buildSponsoredSetMetadataFn;
         this.now = now;
         this.wallClock = wallClock;
         this.customSleep = sleep ?? null;
@@ -575,7 +587,8 @@ export class AnchorWorker {
                 }
             }
             if (!this.dryRun) {
-                if ((stCanon.mode & 0o777) !== 0o600 || sameInode) {
+                const canonIsSymlink = fs.lstatSync(this.statePath).isSymbolicLink();
+                if ((stCanon.mode & 0o777) !== 0o600 || (sameInode && canonIsSymlink)) {
                     writeFileAtomic(this.statePath, canonRaw, { mode: 0o600 });
                 }
                 fs.unlinkSync(this.legacyStatePath);
@@ -855,16 +868,147 @@ export class AnchorWorker {
         }
     }
 
-    _syncTipFromAnchor(anchorRecord, agentOwnerAccount) {
+    _syncTipFromAnchor(anchorRecord, agentOwnerAccount, witnessAccount = null) {
         this._verifiedTip = {
             pointer: anchorRecord?.txHash ?? null,
             ownerAccount: agentOwnerAccount,
+            witnessAccount,
             anchoredSeq: anchorRecord?.toSeq ?? 0,
             anchoredCommitment: anchorRecord?.commitment ?? null,
         };
         if (anchorRecord?.txHash) {
             this._lastSeenAnchorTxHash = anchorRecord.txHash;
         }
+    }
+
+    async _verifyWitnessAlignment({ c, tipBlockHash, agent, history }) {
+        const health = await this.fetchWitnessHealthFn({
+            witnessUrl: this.witnessUrl,
+            allowPrivate: this.allowPrivateWitness,
+        });
+        const onChainWitness = await readMetadataText(this.tokenId, WITNESS_KEY, {
+            blockHash: tipBlockHash,
+            nodeClient: c,
+        });
+        const witnessState = extractWitnessState(history);
+        if (!witnessMatchesOnChain(witnessState, onChainWitness)) {
+            throw new Error(
+                `on-chain ${WITNESS_KEY} (${onChainWitness ?? 'null'}) disagrees with MetadataSet history (${witnessState.currentWitness ?? 'null'})`,
+            );
+        }
+        if (onChainWitness === null || !isSameAccount(onChainWitness, health.witnessAccount)) {
+            throw new Error(
+                `on-chain ${WITNESS_KEY} (${onChainWitness ?? 'not set'}) does not match witness ${health.witnessAccount}`,
+            );
+        }
+        if (isSameAccount(health.witnessAccount, agent.ownerAccount)) {
+            throw new Error(`witness account ${health.witnessAccount} cannot equal token owner ${agent.ownerAccount}`);
+        }
+        return {
+            health,
+            onChainWitness,
+            witnessState,
+            useSponsoredPointer: this.sponsorPointer && Boolean(health.sponsorPointer),
+        };
+    }
+
+    _buildWitnessPayFn(c, ownerSigner) {
+        if (this.payFn) return this.payFn;
+        if (this.paymentSignature) return null;
+        return async (requirements) => {
+            const pWho = this.payerSigner ?? (this.payerKeyfile ? loadSignerFromFile(this.payerKeyfile) : ownerSigner);
+            const memoBytes = Buffer.from(requirements.extra.memoHex, 'hex');
+            const txRes = await sendTransferWithMemo({
+                to: requirements.payTo,
+                microCcd: BigInt(requirements.amount),
+                memoBytes,
+                who: pWho,
+                nodeClient: c,
+            });
+            return {
+                x402Version: X402_VERSION,
+                accepted: requirements,
+                payload: { txHash: txRes.hash },
+            };
+        };
+    }
+
+    async _submitPointerUpdate({
+        c,
+        signer,
+        anchorTxHash,
+        expectedPrevTx,
+        expectedSetNonce,
+        witnessCtx,
+        getPending,
+        setPending,
+    }) {
+        const latestBeforeSet = await readMetadataText(this.tokenId, ANCHOR_KEY, { nodeClient: c });
+        if (latestBeforeSet !== expectedPrevTx) {
+            throw new Error('countersign.anchor moved concurrently; refusing to overwrite pointer');
+        }
+
+        if (witnessCtx?.useSponsoredPointer) {
+            const built = await this.buildSponsoredSetMetadataFn({
+                tokenId: this.tokenId,
+                key: ANCHOR_KEY,
+                valueUtf8: anchorTxHash,
+                who: signer,
+                sponsorAddress: witnessCtx.health.witnessAccount,
+                expectedNonce: expectedSetNonce,
+                nodeClient: c,
+            });
+            const preSponsorPending = {
+                ...getPending(),
+                status: 'finalized',
+                metadataTx: {
+                    mode: 'sponsored',
+                    sponsorUrl: this.witnessUrl,
+                    txHash: null,
+                    expiryEpochSeconds: built.expiryEpochSeconds,
+                    nonce: built.nonce,
+                },
+            };
+            setPending(preSponsorPending);
+            this._updateState({ pendingAnchor: preSponsorPending });
+
+            const sp = await this.requestSponsoredPointerFn({
+                witnessUrl: this.witnessUrl,
+                tokenId: this.tokenId,
+                anchorTxHash,
+                transactionJson: built.transactionJson,
+                allowPrivate: this.allowPrivateWitness,
+            });
+            const postSponsorPending = {
+                ...getPending(),
+                status: 'finalized',
+                metadataTx: {
+                    mode: 'sponsored',
+                    sponsorUrl: this.witnessUrl,
+                    txHash: sp.metadataTxHash,
+                    expiryEpochSeconds: built.expiryEpochSeconds,
+                    nonce: built.nonce,
+                },
+            };
+            setPending(postSponsorPending);
+            this._updateState({ pendingAnchor: postSponsorPending });
+            return { hash: sp.metadataTxHash, sponsored: true };
+        }
+
+        const onMetadataSigned = ({ txHash: metaTxHash, expiryEpochSeconds: metaExpiry }) => {
+            const nextPending = {
+                ...getPending(),
+                status: 'finalized',
+                metadataTx: { txHash: metaTxHash, expiryEpochSeconds: metaExpiry },
+            };
+            setPending(nextPending);
+            this._updateState({ pendingAnchor: nextPending });
+        };
+        const res = await this.setMetadata(this.tokenId, ANCHOR_KEY, anchorTxHash, signer, c, {
+            onSigned: onMetadataSigned,
+            expectedNonce: expectedSetNonce,
+        });
+        return { hash: res?.hash ?? null, sponsored: false };
     }
 
     /** Syncs trail, reconciles chain history and pending anchors, and anchors if threshold is met. */
@@ -941,7 +1085,7 @@ export class AnchorWorker {
         const localSeq = this.trail.lastSeq;
         const noThresholds = this.everyRecords === null && this.everySeconds === null;
 
-        // Idle-poll fast path: verify cached pointer, owner, commitment, and !due before skipping history scans.
+        // Idle-poll fast path: verify cached pointer, owner, witness (if configured), commitment, and !due before skipping history scans.
         if (
             this._verifiedTip !== null &&
             !state?.pendingAnchor &&
@@ -949,12 +1093,20 @@ export class AnchorWorker {
             agent.ownerAccount === this._verifiedTip.ownerAccount &&
             localSeq >= this._verifiedTip.anchoredSeq
         ) {
+            let idleWitnessMatches = true;
+            if (this.witnessUrl) {
+                const currentWitness = await readMetadataText(this.tokenId, WITNESS_KEY, {
+                    blockHash: tipBlockHash,
+                    nodeClient: c,
+                });
+                idleWitnessMatches = currentWitness === this._verifiedTip.witnessAccount;
+            }
             const cachedAnchoredSeq = this._verifiedTip.anchoredSeq;
             const cachedCommitmentMatches =
                 cachedAnchoredSeq === 0
                     ? this._verifiedTip.anchoredCommitment === null
                     : this.trail.commitmentsBySeq.get(cachedAnchoredSeq)?.toString('hex') === this._verifiedTip.anchoredCommitment;
-            if (cachedCommitmentMatches) {
+            if (idleWitnessMatches && cachedCommitmentMatches) {
                 const dueFast =
                     shouldAnchor({
                         localSeq,
@@ -995,7 +1147,8 @@ export class AnchorWorker {
             this._seedLastAnchorMs(prev.blockTime);
             this._lastSeenAnchorTxHash = prev.txHash;
         }
-        this._syncTipFromAnchor(prev, agent.ownerAccount);
+        let witnessStateAtTip = extractWitnessState(history);
+        this._syncTipFromAnchor(prev, agent.ownerAccount, witnessStateAtTip.currentWitness);
 
         let remainingOwnerBudget = history.maxOwnerTxs - history.ownerNonceSpan;
         let resumedPendingOnThisTick = false;
@@ -1018,7 +1171,8 @@ export class AnchorWorker {
                     this._lastSeenAnchorTxHash = prev.txHash;
                 }
             }
-            this._syncTipFromAnchor(prev, agent.ownerAccount);
+            witnessStateAtTip = extractWitnessState(history);
+            this._syncTipFromAnchor(prev, agent.ownerAccount, witnessStateAtTip.currentWitness);
         };
 
         if (state?.pendingAnchor) {
@@ -1061,22 +1215,6 @@ export class AnchorWorker {
                 let metadataHandled = false;
                 if (pending.metadataTx) {
                     const metaTx = pending.metadataTx;
-                    let metaStatus = await getTransactionState(metaTx.txHash, c);
-
-                    if (metaStatus.state === 'absent') {
-                        if (finalizedChainEpochSec <= (metaTx.expiryEpochSeconds ?? Infinity)) {
-                            throw new Error(
-                                `pending metadata tx ${metaTx.txHash} in-flight/ambiguous until finalized chain time passes expiry ${metaTx.expiryEpochSeconds} (chain=${finalizedChainEpochSec})`,
-                            );
-                        }
-                        metaStatus = await getTransactionState(metaTx.txHash, c);
-                        if (metaStatus.state === 'absent') {
-                            this.log(`pending metadata tx ${metaTx.txHash} expired at chain time ${finalizedChainEpochSec}; clearing metadataTx`);
-                            pending = { ...pending, metadataTx: null };
-                            if (!this.dryRun) this._updateState({ pendingAnchor: pending });
-                        }
-                    }
-
                     const finishLandedMetadata = async () => {
                         const anchoredAt = this.wallClock().toISOString();
                         clearPending({
@@ -1086,72 +1224,36 @@ export class AnchorWorker {
                             lastAnchoredAt: anchoredAt,
                         });
                         this.lastAnchorMs = this.now();
-                        this.log(`resumed pending metadata tx ${metaTx.txHash} for anchor ${pending.txHash}`);
+                        this.log(`resumed pending metadata tx ${metaTx.txHash ?? 'sponsored'} for anchor ${pending.txHash}`);
                         metadataHandled = true;
                         resumedPendingOnThisTick = true;
                         await applyRefreshedSnapshot({ preserveTimerForTxHash: pending.txHash });
                     };
 
-                    if (metaStatus.state === 'pending' || metaStatus.state === 'committed') {
-                        if (this.dryRun) {
-                            const plan = {
-                                action: 'wait_metadata_finalization',
-                                tokenId: this.tokenId,
-                                txHash: pending.txHash,
-                                metadataTxHash: metaTx.txHash,
-                                toSeq: pending.toSeq,
-                            };
-                            this.log(`[dry-run] pending metadata recovery plan ${JSON.stringify(plan)}`);
+                    if (metaTx.mode === 'sponsored' && !metaTx.txHash) {
+                        let latestCurrent = await readMetadataText(this.tokenId, ANCHOR_KEY, { nodeClient: c });
+                        if (latestCurrent === pending.txHash) {
+                            await finishLandedMetadata();
+                        } else if (latestCurrent !== (prev?.txHash ?? null)) {
+                            this.log(`pending sponsored metadata landed and pointer moved concurrently; clearing pending state`);
+                            clearPending();
                             return {
                                 synced: syncResult.added,
                                 localSeq,
                                 anchoredSeq: prev?.toSeq ?? 0,
                                 anchored: false,
-                                dryRun: true,
-                                plan,
+                                dryRun: this.dryRun,
                             };
-                        }
-                        let waitSucceeded = false;
-                        try {
-                            await waitForFinalizedPolling(c, metaTx.txHash);
-                            waitSucceeded = true;
-                        } catch (waitErr) {
-                            if (/was rejected:/.test(waitErr.message)) {
-                                this.log(`pending metadata tx ${metaTx.txHash} rejected; clearing metadataTx`);
-                                pending = { ...pending, metadataTx: null };
-                                this._updateState({ pendingAnchor: pending });
-                            } else {
-                                throw waitErr;
-                            }
-                        }
-                        if (waitSucceeded) {
-                            const latestCurrent = await readMetadataText(this.tokenId, ANCHOR_KEY, { nodeClient: c });
-                            if (latestCurrent === pending.txHash) {
-                                await finishLandedMetadata();
-                            } else if (latestCurrent !== (prev?.txHash ?? null)) {
-                                this.log(`pending metadata tx ${metaTx.txHash} landed and pointer moved concurrently; clearing pending state`);
-                                clearPending();
-                                return {
-                                    synced: syncResult.added,
-                                    localSeq,
-                                    anchoredSeq: prev?.toSeq ?? 0,
-                                    anchored: false,
-                                    dryRun: this.dryRun,
-                                };
-                            }
-                        }
-                    } else if (metaStatus.state === 'finalized') {
-                        const failed = metaStatus.summary?.transactionType === 'failed' || Boolean(metaStatus.summary?.rejectReason);
-                        if (failed) {
-                            this.log(`pending metadata tx ${metaTx.txHash} failed on chain; clearing metadataTx`);
-                            pending = { ...pending, metadataTx: null };
-                            if (!this.dryRun) this._updateState({ pendingAnchor: pending });
+                        } else if (finalizedChainEpochSec <= (metaTx.expiryEpochSeconds ?? Infinity)) {
+                            throw new Error(
+                                `pending sponsored metadata tx (nonce ${metaTx.nonce ?? 'unknown'}) in-flight/ambiguous until finalized chain time passes expiry ${metaTx.expiryEpochSeconds} (chain=${finalizedChainEpochSec})`,
+                            );
                         } else {
-                            const latestCurrent = await readMetadataText(this.tokenId, ANCHOR_KEY, { nodeClient: c });
+                            latestCurrent = await readMetadataText(this.tokenId, ANCHOR_KEY, { nodeClient: c });
                             if (latestCurrent === pending.txHash) {
                                 await finishLandedMetadata();
                             } else if (latestCurrent !== (prev?.txHash ?? null)) {
-                                this.log(`pending metadata tx ${metaTx.txHash} landed and pointer moved concurrently; clearing pending state`);
+                                this.log(`pending sponsored metadata landed and pointer moved concurrently; clearing pending state`);
                                 clearPending();
                                 return {
                                     synced: syncResult.added,
@@ -1160,6 +1262,98 @@ export class AnchorWorker {
                                     anchored: false,
                                     dryRun: this.dryRun,
                                 };
+                            } else {
+                                this.log(`pending sponsored metadata tx expired at chain time ${finalizedChainEpochSec}; clearing metadataTx`);
+                                pending = { ...pending, metadataTx: null };
+                                if (!this.dryRun) this._updateState({ pendingAnchor: pending });
+                            }
+                        }
+                    } else {
+                        let metaStatus = await getTransactionState(metaTx.txHash, c);
+
+                        if (metaStatus.state === 'absent') {
+                            if (finalizedChainEpochSec <= (metaTx.expiryEpochSeconds ?? Infinity)) {
+                                throw new Error(
+                                    `pending metadata tx ${metaTx.txHash} in-flight/ambiguous until finalized chain time passes expiry ${metaTx.expiryEpochSeconds} (chain=${finalizedChainEpochSec})`,
+                                );
+                            }
+                            metaStatus = await getTransactionState(metaTx.txHash, c);
+                            if (metaStatus.state === 'absent') {
+                                this.log(`pending metadata tx ${metaTx.txHash} expired at chain time ${finalizedChainEpochSec}; clearing metadataTx`);
+                                pending = { ...pending, metadataTx: null };
+                                if (!this.dryRun) this._updateState({ pendingAnchor: pending });
+                            }
+                        }
+
+                        if (metaStatus.state === 'pending' || metaStatus.state === 'committed') {
+                            if (this.dryRun) {
+                                const plan = {
+                                    action: 'wait_metadata_finalization',
+                                    tokenId: this.tokenId,
+                                    txHash: pending.txHash,
+                                    metadataTxHash: metaTx.txHash,
+                                    toSeq: pending.toSeq,
+                                };
+                                this.log(`[dry-run] pending metadata recovery plan ${JSON.stringify(plan)}`);
+                                return {
+                                    synced: syncResult.added,
+                                    localSeq,
+                                    anchoredSeq: prev?.toSeq ?? 0,
+                                    anchored: false,
+                                    dryRun: true,
+                                    plan,
+                                };
+                            }
+                            let waitSucceeded = false;
+                            try {
+                                await waitForFinalizedPolling(c, metaTx.txHash);
+                                waitSucceeded = true;
+                            } catch (waitErr) {
+                                if (/was rejected:/.test(waitErr.message)) {
+                                    this.log(`pending metadata tx ${metaTx.txHash} rejected; clearing metadataTx`);
+                                    pending = { ...pending, metadataTx: null };
+                                    this._updateState({ pendingAnchor: pending });
+                                } else {
+                                    throw waitErr;
+                                }
+                            }
+                            if (waitSucceeded) {
+                                const latestCurrent = await readMetadataText(this.tokenId, ANCHOR_KEY, { nodeClient: c });
+                                if (latestCurrent === pending.txHash) {
+                                    await finishLandedMetadata();
+                                } else if (latestCurrent !== (prev?.txHash ?? null)) {
+                                    this.log(`pending metadata tx ${metaTx.txHash} landed and pointer moved concurrently; clearing pending state`);
+                                    clearPending();
+                                    return {
+                                        synced: syncResult.added,
+                                        localSeq,
+                                        anchoredSeq: prev?.toSeq ?? 0,
+                                        anchored: false,
+                                        dryRun: this.dryRun,
+                                    };
+                                }
+                            }
+                        } else if (metaStatus.state === 'finalized') {
+                            const failed = metaStatus.summary?.transactionType === 'failed' || Boolean(metaStatus.summary?.rejectReason);
+                            if (failed) {
+                                this.log(`pending metadata tx ${metaTx.txHash} failed on chain; clearing metadataTx`);
+                                pending = { ...pending, metadataTx: null };
+                                if (!this.dryRun) this._updateState({ pendingAnchor: pending });
+                            } else {
+                                const latestCurrent = await readMetadataText(this.tokenId, ANCHOR_KEY, { nodeClient: c });
+                                if (latestCurrent === pending.txHash) {
+                                    await finishLandedMetadata();
+                                } else if (latestCurrent !== (prev?.txHash ?? null)) {
+                                    this.log(`pending metadata tx ${metaTx.txHash} landed and pointer moved concurrently; clearing pending state`);
+                                    clearPending();
+                                    return {
+                                        synced: syncResult.added,
+                                        localSeq,
+                                        anchoredSeq: prev?.toSeq ?? 0,
+                                        anchored: false,
+                                        dryRun: this.dryRun,
+                                    };
+                                }
                             }
                         }
                     }
@@ -1231,6 +1425,8 @@ export class AnchorWorker {
                         const d = decodeAnchor(rd.data);
                         const expectedPrevTx = prev?.txHash ?? null;
                         const expectedCommitment = this.trail.commitmentsBySeq.get(d.toSeq)?.toString('hex');
+                        const activeWitness = extractWitnessState(history).currentWitness;
+                        const expectedAnchorSender = activeWitness ?? agent.ownerAccount;
                         const integrityOk =
                             d.tokenId === this.tokenId &&
                             d.toSeq === pending.toSeq &&
@@ -1238,7 +1434,7 @@ export class AnchorWorker {
                             Boolean(expectedCommitment) &&
                             d.commitment === expectedCommitment &&
                             d.commitment === pending.commitment &&
-                            isSameAccount(rd.sender, agent.ownerAccount) &&
+                            isSameAccount(rd.sender, expectedAnchorSender) &&
                             (!pending.sender || isSameAccount(rd.sender, pending.sender));
                         if (!integrityOk) {
                             throw new Error(
@@ -1290,32 +1486,32 @@ export class AnchorWorker {
                                     `signer ${signer.address} must exactly match registered owner ${agent.ownerAccount} (CIS-8004.setMetadata rejects account aliases)`,
                                 );
                             }
-                            if (!isSameAccount(rd.sender, signer.address)) {
+                            if (!isSameAccount(rd.sender, expectedAnchorSender)) {
                                 throw new Error(
-                                    `pending anchor ${pending.txHash} sender ${rd.sender} does not match signer ${signer.address}`,
+                                    `pending anchor ${pending.txHash} sender ${rd.sender} does not match authorized signer ${expectedAnchorSender}`,
                                 );
                             }
 
-                            const latestBeforeSet = await readMetadataText(this.tokenId, ANCHOR_KEY, { nodeClient: c });
-                            if (latestBeforeSet !== expectedPrevTx) {
-                                throw new Error('countersign.anchor moved concurrently; refusing to overwrite pointer');
-                            }
-
-                            const accForSet = await withRpcRetry(() => c.getAccountInfo(signer.sender, tipBlockHash));
+                            const witnessCtx = this.witnessUrl
+                                ? await this._verifyWitnessAlignment({ c, tipBlockHash, agent, history })
+                                : null;
+                            const setNonceBlockHash = this.witnessUrl
+                                ? (await withRpcRetry(() => c.getConsensusStatus())).lastFinalizedBlock
+                                : tipBlockHash;
+                            const accForSet = await withRpcRetry(() => c.getAccountInfo(signer.sender, setNonceBlockHash));
                             const expectedSetNonce = BigInt(accForSet.accountNonce.value);
 
-                            const onMetadataSigned = ({ txHash: metaTxHash, expiryEpochSeconds: metaExpiry }) => {
-                                pending = {
-                                    ...pending,
-                                    status: 'finalized',
-                                    metadataTx: { txHash: metaTxHash, expiryEpochSeconds: metaExpiry },
-                                };
-                                this._updateState({ pendingAnchor: pending });
-                            };
-
-                            await this.setMetadata(this.tokenId, ANCHOR_KEY, pending.txHash, signer, c, {
-                                onSigned: onMetadataSigned,
-                                expectedNonce: expectedSetNonce,
+                            await this._submitPointerUpdate({
+                                c,
+                                signer,
+                                anchorTxHash: pending.txHash,
+                                expectedPrevTx,
+                                expectedSetNonce,
+                                witnessCtx,
+                                getPending: () => pending,
+                                setPending: (nextP) => {
+                                    pending = nextP;
+                                },
                             });
                             resumedPendingOnThisTick = true;
                             const anchoredAt = this.wallClock().toISOString();
@@ -1388,9 +1584,11 @@ export class AnchorWorker {
             };
         }
 
-        if (remainingOwnerBudget < 2) {
+        const useWitnessAnchor = Boolean(this.witnessUrl && !this.hasCustomSubmitAnchor);
+        const requiredOwnerTxs = useWitnessAnchor ? 1 : 2;
+        if (remainingOwnerBudget < requiredOwnerTxs) {
             throw new Error(
-                `owner nonce span ${history.ownerNonceSpan} + 2 exceeds maxOwnerTxs=${history.maxOwnerTxs}; refusing to submit anchor`,
+                `owner nonce span ${history.ownerNonceSpan} + ${requiredOwnerTxs} exceeds maxOwnerTxs=${history.maxOwnerTxs}; refusing to submit anchor`,
             );
         }
 
@@ -1400,6 +1598,10 @@ export class AnchorWorker {
                 `signer ${signer.address} must exactly match registered owner ${agent.ownerAccount} (CIS-8004.setMetadata rejects account aliases)`,
             );
         }
+
+        const witnessCtx = this.witnessUrl
+            ? await this._verifyWitnessAlignment({ c, tipBlockHash, agent, history })
+            : null;
 
         const latestBeforeAnchor = await readMetadataText(this.tokenId, ANCHOR_KEY, { nodeClient: c });
         if (latestBeforeAnchor !== prevAnchorTx) {
@@ -1437,22 +1639,39 @@ export class AnchorWorker {
             });
         };
 
-        const submitted = await this.submitAnchor({
-            tokenId: this.tokenId,
-            toSeq,
-            commitment: commitmentHex,
-            prevAnchorTx,
-            data,
-            signer,
-            nodeClient: c,
-            onSigned: onAnchorSigned,
-            expectedNonce: expectedAnchorNonce,
-        });
-        const txHash = submitted?.txHash ?? submitted?.hash;
-        if (!TX_RE.test(txHash ?? '')) {
-            throw new Error(`submitAnchor returned invalid txHash: ${txHash}`);
+        let txHash;
+        let sender;
+        if (useWitnessAnchor) {
+            const witnessRes = await this.requestWitnessAnchorFn({
+                witnessUrl: this.witnessUrl,
+                tokenId: this.tokenId,
+                toSeq,
+                commitment: commitmentHex,
+                prevAnchorTx,
+                paymentSignature: this.paymentSignature,
+                payFn: this._buildWitnessPayFn(c, signer),
+                allowPrivate: this.allowPrivateWitness,
+            });
+            txHash = witnessRes.txHash;
+            sender = witnessRes.witnessAccount;
+        } else {
+            const submitted = await this.submitAnchor({
+                tokenId: this.tokenId,
+                toSeq,
+                commitment: commitmentHex,
+                prevAnchorTx,
+                data,
+                signer,
+                nodeClient: c,
+                onSigned: onAnchorSigned,
+                expectedNonce: expectedAnchorNonce,
+            });
+            txHash = submitted?.txHash ?? submitted?.hash;
+            if (!TX_RE.test(txHash ?? '')) {
+                throw new Error(`submitAnchor returned invalid txHash: ${txHash}`);
+            }
+            sender = submitted?.sender ?? signer.address;
         }
-        const sender = submitted?.sender ?? signer.address;
 
         currentPending = {
             txHash,
@@ -1475,23 +1694,26 @@ export class AnchorWorker {
         });
         this.log(`anchored seq 1..${toSeq}: ${EXPLORER_TX(txHash)}`);
 
-        const latestBeforeSet = await readMetadataText(this.tokenId, ANCHOR_KEY, { nodeClient: c });
-        if (latestBeforeSet !== prevAnchorTx) {
-            throw new Error('countersign.anchor moved concurrently; refusing to overwrite pointer');
+        let expectedSetNonce;
+        if (useWitnessAnchor) {
+            const latestCs = await withRpcRetry(() => c.getConsensusStatus());
+            const latestAcc = await withRpcRetry(() => c.getAccountInfo(signer.sender, latestCs.lastFinalizedBlock));
+            expectedSetNonce = BigInt(latestAcc.accountNonce.value);
+        } else {
+            expectedSetNonce = expectedAnchorNonce + 1n;
         }
 
-        const expectedSetNonce = expectedAnchorNonce + 1n;
-        const onMetadataSigned = ({ txHash: metaTxHash, expiryEpochSeconds: metaExpiry }) => {
-            currentPending = {
-                ...currentPending,
-                metadataTx: { txHash: metaTxHash, expiryEpochSeconds: metaExpiry },
-            };
-            this._updateState({ pendingAnchor: currentPending });
-        };
-
-        await this.setMetadata(this.tokenId, ANCHOR_KEY, txHash, signer, c, {
-            onSigned: onMetadataSigned,
-            expectedNonce: expectedSetNonce,
+        await this._submitPointerUpdate({
+            c,
+            signer,
+            anchorTxHash: txHash,
+            expectedPrevTx: prevAnchorTx,
+            expectedSetNonce,
+            witnessCtx,
+            getPending: () => currentPending,
+            setPending: (nextP) => {
+                currentPending = nextP;
+            },
         });
         const anchoredAt = this.wallClock().toISOString();
         this._updateState({
@@ -1509,6 +1731,7 @@ export class AnchorWorker {
                 commitment: commitmentHex,
             },
             agent.ownerAccount,
+            witnessCtx?.onChainWitness ?? witnessStateAtTip.currentWitness,
         );
         this.log(`registry entry now points at seq 1..${toSeq}: ${EXPLORER_TX(txHash)}`);
 

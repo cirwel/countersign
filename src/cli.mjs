@@ -5,20 +5,25 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
+import { AccountAddress } from '@concordium/web-sdk';
 import {
     ANCHOR_KEY,
     EXPLORER_TX,
     TESTNET_GENESIS,
     TX_RE,
     UUID_KEY,
+    WITNESS_KEY,
     applyNodeOptions,
     assertTestnet,
+    buildSignedSponsoredSetMetadata,
     chainIsUnbroken,
     client,
     coverageGrows,
+    extractWitnessState,
     isSameAccount,
     loadAnchorsFromHistory,
     loadSigner,
+    loadSignerFromFile,
     readAgentOf,
     readMetadataText,
     readRegisterData,
@@ -26,13 +31,16 @@ import {
     sendRegisterData,
     sendRegistryUpdate,
     sendSetMetadata,
+    sendTransferWithMemo,
     verifyExistingAnchors,
     withRpcRetry,
+    witnessMatchesOnChain,
 } from './chain.mjs';
 import { UUID_RE, fetchCheckpointsAfter } from './checkpoints.mjs';
 import { decodeBadge, encodeBadge, fetchAgentCard, verifyAgentCardBytes } from './cis8004.mjs';
 import { NETWORK, REGISTRY, mcp } from './registry.mjs';
 import { SCHEMA, commitments, decodeAnchor, encodeAnchor, readTrail, serializeTrail } from './trail.mjs';
+import { startWitnessServer } from './witness.mjs';
 import {
     canonicalStatePath,
     canonicalTrailPath,
@@ -44,6 +52,12 @@ import {
     withFileLock,
     writeFileAtomic,
 } from './worker.mjs';
+import {
+    X402_VERSION,
+    fetchWitnessHealth,
+    requestSponsoredPointer,
+    requestWitnessAnchor,
+} from './x402.mjs';
 
 const hex = (s) => Buffer.from(s, 'utf8').toString('hex');
 const sha256hex = (b) => crypto.createHash('sha256').update(b).digest('hex');
@@ -69,6 +83,33 @@ function parseOptionalPositiveNumber(val, flagName, defaultVal = null) {
     const n = Number(s);
     if (!Number.isFinite(n) || n <= 0) throw new Error(`${flagName} must be a positive finite number`);
     return n;
+}
+
+function parseOptionalPort(val, flagName) {
+    if (val === undefined || val === null) return null;
+    const s = typeof val === 'number' ? String(val) : String(val).trim();
+    if (!/^[0-9]+$/.test(s)) throw new Error(`${flagName} must be an integer between 0 and 65535`);
+    const n = Number(s);
+    if (!Number.isInteger(n) || n < 0 || n > 65535) throw new Error(`${flagName} must be between 0 and 65535`);
+    return n;
+}
+
+function parseOptionalNonNegativeBigIntStr(val, flagName, defaultVal) {
+    if (val === undefined || val === null) return defaultVal;
+    const s = typeof val === 'bigint' || typeof val === 'number' ? String(val) : String(val).trim();
+    if (!/^(?:0|[1-9][0-9]*)$/.test(s)) throw new Error(`${flagName} must be a non-negative integer`);
+    return s;
+}
+
+function resolveSponsorPointerOpt(opts, defaultVal = true) {
+    const hasDisable = Boolean(opts.noSponsorPointer ?? opts['no-sponsor-pointer']);
+    const explicitEnable = opts.sponsorPointer ?? opts['sponsor-pointer'];
+    if (hasDisable && explicitEnable === true) {
+        throw new Error('cannot combine --sponsor-pointer and --no-sponsor-pointer');
+    }
+    if (hasDisable) return false;
+    if (explicitEnable !== undefined) return Boolean(explicitEnable);
+    return defaultVal;
 }
 
 export const commands = {
@@ -241,13 +282,47 @@ export const commands = {
                 const acc = await withRpcRetry(() => c.getAccountInfo(who.sender, tipBlockHash));
                 const expectedAnchorNonce = BigInt(acc.accountNonce.value);
 
+                const witnessUrl = opts.witnessUrl ?? opts['witness-url'] ?? null;
+                const sponsorPointerOpt = resolveSponsorPointerOpt(opts, true);
+                const paymentSignature = opts.paymentSignature ?? opts['payment-signature'] ?? null;
+                const payerKeyfile =
+                    opts.payerKeyfile ?? opts['payer-keyfile'] ?? opts.paymentKeyfile ?? opts['payment-keyfile'] ?? null;
+                const allowPrivateWitness = Boolean(opts.allowPrivateWitness ?? opts['allow-private-witness']);
+                const fetchHealthFn = opts.fetchWitnessHealthFn ?? fetchWitnessHealth;
+                const reqWitnessAnchorFn = opts.requestWitnessAnchorFn ?? requestWitnessAnchor;
+                const reqSponsoredPointerFn = opts.requestSponsoredPointerFn ?? requestSponsoredPointer;
+
+                let witnessHealth = null;
+                if (witnessUrl) {
+                    witnessHealth = await fetchHealthFn({ witnessUrl, allowPrivate: allowPrivateWitness });
+                    const onChainWitness = await readMetadataText(tokenId, WITNESS_KEY, {
+                        blockHash: tipBlockHash,
+                        nodeClient: c,
+                    });
+                    const witnessState = extractWitnessState(history);
+                    if (!witnessMatchesOnChain(witnessState, onChainWitness)) {
+                        throw new Error(
+                            `on-chain ${WITNESS_KEY} (${onChainWitness ?? 'null'}) disagrees with MetadataSet history (${witnessState.currentWitness ?? 'null'})`,
+                        );
+                    }
+                    if (onChainWitness === null || !isSameAccount(onChainWitness, witnessHealth.witnessAccount)) {
+                        throw new Error(
+                            `on-chain ${WITNESS_KEY} (${onChainWitness ?? 'not set'}) does not match witness ${witnessHealth.witnessAccount}`,
+                        );
+                    }
+                    if (isSameAccount(witnessHealth.witnessAccount, agent.ownerAccount)) {
+                        throw new Error(`witness account ${witnessHealth.witnessAccount} cannot equal owner ${agent.ownerAccount}`);
+                    }
+                }
+
                 let hash = tx; // --tx <hash>: an anchor that was sent but whose pointer update did not land
                 if (hash) {
                     if (!TX_RE.test(hash)) throw new Error('--tx must be a transaction hash');
                     const sent = await readRegisterData(hash, c);
                     const d = decodeAnchor(sent.data);
+                    const authorizedSender = witnessHealth?.witnessAccount ?? who.address;
                     const ok =
-                        isSameAccount(sent.sender, who.address) &&
+                        (isSameAccount(sent.sender, authorizedSender) || isSameAccount(sent.sender, who.address)) &&
                         d.tokenId === tokenId &&
                         d.toSeq === count &&
                         d.commitment === last.toString('hex') &&
@@ -258,20 +333,208 @@ export const commands = {
                     if (latestBeforeAnchor !== (prev?.txHash ?? null)) {
                         throw new Error('countersign.anchor moved concurrently; refusing to overwrite pointer');
                     }
-                    const data = encodeAnchor({ tokenId, toSeq: count, commitment: last, prevAnchorTx: prev?.txHash ?? null });
-                    ({ hash } = await sendRegisterData(data, who, c, { expectedNonce: expectedAnchorNonce }));
-                    console.log(`anchored seq 1..${count}: ${EXPLORER_TX(hash)}`);
+                    if (witnessUrl) {
+                        const payFn = paymentSignature
+                            ? null
+                            : async (requirements) => {
+                                  const pWho = opts.payerSigner ?? (payerKeyfile ? loadSignerFromFile(payerKeyfile) : who);
+                                  const memoBytes = Buffer.from(requirements.extra.memoHex, 'hex');
+                                  const payTx = await sendTransferWithMemo({
+                                      to: requirements.payTo,
+                                      microCcd: BigInt(requirements.amount),
+                                      memoBytes,
+                                      who: pWho,
+                                      nodeClient: c,
+                                  });
+                                  return {
+                                      x402Version: X402_VERSION,
+                                      accepted: requirements,
+                                      payload: { txHash: payTx.hash },
+                                  };
+                              };
+                        const wRes = await reqWitnessAnchorFn({
+                            witnessUrl,
+                            tokenId,
+                            toSeq: count,
+                            commitment: last.toString('hex'),
+                            prevAnchorTx: prev?.txHash ?? null,
+                            paymentSignature,
+                            payFn,
+                            allowPrivate: allowPrivateWitness,
+                        });
+                        hash = wRes.txHash;
+                        console.log(`witnessed seq 1..${count}: ${EXPLORER_TX(hash)}`);
+                    } else {
+                        const data = encodeAnchor({ tokenId, toSeq: count, commitment: last, prevAnchorTx: prev?.txHash ?? null });
+                        ({ hash } = await sendRegisterData(data, who, c, { expectedNonce: expectedAnchorNonce }));
+                        console.log(`anchored seq 1..${count}: ${EXPLORER_TX(hash)}`);
+                    }
                 }
 
                 const latestBeforeSet = await readMetadataText(tokenId, ANCHOR_KEY, { nodeClient: c });
                 if (latestBeforeSet !== (prev?.txHash ?? null)) {
                     throw new Error('countersign.anchor moved concurrently; refusing to overwrite pointer');
                 }
-                const expectedSetNonce = tx ? expectedAnchorNonce : expectedAnchorNonce + 1n;
-                const set = await sendSetMetadata(tokenId, ANCHOR_KEY, hash, who, c, { expectedNonce: expectedSetNonce });
-                console.log('registry entry now points at the anchor:', EXPLORER_TX(set.hash));
+                let expectedSetNonce;
+                if (witnessUrl) {
+                    const latestCs = await withRpcRetry(() => c.getConsensusStatus());
+                    const latestAcc = await withRpcRetry(() => c.getAccountInfo(who.sender, latestCs.lastFinalizedBlock));
+                    expectedSetNonce = BigInt(latestAcc.accountNonce.value);
+                } else {
+                    expectedSetNonce = tx ? expectedAnchorNonce : expectedAnchorNonce + 1n;
+                }
+                if (witnessUrl && sponsorPointerOpt && witnessHealth?.sponsorPointer) {
+                    const built = await buildSignedSponsoredSetMetadata({
+                        tokenId,
+                        key: ANCHOR_KEY,
+                        valueUtf8: hash,
+                        who,
+                        sponsorAddress: witnessHealth.witnessAccount,
+                        expectedNonce: expectedSetNonce,
+                        nodeClient: c,
+                    });
+                    const sp = await reqSponsoredPointerFn({
+                        witnessUrl,
+                        tokenId,
+                        anchorTxHash: hash,
+                        transactionJson: built.transactionJson,
+                        allowPrivate: allowPrivateWitness,
+                    });
+                    console.log('registry entry now points at the anchor (sponsored):', EXPLORER_TX(sp.metadataTxHash));
+                } else {
+                    const set = await sendSetMetadata(tokenId, ANCHOR_KEY, hash, who, c, { expectedNonce: expectedSetNonce });
+                    console.log('registry entry now points at the anchor:', EXPLORER_TX(set.hash));
+                }
             });
         });
+    },
+
+    /** Authorize or clear a separate witness account (`countersign.witness`) for a registry token. */
+    async 'set-witness'({ token, tokenId, witness, clear, node, nodeClient, who: providedWho, ...opts }) {
+        const resolvedToken = token ?? tokenId;
+        if (!/^(?:0|[1-9][0-9]*)$/.test(resolvedToken !== undefined && resolvedToken !== null ? String(resolvedToken) : '')) {
+            throw new Error('--token <id> is required');
+        }
+        const tokenStr = String(resolvedToken);
+        const doClear = Boolean(clear);
+        const hasWitness = witness !== undefined && witness !== null;
+        if (doClear === hasWitness) {
+            throw new Error('pass either --witness <account> or --clear');
+        }
+        let valueUtf8 = '';
+        if (hasWitness) {
+            if (typeof witness !== 'string' || witness.length === 0) {
+                throw new Error('--witness must be a non-empty Concordium account address');
+            }
+            const parsed = AccountAddress.fromBase58(witness);
+            if (parsed.address !== witness) {
+                throw new Error(`--witness ${witness} is not in canonical Base58Check form`);
+            }
+            valueUtf8 = witness;
+        }
+
+        const nodeInsecure = Boolean(opts.nodeInsecure ?? opts['node-insecure']);
+        applyNodeOptions(node, nodeInsecure);
+        const who = providedWho ?? loadSigner();
+        const c = nodeClient ?? (await client());
+        await assertTestnet(c);
+
+        const cs = await withRpcRetry(() => c.getConsensusStatus());
+        const tipBlockHash = cs.lastFinalizedBlock;
+        const agent = await readAgentOf(tokenStr, { blockHash: tipBlockHash, nodeClient: c });
+        if (!agent) throw new Error(`registry token ${tokenStr} is not registered`);
+        if (agent.status !== 'Active') {
+            throw new Error(`registry token ${tokenStr} status is ${agent.status}`);
+        }
+        if (who.address !== agent.ownerAccount) {
+            throw new Error(
+                `signer ${who.address} must exactly match registered owner ${agent.ownerAccount} (CIS-8004.setMetadata rejects account aliases)`,
+            );
+        }
+        if (!doClear && isSameAccount(valueUtf8, agent.ownerAccount)) {
+            throw new Error(`witness account ${valueUtf8} cannot be the same as token owner ${agent.ownerAccount}`);
+        }
+
+        const next = await withRpcRetry(() => c.getNextAccountNonce(who.sender));
+        if (next.allFinal !== true) {
+            throw new Error(`owner ${who.address} has unfinalized transactions (allFinal=${next.allFinal}); retry after finalization`);
+        }
+        const expectedNonce = BigInt(next.nonce?.value ?? next.nonce);
+        const res = await sendSetMetadata(tokenStr, WITNESS_KEY, valueUtf8, who, c, { expectedNonce });
+        console.log(
+            doClear ? `cleared ${WITNESS_KEY}:` : `set ${WITNESS_KEY} to ${valueUtf8}:`,
+            EXPLORER_TX(res.hash),
+        );
+        return { hash: res.hash, witness: doClear ? null : valueUtf8 };
+    },
+
+    /** Run the standalone x402-paid Countersign witness HTTP service. */
+    async witness({ node, nodeClient, ...opts }) {
+        const nodeInsecure = Boolean(opts.nodeInsecure ?? opts['node-insecure']);
+        applyNodeOptions(node, nodeInsecure);
+        const witnessKeyfile = opts.witnessKeyfile ?? opts['witness-keyfile'];
+        const ledgerPath = opts.ledger ?? opts.ledgerPath;
+        const host = opts.host ?? '127.0.0.1';
+        const port = parseOptionalPort(opts.port, '--port') ?? 8787;
+        const priceMicroCcd = parseOptionalNonNegativeBigIntStr(
+            opts.priceMicroCcd ?? opts['price-micro-ccd'],
+            '--price-micro-ccd',
+            '1000000',
+        );
+        const payTo = opts.payTo ?? opts['pay-to'];
+        const facilitatorUrl = opts.facilitatorUrl ?? opts['facilitator-url'];
+        const sponsorPointer = resolveSponsorPointerOpt(opts, true);
+        const allowPrivateCard = Boolean(opts.allowPrivateCard ?? opts['allow-private-card']);
+        const allowPrivateFacilitator = Boolean(
+            opts.allowPrivateFacilitator ?? opts['allow-private-facilitator'],
+        );
+
+        const handle = await startWitnessServer({
+            host,
+            port,
+            priceMicroCcd,
+            payTo,
+            sponsorPointer,
+            allowPrivateCard,
+            allowPrivateFacilitator,
+            ledgerPath,
+            witnessKeyfile,
+            signer: opts.signer,
+            nodeClient,
+            verifier: opts.verifier,
+            facilitatorUrl,
+            fetchCard: opts.fetchCard,
+            log: opts.log,
+        });
+
+        console.log(
+            `witness listening on ${handle.url} (account=${handle.witnessAccount}, payTo=${handle.payTo}, price=${handle.priceMicroCcd} microCCD, sponsorPointer=${handle.sponsorPointer})`,
+        );
+
+        let closing = false;
+        const shutdown = async () => {
+            if (closing) return;
+            closing = true;
+            process.off('SIGINT', onSig);
+            process.off('SIGTERM', onSig);
+            await handle.close();
+        };
+        const onSig = () => {
+            shutdown().catch((e) => {
+                console.error('error closing witness:', e.message);
+                process.exit(1);
+            });
+        };
+        process.on('SIGINT', onSig);
+        process.on('SIGTERM', onSig);
+
+        const origClose = handle.close;
+        handle.close = async () => {
+            process.off('SIGINT', onSig);
+            process.off('SIGTERM', onSig);
+            await origClose();
+        };
+        return handle;
     },
 
     /** Anyone: check a badge and a trail file directly against a Concordium testnet node. Needs no keys. */
@@ -279,6 +542,8 @@ export const commands = {
         process.exitCode = 1; // only a completed, fully passing run resets this
         const nodeInsecure = Boolean(opts.nodeInsecure ?? opts['node-insecure']);
         const allowPrivate = Boolean(opts.allowPrivateCard ?? opts['allow-private-card']);
+        const requireWitness = Boolean(opts.requireWitness ?? opts['require-witness']);
+        const expectedWitness = opts.witness !== undefined && opts.witness !== null ? String(opts.witness) : null;
         applyNodeOptions(node, nodeInsecure);
         const checks = [];
         let covered = 0;
@@ -287,6 +552,18 @@ export const commands = {
             console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  ' + detail : ''}`);
             return ok;
         };
+
+        if (expectedWitness !== null) {
+            try {
+                const parsedWitness = AccountAddress.fromBase58(expectedWitness);
+                if (parsedWitness.address !== expectedWitness) {
+                    throw new Error('not in canonical Base58Check form');
+                }
+            } catch (e) {
+                check('witness flag is a canonical Concordium account address', false, e.message);
+                return finish(checks);
+            }
+        }
 
         let header, records;
         try {
@@ -379,6 +656,26 @@ export const commands = {
         }
         check('on-chain ownership and event history are intact since registration', true, `reg block ${history.regHeight}, ${history.scannedBlocks} owner tx block(s)`);
 
+        const onChainWitness = await readMetadataText(tokenId, WITNESS_KEY, { blockHash: tipBlockHash, nodeClient: c });
+        let witnessState;
+        try {
+            witnessState = extractWitnessState(history);
+        } catch (e) {
+            check('on-chain witness metadata matches reconstructed witness history', false, e.message);
+            return finish(checks);
+        }
+        if (!witnessMatchesOnChain(witnessState, onChainWitness)) {
+            check(
+                'on-chain witness metadata matches reconstructed witness history',
+                false,
+                `on-chain ${onChainWitness ?? 'null'} !== history ${witnessState.currentWitness ?? 'null'}`,
+            );
+            return finish(checks);
+        }
+        if (witnessState.sawWitnessEvent) {
+            check('on-chain witness metadata matches reconstructed witness history', true, onChainWitness ?? 'cleared');
+        }
+
         let anchors;
         try {
             anchors = await loadAnchorsFromHistory(history, c, tipBlockHeight);
@@ -387,7 +684,31 @@ export const commands = {
             return finish(checks);
         }
         check('the current pointer is the last one in the registry event history', anchors.at(-1)?.txHash === current, `${anchors.length} pointer updates`);
-        check('every anchor was sent by the registry entry owner', Boolean(owner) && anchors.every((a) => isSameAccount(a.sender, owner)), owner);
+        const senderLabel = witnessState.sawWitnessEvent
+            ? 'every anchor was sent by the authorized signer (owner or active witness)'
+            : 'every anchor was sent by the registry entry owner';
+        check(
+            senderLabel,
+            Boolean(owner) && anchors.every((a) => isSameAccount(a.sender, a.authorizedWitness ?? owner)),
+            witnessState.currentWitness ? `owner ${owner}, witness ${witnessState.currentWitness}` : owner,
+        );
+        if (requireWitness) {
+            const latest = anchors.at(-1);
+            const ok =
+                witnessState.currentWitness !== null &&
+                Boolean(latest?.authorizedWitness) &&
+                isSameAccount(latest.sender, witnessState.currentWitness);
+            check('latest anchor was countersigned by active witness', ok, witnessState.currentWitness ?? 'none');
+        }
+        if (expectedWitness !== null) {
+            const latest = anchors.at(-1);
+            const ok =
+                witnessState.currentWitness !== null &&
+                isSameAccount(witnessState.currentWitness, expectedWitness) &&
+                Boolean(latest?.authorizedWitness) &&
+                isSameAccount(latest.sender, expectedWitness);
+            check(`latest anchor was countersigned by witness ${expectedWitness}`, ok, witnessState.currentWitness ?? 'none');
+        }
         check('every anchor names this registry token', anchors.every((a) => a.tokenId === tokenId));
         check('anchors form one unbroken chain (each names the one before it, none was skipped or replaced)', chainIsUnbroken(anchors));
         check('each anchor covers more records than the one before', coverageGrows(anchors));
@@ -435,6 +756,12 @@ export const commands = {
         const once = Boolean(opts.once);
         const dryRun = Boolean(opts.dryRun ?? opts['dry-run']);
         const nodeInsecure = Boolean(opts.nodeInsecure ?? opts['node-insecure']);
+        const witnessUrl = opts.witnessUrl ?? opts['witness-url'] ?? null;
+        const allowPrivateWitness = Boolean(opts.allowPrivateWitness ?? opts['allow-private-witness']);
+        const sponsorPointer = resolveSponsorPointerOpt(opts, true);
+        const paymentSignature = opts.paymentSignature ?? opts['payment-signature'] ?? null;
+        const payerKeyfile =
+            opts.payerKeyfile ?? opts['payer-keyfile'] ?? opts.paymentKeyfile ?? opts['payment-keyfile'] ?? null;
 
         const ac = new AbortController();
         const externalSignal = opts.signal;
@@ -476,6 +803,17 @@ export const commands = {
                 nodeClient,
                 signer: opts.signer ?? opts.who ?? null,
                 ...(opts.loadSignerFn ? { loadSignerFn: opts.loadSignerFn } : {}),
+                witnessUrl,
+                allowPrivateWitness,
+                sponsorPointer,
+                paymentSignature,
+                payerKeyfile,
+                ...(opts.payFn ? { payFn: opts.payFn } : {}),
+                ...(opts.payerSigner ? { payerSigner: opts.payerSigner } : {}),
+                ...(opts.fetchWitnessHealthFn ? { fetchWitnessHealthFn: opts.fetchWitnessHealthFn } : {}),
+                ...(opts.requestWitnessAnchorFn ? { requestWitnessAnchorFn: opts.requestWitnessAnchorFn } : {}),
+                ...(opts.requestSponsoredPointerFn ? { requestSponsoredPointerFn: opts.requestSponsoredPointerFn } : {}),
+                ...(opts.buildSponsoredSetMetadataFn ? { buildSponsoredSetMetadataFn: opts.buildSponsoredSetMetadataFn } : {}),
                 source: opts.source,
                 submitAnchor: opts.submitAnchor,
                 setMetadata: opts.setMetadata,
@@ -531,6 +869,18 @@ if (isMainEntry()) {
         'tx',
         'node',
         'card',
+        'witness',
+        'witness-keyfile',
+        'witness-url',
+        'ledger',
+        'host',
+        'port',
+        'price-micro-ccd',
+        'pay-to',
+        'facilitator-url',
+        'payment-signature',
+        'payer-keyfile',
+        'payment-keyfile',
         'every-records',
         'every-seconds',
         'poll-seconds',
@@ -538,7 +888,18 @@ if (isMainEntry()) {
         'psql-timeout',
         'psql-batch-size',
     ];
-    const boolOpts = ['node-insecure', 'allow-private-card', 'once', 'dry-run'];
+    const boolOpts = [
+        'node-insecure',
+        'allow-private-card',
+        'allow-private-witness',
+        'allow-private-facilitator',
+        'once',
+        'dry-run',
+        'clear',
+        'require-witness',
+        'sponsor-pointer',
+        'no-sponsor-pointer',
+    ];
     const { values } = parseArgs({
         args: rest,
         options: {

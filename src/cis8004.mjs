@@ -1,6 +1,7 @@
 // Pure CIS-8004 / CIS-2 binary codecs, Concordium badge codec, and SSRF-hardened Agent Card validator.
 import crypto from 'node:crypto';
 import dns from 'node:dns';
+import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
 import zlib from 'node:zlib';
@@ -580,24 +581,39 @@ export function isDisallowedIp(rawIp) {
 }
 
 /**
- * Fetches an Agent Card over HTTPS without redirects, enforcing pre-connect SSRF IP checks,
- * timeout, and a streaming byte cap.
+ * Performs an SSRF-hardened HTTP(S) request without redirects, enforcing pre-connect public-IP DNS/literal guards,
+ * streaming compressed and decompressed byte caps, and wall-clock timeout.
+ * Plaintext http:// is refused unless allowPrivate === true.
  */
-export async function fetchAgentCard(
+export async function safeHttpsRequest(
     uri,
-    { timeoutMs = 15000, maxBytes = 1048576, allowPrivate = false, lookupFn = dns.lookup, requestFn = https.request, ca } = {},
+    {
+        method = 'GET',
+        headers = {},
+        body,
+        timeoutMs = 15000,
+        maxBytes = 1048576,
+        allowPrivate = false,
+        acceptStatus = (status) => status >= 200 && status < 300,
+        lookupFn = dns.lookup,
+        requestFn,
+        ca,
+        label = 'response',
+        urlLabel = 'URL',
+    } = {},
 ) {
     let url;
     try {
         url = new URL(uri);
     } catch {
-        throw new Error(`invalid agentUri: ${uri}`);
+        throw new Error(`invalid ${urlLabel}: ${uri}`);
     }
-    if (url.protocol !== 'https:') {
-        throw new Error(`refusing non-HTTPS agentUri protocol ${url.protocol}`);
+    const protocolAllowed = url.protocol === 'https:' || (allowPrivate && url.protocol === 'http:');
+    if (!protocolAllowed) {
+        throw new Error(`refusing non-HTTPS ${urlLabel} protocol ${url.protocol}`);
     }
     if (url.username || url.password) {
-        throw new Error('refusing agentUri containing embedded credentials');
+        throw new Error(`refusing ${urlLabel} containing embedded credentials`);
     }
     if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
         throw new Error(`invalid maxBytes: ${maxBytes}`);
@@ -608,7 +624,7 @@ export async function fetchAgentCard(
 
     const hostname = url.hostname.startsWith('[') && url.hostname.endsWith(']') ? url.hostname.slice(1, -1) : url.hostname;
     if (!allowPrivate && net.isIP(hostname) && isDisallowedIp(hostname)) {
-        throw new Error(`refusing private or non-public IP address ${hostname} in agentUri`);
+        throw new Error(`refusing private or non-public IP address ${hostname} in ${urlLabel}`);
     }
 
     const safeLookup = (host, options, cb) => {
@@ -636,6 +652,24 @@ export async function fetchAgentCard(
         });
     };
 
+    const transportRequestFn = requestFn ?? (url.protocol === 'http:' ? http.request : https.request);
+    let bodyBuf = null;
+    if (body !== undefined && body !== null) {
+        if (Buffer.isBuffer(body)) bodyBuf = body;
+        else if (body instanceof Uint8Array) bodyBuf = Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+        else if (typeof body === 'string') bodyBuf = Buffer.from(body, 'utf8');
+        else throw new TypeError('request body must be a Buffer, Uint8Array, or string');
+    }
+
+    const reqHeaders = {
+        accept: 'application/json',
+        'accept-encoding': 'gzip, br, deflate, identity',
+        ...headers,
+    };
+    if (bodyBuf !== null && reqHeaders['content-length'] === undefined && reqHeaders['Content-Length'] === undefined) {
+        reqHeaders['content-length'] = String(bodyBuf.byteLength);
+    }
+
     return new Promise((resolve, reject) => {
         let settled = false;
         let activeRes = null;
@@ -648,102 +682,100 @@ export async function fetchAgentCard(
             else resolve(value);
         };
 
-        const req = requestFn(
-            url,
-            {
-                method: 'GET',
-                agent: false,
-                lookup: safeLookup,
-                ...(ca !== undefined ? { ca } : {}),
-                headers: { accept: 'application/json', 'accept-encoding': 'gzip, br, deflate, identity' },
-            },
-            (res) => {
-                activeRes = res;
-                const fail = (err) => {
-                    done(err);
-                    activeDecompressor?.destroy();
-                    res.destroy();
-                    req.destroy();
-                };
-                const status = res.statusCode ?? 0;
-                if (status >= 300 && status < 400) {
-                    fail(new Error(`refusing HTTP ${status} redirect fetching agent card`));
-                    return;
-                }
-                if (status < 200 || status >= 300) {
-                    fail(new Error(`HTTP ${status} fetching agent card from ${url.origin}${url.pathname}`));
-                    return;
-                }
-                const cl = res.headers?.['content-length'];
-                if (typeof cl === 'string' && /^\d+$/.test(cl) && Number(cl) > maxBytes) {
-                    fail(new Error(`agent card Content-Length (${cl}) exceeds ${maxBytes} byte limit`));
-                    return;
-                }
+        const reqOpts = {
+            method,
+            agent: false,
+            lookup: safeLookup,
+            ...(ca !== undefined && url.protocol === 'https:' ? { ca } : {}),
+            headers: reqHeaders,
+        };
 
-                const encHeader = String(res.headers?.['content-encoding'] ?? '').trim().toLowerCase();
-                let decompressor = null;
-                if (encHeader === '' || encHeader === 'identity') {
-                    decompressor = null;
-                } else if (encHeader === 'gzip' || encHeader === 'x-gzip') {
-                    decompressor = zlib.createGunzip();
-                } else if (encHeader === 'deflate') {
-                    decompressor = zlib.createInflate();
-                } else if (encHeader === 'br') {
-                    decompressor = zlib.createBrotliDecompress();
-                } else {
-                    fail(new Error(`unsupported Content-Encoding: ${encHeader}`));
-                    return;
-                }
-                activeDecompressor = decompressor;
+        const req = transportRequestFn(url, reqOpts, (res) => {
+            activeRes = res;
+            const fail = (err) => {
+                done(err);
+                activeDecompressor?.destroy();
+                res.destroy();
+                req.destroy();
+            };
+            const status = res.statusCode ?? 0;
+            if (status >= 300 && status < 400) {
+                fail(new Error(`refusing HTTP ${status} redirect fetching ${label}`));
+                return;
+            }
+            if (!acceptStatus(status)) {
+                fail(new Error(`HTTP ${status} fetching ${label} from ${url.origin}${url.pathname}`));
+                return;
+            }
+            const cl = res.headers?.['content-length'];
+            if (typeof cl === 'string' && /^\d+$/.test(cl) && Number(cl) > maxBytes) {
+                fail(new Error(`${label} Content-Length (${cl}) exceeds ${maxBytes} byte limit`));
+                return;
+            }
 
-                if (!decompressor) {
-                    const chunks = [];
-                    let total = 0;
-                    res.on('data', (chunk) => {
-                        const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-                        total += b.byteLength;
-                        if (total > maxBytes) {
-                            fail(new Error(`agent card exceeds ${maxBytes} byte limit`));
-                            return;
-                        }
-                        chunks.push(b);
-                    });
-                    res.on('end', () => done(null, Buffer.concat(chunks, total)));
-                    res.on('error', (err) => fail(err));
-                    res.on('aborted', () => fail(new Error('agent card response aborted')));
-                    return;
-                }
+            const encHeader = String(res.headers?.['content-encoding'] ?? '').trim().toLowerCase();
+            let decompressor = null;
+            if (encHeader === '' || encHeader === 'identity') {
+                decompressor = null;
+            } else if (encHeader === 'gzip' || encHeader === 'x-gzip') {
+                decompressor = zlib.createGunzip();
+            } else if (encHeader === 'deflate') {
+                decompressor = zlib.createInflate();
+            } else if (encHeader === 'br') {
+                decompressor = zlib.createBrotliDecompress();
+            } else {
+                fail(new Error(`unsupported Content-Encoding: ${encHeader}`));
+                return;
+            }
+            activeDecompressor = decompressor;
 
-                let wireTotal = 0;
+            if (!decompressor) {
+                const chunks = [];
+                let total = 0;
                 res.on('data', (chunk) => {
                     const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-                    wireTotal += b.byteLength;
-                    if (wireTotal > maxBytes) {
-                        fail(new Error(`agent card exceeds ${maxBytes} byte limit`));
-                    }
-                });
-                res.on('error', (err) => fail(err));
-                res.on('aborted', () => fail(new Error('agent card response aborted')));
-
-                const chunks = [];
-                let decodedTotal = 0;
-                decompressor.on('data', (chunk) => {
-                    const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-                    decodedTotal += b.byteLength;
-                    if (decodedTotal > maxBytes) {
-                        fail(new Error(`agent card exceeds ${maxBytes} byte limit`));
+                    total += b.byteLength;
+                    if (total > maxBytes) {
+                        fail(new Error(`${label} exceeds ${maxBytes} byte limit`));
                         return;
                     }
                     chunks.push(b);
                 });
-                decompressor.on('end', () => done(null, Buffer.concat(chunks, decodedTotal)));
-                decompressor.on('error', (err) => fail(new Error(`invalid compressed agent card: ${err.message}`)));
-                res.pipe(decompressor);
-            },
-        );
+                res.on('end', () => done(null, { statusCode: status, headers: res.headers ?? {}, body: Buffer.concat(chunks, total) }));
+                res.on('error', (err) => fail(err));
+                res.on('aborted', () => fail(new Error(`${label} response aborted`)));
+                return;
+            }
+
+            let wireTotal = 0;
+            res.on('data', (chunk) => {
+                const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                wireTotal += b.byteLength;
+                if (wireTotal > maxBytes) {
+                    fail(new Error(`${label} exceeds ${maxBytes} byte limit`));
+                }
+            });
+            res.on('error', (err) => fail(err));
+            res.on('aborted', () => fail(new Error(`${label} response aborted`)));
+
+            const chunks = [];
+            let decodedTotal = 0;
+            decompressor.on('data', (chunk) => {
+                const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                decodedTotal += b.byteLength;
+                if (decodedTotal > maxBytes) {
+                    fail(new Error(`${label} exceeds ${maxBytes} byte limit`));
+                    return;
+                }
+                chunks.push(b);
+            });
+            decompressor.on('end', () => done(null, { statusCode: status, headers: res.headers ?? {}, body: Buffer.concat(chunks, decodedTotal) }));
+            decompressor.on('error', (err) => fail(new Error(`invalid compressed ${label}: ${err.message}`)));
+            res.pipe(decompressor);
+        });
 
         const timer = setTimeout(() => {
-            const err = new Error(`fetching agent card timed out after ${timeoutMs}ms`);
+            const err = new Error(`fetching ${label} timed out after ${timeoutMs}ms`);
             done(err);
             activeDecompressor?.destroy();
             activeRes?.destroy();
@@ -751,6 +783,88 @@ export async function fetchAgentCard(
         }, timeoutMs);
 
         req.on('error', (err) => done(err));
-        req.end();
+        if (bodyBuf !== null) req.end(bodyBuf);
+        else req.end();
     });
+}
+
+/**
+ * Fetches and strictly parses JSON over SSRF-hardened HTTP(S) using `safeHttpsRequest`.
+ */
+export async function safeJsonFetch(
+    uri,
+    {
+        method = 'GET',
+        headers = {},
+        body,
+        timeoutMs = 15000,
+        maxBytes = 65536,
+        allowPrivate = false,
+        acceptStatus = (status) => status >= 200 && status < 300,
+        lookupFn = dns.lookup,
+        requestFn,
+        ca,
+        label = 'JSON response',
+        urlLabel = 'URL',
+    } = {},
+) {
+    let encodedBody = body;
+    const reqHeaders = { ...headers };
+    if (body !== undefined && body !== null && typeof body !== 'string' && !Buffer.isBuffer(body) && !(body instanceof Uint8Array)) {
+        encodedBody = JSON.stringify(body);
+        if (reqHeaders['content-type'] === undefined && reqHeaders['Content-Type'] === undefined) {
+            reqHeaders['content-type'] = 'application/json';
+        }
+    }
+    const res = await safeHttpsRequest(uri, {
+        method,
+        headers: reqHeaders,
+        body: encodedBody,
+        timeoutMs,
+        maxBytes,
+        allowPrivate,
+        acceptStatus,
+        lookupFn,
+        requestFn,
+        ca,
+        label,
+        urlLabel,
+    });
+    let data = null;
+    let text = '';
+    if (res.body.length > 0) {
+        text = utf8Fatal.decode(res.body);
+        try {
+            data = JSON.parse(text);
+        } catch (err) {
+            if (res.statusCode >= 200 && res.statusCode < 300) {
+                throw new Error(`${label} is not valid JSON: ${err.message}`);
+            }
+        }
+    } else if (res.statusCode >= 200 && res.statusCode < 300) {
+        throw new Error(`${label} returned an empty body`);
+    }
+    return { statusCode: res.statusCode, headers: res.headers, data, text, body: res.body };
+}
+
+/**
+ * Fetches an Agent Card over HTTPS without redirects, enforcing pre-connect SSRF IP checks,
+ * timeout, and a streaming byte cap.
+ */
+export async function fetchAgentCard(
+    uri,
+    { timeoutMs = 15000, maxBytes = 1048576, allowPrivate = false, lookupFn = dns.lookup, requestFn, ca } = {},
+) {
+    const res = await safeHttpsRequest(uri, {
+        method: 'GET',
+        timeoutMs,
+        maxBytes,
+        allowPrivate,
+        lookupFn,
+        requestFn,
+        ca,
+        label: 'agent card',
+        urlLabel: 'agentUri',
+    });
+    return res.body;
 }

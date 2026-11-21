@@ -39,7 +39,7 @@ git clone https://github.com/cirwel/countersign && cd countersign && npm install
 node src/cli.mjs verify --badge JyP9UYjHZ84JsGq5rAC2F --trail trail/watcher.jsonl
 ```
 
-Optional flags: `--node <host[:port]|url>` (or `COUNTERSIGN_NODE`, supporting `http://` / `grpc://` plaintext or `https://` / `grpcs://` TLS), `--node-insecure` (or `COUNTERSIGN_NODE_INSECURE=1`) for plaintext local gRPC nodes, `--card <path>` to verify a local Agent Card copy instead of fetching `agent_uri` over HTTPS, and `--allow-private-card` to allow private/loopback card hosts during local testing (blocked by default against SSRF).
+Optional flags: `--node <host[:port]|url>` (or `COUNTERSIGN_NODE`, supporting `http://` / `grpc://` plaintext or `https://` / `grpcs://` TLS), `--node-insecure` (or `COUNTERSIGN_NODE_INSECURE=1`) for plaintext local gRPC nodes, `--card <path>` to verify a local Agent Card copy instead of fetching `agent_uri` over HTTPS, `--allow-private-card` to allow private/loopback card hosts during local testing (blocked by default against SSRF), `--require-witness` to require the latest anchor to be countersigned by an active witness, and `--witness <account>` to require a specific canonical witness account.
 
 The command makes zero calls to Concordium's hosted Agent Registry MCP server. It:
 
@@ -48,7 +48,7 @@ The command makes zero calls to Concordium's hosted Agent Registry MCP server. I
 3. calls `CIS-8004.agentOf` and `CIS-8004.getMetadata` directly on the node (`invokeContract`), fetches the Agent Card over HTTPS (no redirects, pre-connect public-IP SSRF guard, 1 MiB cap) or reads `--card`, verifies its SHA-256 against the on-chain hash, and checks the `concordium-badge/v1` extension (`tokenAddress`, `owner.account`, `contracts.cis8004`);
 4. confirms the trail header and on-chain `unitares.agent_uuid` metadata agree (using BOM-preserving strict UTF-8 decoding);
 5. reconstructs every `MetadataSet` event for the token directly from finalized blocks since registration: locates the `Mint` event, verifies `Mint.owner` equals the current owner, verifies the registry's `sourceModule.moduleRef` at both registration and tip equals the pinned `REGISTRY_MODULE_REF` (`0e57473715d1c2a364fa626b8783688db32b7fac9d0e2fc97043da91e1a7d3eb`), verifies via `CIS-8004.getAdmin` that the admin did not change and scans every block where either the owner's or admin's `accountNonce` increased (up to `maxOwnerTxs` / `maxAdminTxs = 2000`), verifies zero initial CIS-2 operators for the owner in contract state at the registration block, and fails closed on any `Upgraded` trace event, `AdminTransferred`, `Transfer`, `Burn`, `UpdateOperator(Add)`, non-owner `MetadataSet` sender, or unknown `<12802,0>` contract event tag;
-6. reads every `countersign.anchor` pointer from those events and each anchor transaction from the node, confirms each anchor was sent by the owner, forms one unbroken chain with none skipped or replaced, and strictly increases coverage;
+6. replays `countersign.witness` transitions chronologically from those events, confirms the active witness matches on-chain `countersign.witness` metadata (rejecting initial-metadata injections, malformed addresses, and owner-equal witnesses), reads every `countersign.anchor` pointer and anchor transaction from the node, confirms each anchor was sent by the authorized signer at that point in the timeline (`authorizedWitness ?? owner`), forms one unbroken chain with none skipped or replaced, and strictly increases coverage;
 7. recomputes the commitment chain from the trail file and compares it with every anchor.
 
 Now change one character in any anchored line of `trail/watcher.jsonl` and run it again. It fails.
@@ -71,9 +71,22 @@ node src/cli.mjs register --uuid <unitares agent uuid>      # mint the registry 
 node src/cli.mjs card --token <id> --name ... --url ... --out agent-card/<name>.json
 node src/cli.mjs pin-card --token <id> --url ... --file agent-card/<name>.json
 node src/cli.mjs export --uuid <uuid> --token <id> --out trail/<name>.jsonl
-node src/cli.mjs anchor --trail trail/<name>.jsonl
-node src/cli.mjs watch --uuid <uuid> --token <id> --trail trail/<name>.jsonl --every-records 10 --every-seconds 3600
+node src/cli.mjs set-witness --token <id> --witness <witnessAccount>   # or --clear
+node src/cli.mjs anchor --trail trail/<name>.jsonl [--witness-url https://... [--no-sponsor-pointer] [--payer-keyfile ...]]
+node src/cli.mjs watch --uuid <uuid> --token <id> --trail trail/<name>.jsonl --every-records 10 --every-seconds 3600 [--witness-url https://...]
 ```
+
+Standalone witness service (run by a separate witness operator with `COUNTERSIGN_WITNESS_KEYFILE` or `--witness-keyfile`, `chmod 600`; never falls back to the agent owner's keyfile):
+
+```sh
+node src/cli.mjs witness --witness-keyfile /path/to/witness-key.json --ledger /path/to/witness-ledger.json --host 127.0.0.1 --port 8787 --price-micro-ccd 1000000
+```
+
+### Witnessed anchoring & Protocol 10 fee-sponsored pointers
+
+- **Authorization timeline (`set-witness`):** The token owner authorizes a distinct, non-owner witness account under `countersign.witness` (or clears it back to owner-only with `--clear`), using finalized-nonce CAS.
+- **x402 v2 witness service (`witness`):** Exposes `GET /health`, `POST /v1/anchor`, and `POST /v1/sponsor-pointer` after verifying testnet genesis. Before inspecting or claiming payment, `POST /v1/anchor` verifies the token is `Active`, the witness is not the token owner, the Agent Card matches its on-chain hash, `countersign.witness` matches both `MetadataSet` history and the witness's own account, and `(prevAnchorTx, toSeq)` strictly extends the chain. It issues a `402` challenge (`PAYMENT-REQUIRED`) binding a deterministic SHA-256 memo to `(tokenId, toSeq, commitment, prevAnchorTx)`, verifies payment via either finalized Concordium `transferWithMemo` (`readAccountTransfer`) or an SSRF-hardened x402 facilitator (`--facilitator-url`), and persists payment state atomically (`mode 0600`) through `claimed -> broadcasted -> committed` (`PaymentLedger` never releases `broadcasted` or `committed` entries, preventing replay across crashes). Concurrent requests per `tokenId` are serialized via a per-token mutex, and request bodies are strictly capped at 64 KiB (`413` / `415`).
+- **Zero-CCD owner pointer updates (`--sponsor-pointer`, default when supported):** Because `CIS-8004.setMetadata` checks `ctx.sender()` on chain, the agent owner signs a Protocol 10 fee-sponsored V1 transaction (`header.sponsor = witnessAccount`, zero CCD attached, `<12802,0>` `CIS-8004.setMetadata`, exact `anchorTxHash` payload, capped energy and bounded expiry) and posts it to `/v1/sponsor-pointer`. The witness fails closed on any tampered field, checks the owner's Ed25519 signature against on-chain credentials (`AccountInfo`) and dry-run `invokeContract`, co-signs as sponsor, submits the V1 transaction, and records crash-recovery state (`mode: 'sponsored'`). Owners pay zero CCD in transaction fees for `setMetadata`; pass `--no-sponsor-pointer` to submit `setMetadata` directly from the owner account instead, or `--payer-keyfile` / `--payment-signature` to pay x402 from a separate payer or facilitator. With `--witness-url`, `watch` consumes only 1 owner nonce per anchor (instead of 2) and refreshes the owner nonce before `setMetadata`.
 
 `export` and `watch` read UNITARES `core.checkpoint_outbox` (`event_schema = 'checkpoint.recorded.v1'`) joined with `core.checkpoints` in read-only single-line JSON keyset batches (`LIMIT 5000` per page bounded by a single high-water `MAX(seq)` snapshot when multi-page, `--psql-timeout <ms>` defaulting to `30000`, `psql -X -q -v ON_ERROR_STOP=1 -At -c` with `PGOPTIONS='-c default_transaction_read_only=on'`, coercing nullable `report_excerpt` to `""`). By default they run `psql -d governance` unless `PGDATABASE` or `DATABASE_URL` is set (`DATABASE_URL` is mapped into `PG*` env vars supporting `host`/`port`/`user`/`password`/`dbname`/`sslmode`/`sslrootcert`/`sslcert`/`sslkey`/`connect_timeout`/`application_name`, defaulting empty dbname to `governance`, rejecting unsupported query parameters or multi-host authorities, and keeping passwords out of `argv`), or `--psql <cmd>`.
 
