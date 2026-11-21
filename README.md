@@ -39,15 +39,15 @@ git clone https://github.com/cirwel/countersign && cd countersign && npm install
 node src/cli.mjs verify --badge JyP9UYjHZ84JsGq5rAC2F --trail trail/watcher.jsonl
 ```
 
-Optional flags: `--node <host[:port]>` (or `COUNTERSIGN_NODE`) to point at your own Concordium testnet gRPC node instead of `grpc.testnet.concordium.com:20000`, and `--card <path>` to verify a local copy of the Agent Card instead of fetching `agent_uri` over HTTPS.
+Optional flags: `--node <host[:port]|url>` (or `COUNTERSIGN_NODE`, supporting `http://` / `grpc://` plaintext or `https://` / `grpcs://` TLS), `--node-insecure` (or `COUNTERSIGN_NODE_INSECURE=1`) for plaintext local gRPC nodes, `--card <path>` to verify a local Agent Card copy instead of fetching `agent_uri` over HTTPS, and `--allow-private-card` to allow private/loopback card hosts during local testing (blocked by default against SSRF).
 
 The command makes zero calls to Concordium's hosted Agent Registry MCP server. It:
 
 1. decodes the badge locally as a CIS-2 Base58Check token address and refuses any registry other than `<12802,0>` on testnet;
 2. connects directly to a Concordium testnet gRPC node, confirms its genesis block is testnet's, and pins a single finalized tip block;
-3. calls `CIS-8004.agentOf` and `CIS-8004.getMetadata` directly on the node (`invokeContract`), fetches the Agent Card over HTTPS (no redirects, 1 MiB cap) or reads `--card`, verifies its SHA-256 against the on-chain hash, and checks the `concordium-badge/v1` extension (`tokenAddress`, `owner.account`, `contracts.cis8004`);
-4. confirms the trail header and on-chain `unitares.agent_uuid` metadata agree;
-5. reconstructs every `MetadataSet` event for the token directly from finalized blocks since registration: locates the `Mint` event, verifies `Mint.owner` equals the current owner, verifies the registry's `sourceModule.moduleRef` matches between registration and tip, verifies zero initial CIS-2 operators for the owner in contract state at the registration block, exhaustively finds every block where the owner's `accountNonce` increased (up to `maxOwnerTxs = 2000`), and fails closed on any `Transfer`, `Burn`, or `UpdateOperator(Add)`;
+3. calls `CIS-8004.agentOf` and `CIS-8004.getMetadata` directly on the node (`invokeContract`), fetches the Agent Card over HTTPS (no redirects, pre-connect public-IP SSRF guard, 1 MiB cap) or reads `--card`, verifies its SHA-256 against the on-chain hash, and checks the `concordium-badge/v1` extension (`tokenAddress`, `owner.account`, `contracts.cis8004`);
+4. confirms the trail header and on-chain `unitares.agent_uuid` metadata agree (using BOM-preserving strict UTF-8 decoding);
+5. reconstructs every `MetadataSet` event for the token directly from finalized blocks since registration: locates the `Mint` event, verifies `Mint.owner` equals the current owner, verifies the registry's `sourceModule.moduleRef` at both registration and tip equals the pinned `REGISTRY_MODULE_REF` (`0e57473715d1c2a364fa626b8783688db32b7fac9d0e2fc97043da91e1a7d3eb`), verifies zero initial CIS-2 operators for the owner in contract state at the registration block, exhaustively finds every block where the owner's `accountNonce` increased (up to `maxOwnerTxs = 2000`), and fails closed on any `Transfer`, `Burn`, `UpdateOperator(Add)`, non-owner `MetadataSet` sender, or unknown `<12802,0>` contract event tag;
 6. reads every `countersign.anchor` pointer from those events and each anchor transaction from the node, confirms each anchor was sent by the owner, forms one unbroken chain with none skipped or replaced, and strictly increases coverage;
 7. recomputes the commitment chain from the trail file and compares it with every anchor.
 
@@ -74,7 +74,7 @@ node src/cli.mjs export --uuid <uuid> --token <id> --out trail/<name>.jsonl
 node src/cli.mjs anchor --trail trail/<name>.jsonl
 ```
 
-`anchor` and `verify` make zero calls to the hosted Agent Registry MCP server: `anchor` reads history directly from the testnet node, submits the `registerData` commitment, and builds `CIS-8004.setMetadata` locally with energy estimated via dry-run `invokeContract` (capped at 100,000 energy). `register`, `card`, and `pin-card` use the hosted MCP server only to construct helper payloads (`register` and `pin-card` refuse any unsigned payload that does not target `<12802,0>` on testnet with the expected entrypoint; `register` computes the badge locally).
+`anchor` and `verify` make zero calls to the hosted Agent Registry MCP server: `anchor` reads history directly from the testnet node, re-checks `countersign.anchor` immediately before submitting `registerData` and again before `setMetadata`, builds `CIS-8004.setMetadata` locally with energy estimated via dry-run `invokeContract` (capped at 100,000 energy), and polls `getBlockItemStatus` for finalization. `register`, `card`, and `pin-card` use the hosted MCP server to construct unsigned payloads (`register` polls `agents_by_owner` and derives the printed badge locally; `register` and `pin-card` refuse any unsigned payload not targeting `<12802,0>` on testnet with the expected entrypoint; `pin-card` fetches the hosted card via the same SSRF-hardened `fetchAgentCard`).
 
 ## What this proves, and what it does not
 
@@ -85,7 +85,7 @@ node src/cli.mjs anchor --trail trail/<name>.jsonl
 - The canonical format is defined by this project, not by UNITARES. The exporter reads the server's `core.checkpoints` table; the server's own checkpoint digests are keyed and cannot be checked by outsiders, which is why Countersign defines its own.
 - Records newer than the latest anchor are not covered until the next anchor.
 - `verify` trusts zero hosted registry or indexer APIs: it reads contract views, contract state, block transaction events, and anchor transactions directly from a Concordium testnet gRPC node (`--node` / `COUNTERSIGN_NODE`, defaulting to `grpc.testnet.concordium.com:20000`). Point `--node` at your own synced testnet node to remove trust in the public endpoint as well.
-- Ownership and history continuity rely on the verified invariants: `Mint.owner` equals the current owner, zero CIS-2 operators existed in `<12802,0>` state at registration, no `Transfer`, `Burn`, or `UpdateOperator(Add)` occurred across any block where the owner's `accountNonce` increased (capped at 2000 owner transactions since registration; accounts with more fail closed), and the contract's `sourceModule.moduleRef` at registration matches tip (an admin upgrading the contract away and back to the identical `moduleRef` outside owner transaction blocks is outside this check).
+- Ownership and history continuity rely on the verified invariants: `Mint.owner` equals the current owner (including Concordium account aliases), zero CIS-2 operators existed in `<12802,0>` state at registration, no `Transfer`, `Burn`, `UpdateOperator(Add)`, non-owner `MetadataSet`, or unknown `<12802,0>` contract event occurred across any block where the owner's `accountNonce` increased (capped at 2000 owner transactions since registration; accounts with more fail closed), and the contract's `sourceModule.moduleRef` at both registration and tip equals the pinned `REGISTRY_MODULE_REF` (`0e57473715d1c2a364fa626b8783688db32b7fac9d0e2fc97043da91e1a7d3eb`; an admin upgrading away and back to the identical `moduleRef` outside owner transaction blocks is outside this check).
 - This is a prototype. It has had no security audit, and it is not a compliance tool.
 
 ## Path to production

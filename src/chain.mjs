@@ -1,5 +1,6 @@
 // Concordium testnet access. Reading needs no keys; signing reads a key file that lives outside the repo.
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import {
@@ -27,13 +28,14 @@ import {
     parseCis2Event,
     parseMetadataSetEvent,
 } from './cis8004.mjs';
-import { REGISTRY, TESTNET_GENESIS, assertRegistry } from './registry.mjs';
+import { REGISTRY, REGISTRY_MODULE_REF, TESTNET_GENESIS, assertRegistry } from './registry.mjs';
 import { decodeAnchor } from './trail.mjs';
 
 export { TESTNET_GENESIS };
 export const EXPLORER_TX = (hash) => `https://ccdexplorer.io/testnet/transaction/${hash}`;
 const DEFAULT_NODE_HOST = 'grpc.testnet.concordium.com';
 const DEFAULT_NODE_PORT = 20000;
+const DEFAULT_RPC_TIMEOUT_MS = 30000;
 const MAX_REGISTRY_ENERGY = 100000;
 
 let explicitConfig = null;
@@ -45,21 +47,40 @@ const verifiedClients = new WeakMap();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function isTransientRpcError(err) {
+/** Compares two Base58Check Concordium account addresses canonically, treating aliases of the same account as equal. */
+export function isSameAccount(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string') return false;
+    try {
+        return AccountAddress.isAlias(AccountAddress.fromBase58(a), AccountAddress.fromBase58(b));
+    } catch {
+        return false;
+    }
+}
+
+export function isTransientRpcError(err) {
     if (!err) return false;
     const code = err.code;
-    if (code === 'UNAVAILABLE' || code === 'RESOURCE_EXHAUSTED' || code === 14 || code === 8 || code === 429 || code === '429') {
+    if (
+        code === 'UNAVAILABLE' ||
+        code === 'RESOURCE_EXHAUSTED' ||
+        code === 'DEADLINE_EXCEEDED' ||
+        code === 14 ||
+        code === 8 ||
+        code === 4 ||
+        code === 429 ||
+        code === '429'
+    ) {
         return true;
     }
     if (err.status === 429 || err.statusCode === 429) return true;
-    return /\b(429|UNAVAILABLE|RESOURCE_EXHAUSTED)\b/i.test(String(err.message ?? ''));
+    return /HTTP status code 429|\b(?:UNAVAILABLE|RESOURCE_EXHAUSTED|DEADLINE_EXCEEDED)\b/i.test(String(err.message ?? ''));
 }
 
 function isNotFoundError(err) {
     return err?.code === 'NOT_FOUND' || err?.code === 5;
 }
 
-async function withRpcRetry(fn, { maxRetries = 4, baseDelayMs = 1000, onBackoff } = {}) {
+export async function withRpcRetry(fn, { maxRetries = 4, baseDelayMs = 1000, onBackoff } = {}) {
     let attempt = 0;
     while (true) {
         try {
@@ -74,7 +95,7 @@ async function withRpcRetry(fn, { maxRetries = 4, baseDelayMs = 1000, onBackoff 
     }
 }
 
-/** Bounded-concurrency RPC pool with exponential backoff retry on transient HTTP 429 / gRPC UNAVAILABLE / RESOURCE_EXHAUSTED. */
+/** Bounded-concurrency RPC pool with exponential backoff retry on transient 429 / UNAVAILABLE / RESOURCE_EXHAUSTED / DEADLINE_EXCEEDED. */
 export function createRpcPool(concurrency = 5, retryOpts = {}) {
     if (!Number.isInteger(concurrency) || concurrency < 1) {
         throw new Error(`invalid RPC pool concurrency: ${concurrency}`);
@@ -118,51 +139,98 @@ export function createRpcPool(concurrency = 5, retryOpts = {}) {
     return run;
 }
 
-export { withRpcRetry };
+function envNodeInsecure() {
+    const v = String(process.env.COUNTERSIGN_NODE_INSECURE ?? '').trim().toLowerCase();
+    return v === '1' || v === 'true';
+}
+
+export function formatGrpcHost(host) {
+    return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+}
 
 function parseNodeString(raw) {
     const spec = raw.trim();
     if (!spec) return null;
-    if (spec.startsWith('[')) {
-        const m = /^\[([^\]]+)\](?::(\d+))?$/.exec(spec);
-        if (!m) throw new Error(`invalid node address: ${raw}`);
+    let rest = spec;
+    let tls;
+    const schemeMatch = /^(https?|grpcs?):\/\/(.*)$/i.exec(spec);
+    if (schemeMatch) {
+        const scheme = schemeMatch[1].toLowerCase();
+        tls = scheme === 'https' || scheme === 'grpcs';
+        rest = schemeMatch[2];
+        if (!rest || rest.includes('/') || rest.includes('?') || rest.includes('#') || rest.includes('@')) {
+            throw new Error(`invalid node address: ${raw}`);
+        }
+    }
+    if (rest.startsWith('[')) {
+        const m = /^\[([^\]]+)\](?::(\d+))?$/.exec(rest);
+        if (!m || !net.isIPv6(m[1])) throw new Error(`invalid IPv6 node address: ${raw}`);
         const port = m[2] ? Number(m[2]) : DEFAULT_NODE_PORT;
         if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`invalid node port in ${raw}`);
-        return { host: m[1], port, tls: true };
+        return { host: m[1], port, tls };
     }
-    const parts = spec.split(':');
+    if (net.isIPv6(rest)) {
+        return { host: rest, port: DEFAULT_NODE_PORT, tls };
+    }
+    const parts = rest.split(':');
     if (parts.length === 1) {
-        return { host: parts[0], port: DEFAULT_NODE_PORT, tls: true };
+        return { host: parts[0], port: DEFAULT_NODE_PORT, tls };
     }
     if (parts.length === 2 && parts[0].length > 0 && /^\d+$/.test(parts[1])) {
         const port = Number(parts[1]);
         if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`invalid node port in ${raw}`);
-        return { host: parts[0], port, tls: true };
+        return { host: parts[0], port, tls };
     }
     throw new Error(`invalid node address: ${raw}`);
 }
 
+function resolveEnvNodeConfig() {
+    const parsed = process.env.COUNTERSIGN_NODE ? parseNodeString(process.env.COUNTERSIGN_NODE) : null;
+    const host = parsed?.host ?? DEFAULT_NODE_HOST;
+    const port = parsed?.port ?? DEFAULT_NODE_PORT;
+    const tls = parsed?.tls !== undefined ? parsed.tls : !envNodeInsecure();
+    return { host, port, tls, rpcTimeoutMs: DEFAULT_RPC_TIMEOUT_MS };
+}
+
 function normalizeNodeConfig(opts) {
     if (opts === undefined || opts === null) return null;
-    if (typeof opts === 'string') return parseNodeString(opts);
-    if (typeof opts !== 'object') throw new TypeError('configureNode expects an options object or host[:port] string');
-    const envCfg = process.env.COUNTERSIGN_NODE ? parseNodeString(process.env.COUNTERSIGN_NODE) : null;
-    const host = opts.host ?? envCfg?.host ?? DEFAULT_NODE_HOST;
-    const port = opts.port !== undefined ? Number(opts.port) : (envCfg?.port ?? DEFAULT_NODE_PORT);
-    const tls = opts.tls ?? true;
-    if (typeof host !== 'string' || host.trim().length === 0) throw new Error('node host must be a non-empty string');
+    const base = resolveEnvNodeConfig();
+    if (typeof opts === 'string') {
+        const parsed = parseNodeString(opts);
+        if (!parsed) return null;
+        return {
+            host: parsed.host,
+            port: parsed.port,
+            tls: parsed.tls !== undefined ? parsed.tls : base.tls,
+            rpcTimeoutMs: DEFAULT_RPC_TIMEOUT_MS,
+        };
+    }
+    if (typeof opts !== 'object') throw new TypeError('configureNode expects an options object or node URL/host[:port] string');
+
+    let parsedHost = null;
+    if (opts.host !== undefined) {
+        if (typeof opts.host !== 'string' || opts.host.trim().length === 0) {
+            throw new Error('node host must be a non-empty string');
+        }
+        parsedHost = parseNodeString(opts.host);
+    }
+    const host = parsedHost?.host ?? base.host;
+    const port = opts.port !== undefined ? Number(opts.port) : (parsedHost?.port ?? base.port);
+    if (opts.tls !== undefined && typeof opts.tls !== 'boolean') {
+        throw new Error('node tls option must be a boolean');
+    }
+    if (parsedHost?.tls === true && opts.tls === false) {
+        throw new Error('cannot combine explicit TLS scheme with insecure node option');
+    }
+    const tls = opts.tls !== undefined ? opts.tls : (parsedHost?.tls !== undefined ? parsedHost.tls : base.tls);
+    const rpcTimeoutMs = opts.rpcTimeoutMs !== undefined ? Number(opts.rpcTimeoutMs) : DEFAULT_RPC_TIMEOUT_MS;
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`invalid node port: ${opts.port}`);
-    if (typeof tls !== 'boolean') throw new Error('node tls option must be a boolean');
-    return { host: host.trim(), port, tls };
+    if (!Number.isSafeInteger(rpcTimeoutMs) || rpcTimeoutMs <= 0) throw new Error(`invalid rpcTimeoutMs: ${opts.rpcTimeoutMs}`);
+    return { host, port, tls, rpcTimeoutMs };
 }
 
 function effectiveNodeConfig() {
-    if (explicitConfig) return explicitConfig;
-    if (process.env.COUNTERSIGN_NODE) {
-        const parsed = parseNodeString(process.env.COUNTERSIGN_NODE);
-        if (parsed) return parsed;
-    }
-    return { host: DEFAULT_NODE_HOST, port: DEFAULT_NODE_PORT, tls: true };
+    return explicitConfig ?? resolveEnvNodeConfig();
 }
 
 /** Configures the Concordium testnet gRPC endpoint and resets any cached node client. */
@@ -173,6 +241,14 @@ export function configureNode(opts) {
     cachedPromiseKey = undefined;
     explicitConfig = normalizeNodeConfig(opts);
     return effectiveNodeConfig();
+}
+
+/** Instantiates a ConcordiumGRPCNodeClient for the configured endpoint without issuing RPCs yet. */
+export function createGrpcClient(cfg = effectiveNodeConfig()) {
+    const creds = cfg.tls ? credentials.createSsl() : credentials.createInsecure();
+    return new ConcordiumGRPCNodeClient(formatGrpcHost(cfg.host), cfg.port, creds, {
+        timeout: cfg.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS,
+    });
 }
 
 /** Confirms a node client reports Concordium testnet genesis, caching verification per client instance. */
@@ -198,15 +274,14 @@ export async function assertTestnet(nodeClient) {
 /** Returns a node client only after confirming the node is on testnet. There is no mainnet configuration in this tool. */
 export async function client() {
     const cfg = effectiveNodeConfig();
-    const key = `${cfg.host}:${cfg.port}:${cfg.tls ? 'tls' : 'plain'}`;
+    const key = `${formatGrpcHost(cfg.host)}:${cfg.port}:${cfg.tls ? 'tls' : 'plain'}:${cfg.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS}`;
     if (cached && cachedKey === key) return cached;
     if (cachedPromise && cachedPromiseKey === key) return cachedPromise;
 
     cached = undefined;
     cachedKey = undefined;
     const p = (async () => {
-        const creds = cfg.tls ? credentials.createSsl() : credentials.createInsecure();
-        const c = new ConcordiumGRPCNodeClient(cfg.host, cfg.port, creds);
+        const c = createGrpcClient(cfg);
         await assertTestnet(c);
         cached = c;
         cachedKey = key;
@@ -240,23 +315,41 @@ export function loadSigner() {
     return { address: k.accountAddress, sender: AccountAddress.fromBase58(k.accountAddress), signer: buildBasicAccountSigner(signKey) };
 }
 
-async function signSendWait(builder, who) {
-    const c = await client();
+async function waitForFinalizedPolling(c, hash, { timeoutMs = 180000, pollIntervalMs = 2000 } = {}) {
+    const deadline = Date.now() + timeoutMs;
+    while (true) {
+        const status = await withRpcRetry(() => c.getBlockItemStatus(hash));
+        if (status.status === 'finalized') {
+            const summary = status.outcome?.summary;
+            if (!summary) throw new Error(`transaction ${hash} finalized without outcome summary`);
+            if (summary.transactionType === 'failed' || summary.rejectReason) {
+                throw new Error(`transaction ${hash} was rejected: ${JSON.stringify(summary.rejectReason ?? summary, bigintSafe)}`);
+            }
+            return { hash: hash.toString(), summary };
+        }
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+            throw new Error(`transaction ${hash} did not finalize within ${timeoutMs}ms`);
+        }
+        await sleep(Math.min(pollIntervalMs, remaining));
+    }
+}
+
+async function signSendWait(builder, who, nodeClient, pollOpts) {
+    const c = nodeClient ?? (await client());
+    await assertTestnet(c);
     const { nonce } = await withRpcRetry(() => c.getNextAccountNonce(who.sender));
     const tx = builder.addMetadata({ sender: who.sender, nonce }).build();
     const signed = await Transaction.signAndFinalize(tx, who.signer);
     const hash = await c.sendTransaction(signed);
-    const { summary } = await c.waitForTransactionFinalization(hash, 180000);
-    if (summary.transactionType === 'failed' || summary.rejectReason) {
-        throw new Error(`transaction ${hash} was rejected: ${JSON.stringify(summary.rejectReason ?? summary, bigintSafe)}`);
-    }
-    return { hash: hash.toString(), summary };
+    console.log('submitted tx:', hash.toString());
+    return waitForFinalizedPolling(c, hash, pollOpts);
 }
 
 export const bigintSafe = (_k, v) => (typeof v === 'bigint' ? v.toString() : v);
 
-export function sendRegisterData(bytes, who = loadSigner()) {
-    return signSendWait(Transaction.registerData({ data: new DataBlob(Buffer.from(bytes)) }), who);
+export function sendRegisterData(bytes, who = loadSigner(), nodeClient, pollOpts) {
+    return signSendWait(Transaction.registerData({ data: new DataBlob(Buffer.from(bytes)) }), who, nodeClient, pollOpts);
 }
 
 /**
@@ -265,7 +358,7 @@ export function sendRegisterData(bytes, who = loadSigner()) {
  * the contract must be the pinned registry, the energy is capped, and where the caller can build the
  * parameter itself the server's bytes must equal it.
  */
-export function sendRegistryUpdate(built, who, expect) {
+export function sendRegistryUpdate(built, who, expect, nodeClient, pollOpts) {
     assertRegistry(built.contract_address);
     if (built.network !== 'testnet') throw new Error('registry payload is not for testnet; refusing to sign');
     if (!expect?.receiveName || built.receive_name !== expect.receiveName) throw new Error(`registry payload calls ${built.receive_name}, expected ${expect?.receiveName}; refusing to sign`);
@@ -278,7 +371,7 @@ export function sendRegistryUpdate(built, who, expect) {
         receiveName: ReceiveName.fromString(built.receive_name),
         message: Parameter.fromHexString(built.parameter_hex),
     };
-    return signSendWait(Transaction.updateContract(payload, Energy.create(energy)), who);
+    return signSendWait(Transaction.updateContract(payload, Energy.create(energy)), who, nodeClient, pollOpts);
 }
 
 function registryContractAddress() {
@@ -294,6 +387,12 @@ function eventToHex(ev) {
     if (ev?.buffer instanceof Uint8Array) return Buffer.from(ev.buffer).toString('hex');
     if (ev instanceof Uint8Array) return Buffer.from(ev).toString('hex');
     return ContractEvent.toHexString(ev);
+}
+
+function addressToString(addr) {
+    if (typeof addr === 'string') return addr;
+    if (addr && typeof addr.address === 'string') return addr.address;
+    return addr !== undefined && addr !== null ? String(addr) : '';
 }
 
 /** Invokes a read-only CIS-8004 view entrypoint on the pinned testnet registry contract. */
@@ -327,8 +426,9 @@ export async function readMetadataText(tokenId, key, { blockHash, nodeClient } =
 }
 
 /** Builds CIS-8004.setMetadata locally, estimates energy via dry-run invokeContract, and submits it on testnet. */
-export async function sendSetMetadata(tokenId, key, valueUtf8, who = loadSigner()) {
-    const c = await client();
+export async function sendSetMetadata(tokenId, key, valueUtf8, who = loadSigner(), nodeClient, pollOpts) {
+    const c = nodeClient ?? (await client());
+    await assertTestnet(c);
     const paramBuf = encodeSetMetadataParam(tokenId, key, valueUtf8);
     const contract = registryContractAddress();
     const receiveName = ReceiveName.fromString('CIS-8004.setMetadata');
@@ -354,7 +454,7 @@ export async function sendSetMetadata(tokenId, key, valueUtf8, who = loadSigner(
         receiveName,
         message: Parameter.fromBuffer(paramBuf),
     };
-    return signSendWait(Transaction.updateContract(payload, Energy.create(energy)), who);
+    return signSendWait(Transaction.updateContract(payload, Energy.create(energy)), who, c, pollOpts);
 }
 
 /** Finalized register-data transaction: who sent it, what bytes it carries, timestamp, and block height. */
@@ -368,7 +468,7 @@ export async function readRegisterData(txHash, nodeClient) {
     const block = await withRpcRetry(() => c.getBlockInfo(status.outcome.blockHash));
     const data = typeof s.dataRegistered.data === 'string' ? Buffer.from(s.dataRegistered.data, 'hex') : Buffer.from(s.dataRegistered.data);
     return {
-        sender: s.sender.address ?? String(s.sender),
+        sender: addressToString(s.sender),
         data,
         blockTime: block.blockSlotTime.toISOString(),
         blockHeight: Number(block.blockHeight),
@@ -377,12 +477,21 @@ export async function readRegisterData(txHash, nodeClient) {
 
 /**
  * Reconstructs the complete, unbroken CIS-8004 MetadataSet history for tokenId between registration and tip
- * directly from a Concordium node, verifying mint ownership, immutable contract module, zero initial
+ * directly from a Concordium node, verifying mint ownership, pinned immutable contract module, zero initial
  * operators, and uninterrupted exclusive ownership across every owner transaction block.
  */
 export async function readRegistryHistory(
     tokenId,
-    { tipBlockHash, tipBlockHeight, agent, hintAnchorTxHashes = [], maxOwnerTxs = 2000, nodeClient, pool: providedPool } = {},
+    {
+        tipBlockHash,
+        tipBlockHeight,
+        agent,
+        hintAnchorTxHashes = [],
+        maxOwnerTxs = 2000,
+        streamTimeoutMs = DEFAULT_RPC_TIMEOUT_MS,
+        nodeClient,
+        pool: providedPool,
+    } = {},
 ) {
     if (!agent || !agent.ownerAccount || typeof agent.registeredAtMs !== 'number') {
         throw new Error('readRegistryHistory requires decoded agent info with ownerAccount and registeredAtMs');
@@ -443,16 +552,33 @@ export async function readRegistryHistory(
         return p;
     };
 
-    const getBlockEvents = async (h) => {
-        const bh = await blockHashAt(h);
-        return rpc.run(async () => {
-            const items = [];
-            for await (const s of c.getBlockTransactionEvents(bh)) items.push(s);
-            return items;
-        });
+    const withStreamTimeout = async (fn) => {
+        const ac = new AbortController();
+        const timer = setTimeout(() => {
+            ac.abort(new Error(`gRPC stream timed out after ${streamTimeoutMs}ms (DEADLINE_EXCEEDED)`));
+        }, streamTimeoutMs);
+        try {
+            return await fn(ac.signal);
+        } finally {
+            clearTimeout(timer);
+        }
     };
 
-    // 1. Locate registration block height via 2-point linear interpolation + binary search.
+    const getBlockEvents = async (h) => {
+        const bh = await blockHashAt(h);
+        return rpc.run(() =>
+            withStreamTimeout(async (signal) => {
+                const items = [];
+                for await (const s of c.getBlockTransactionEvents(bh, signal)) {
+                    if (signal.aborted) throw signal.reason;
+                    items.push(s);
+                }
+                return items;
+            }),
+        );
+    };
+
+    // 1. Locate registration block height via 2-point linear interpolation + binary/regula-falsi search.
     const targetMs = agent.registeredAtMs;
     const refH = tipH > 10000n ? tipH - 10000n : 0n;
     const [tipTimeMs, refTimeMs] = await Promise.all([timeAt(tipH), timeAt(refH)]);
@@ -533,7 +659,7 @@ export async function readRegistryHistory(
         }
     }
 
-    // 2. Find Mint event for tokenId in [regHeight-2n, regHeight+2n] and verify Mint.owner === agent.ownerAccount.
+    // 2. Find Mint event for tokenId in [regHeight-2n, regHeight+2n] and verify Mint.owner matches current owner.
     const findMintsInBlock = (h, summaries) => {
         const hits = [];
         for (let txIdx = 0; txIdx < summaries.length; txIdx++) {
@@ -565,9 +691,8 @@ export async function readRegistryHistory(
 
     const winLo = lo >= 2n ? lo - 2n : 0n;
     const winHi = lo + 2n <= tipH ? lo + 2n : tipH;
-    // Probe the interpolated height lo first; scan neighbors only if Mint wasn't at lo.
     const loSummaries = await getBlockEvents(lo);
-    let mintHits = findMintsInBlock(lo, loSummaries);
+    const mintHits = findMintsInBlock(lo, loSummaries);
     if (mintHits.length === 0) {
         const neighbors = [];
         for (let h = winLo; h <= winHi; h += 1n) {
@@ -582,8 +707,8 @@ export async function readRegistryHistory(
         throw new Error(`expected 1 Mint event for token ${targetTokenId} near block ${lo}, found ${mintHits.length}`);
     }
     const mintHit = mintHits[0];
-    if (mintHit.owner !== owner) {
-        throw new Error(`token ${targetTokenId} was minted to ${mintHit.owner}, not current owner ${owner}`);
+    if (typeof mintHit.owner !== 'string' || !isSameAccount(mintHit.owner, owner)) {
+        throw new Error(`token ${targetTokenId} was minted to ${JSON.stringify(mintHit.owner)}, not current owner ${owner}`);
     }
     if (mintHit.amount !== 1n) {
         throw new Error(`token ${targetTokenId} Mint amount was ${mintHit.amount}, expected 1`);
@@ -591,15 +716,18 @@ export async function readRegistryHistory(
 
     const regHeight = mintHit.height;
     const regBlockHash = await blockHashAt(regHeight);
+    const resolvedTipBlockHash = tipBlockHash ?? (await blockHashAt(tipH));
 
-    // 3. Verify registry sourceModule.moduleRef did not change between registration and tip.
+    // 3. Verify registry sourceModule.moduleRef at both registration and tip matches pinned REGISTRY_MODULE_REF.
     const [regInst, tipInst] = await Promise.all([
         rpc.run(() => c.getInstanceInfo(registryAddr, regBlockHash)),
-        rpc.run(() => c.getInstanceInfo(registryAddr, tipBlockHash)),
+        rpc.run(() => c.getInstanceInfo(registryAddr, resolvedTipBlockHash)),
     ]);
     const refOf = (info) => info?.sourceModule?.moduleRef ?? String(info?.sourceModule ?? '');
-    if (!refOf(regInst) || refOf(regInst) !== refOf(tipInst)) {
-        throw new Error(`registry contract sourceModule changed between registration (${refOf(regInst)}) and tip (${refOf(tipInst)})`);
+    if (refOf(regInst) !== REGISTRY_MODULE_REF || refOf(tipInst) !== REGISTRY_MODULE_REF) {
+        throw new Error(
+            `registry contract sourceModule mismatch (reg=${refOf(regInst)}, tip=${refOf(tipInst)}, expected=${REGISTRY_MODULE_REF})`,
+        );
     }
 
     // 4. Verify zero initial CIS-2 operators for owner at regBlockHash.
@@ -618,44 +746,53 @@ export async function readRegistryHistory(
         if (!/^[0-9a-f]{16}$/.test(opSubmap)) {
             throw new Error(`unexpected operator submap prefix for ${owner} at block ${regHeight}`);
         }
-        const hasInitialOperator = await rpc.run(async () => {
-            for await (const entry of c.getInstanceState(registryAddr, regBlockHash)) {
-                const k = typeof entry.key === 'string' ? entry.key.toLowerCase() : Buffer.from(entry.key).toString('hex');
-                if (k.startsWith(opSubmap)) return true;
-            }
-            return false;
-        });
+        const hasInitialOperator = await rpc.run(() =>
+            withStreamTimeout(async (signal) => {
+                for await (const entry of c.getInstanceState(registryAddr, regBlockHash, signal)) {
+                    if (signal.aborted) throw signal.reason;
+                    const k = typeof entry.key === 'string' ? entry.key.toLowerCase() : Buffer.from(entry.key).toString('hex');
+                    if (k.startsWith(opSubmap)) return true;
+                }
+                return false;
+            }),
+        );
         if (hasInitialOperator) {
             throw new Error(`owner ${owner} had pre-existing CIS-2 operator(s) at registration block ${regHeight}`);
         }
     }
 
-    // 5. Follow hintAnchorTxHashes / prevAnchorTx links (cycle-protected) to get split hints.
-    const seenHints = new Set();
-    const hintHeightSet = new Set();
-    const hintQueue = [...hintAnchorTxHashes].filter((h) => typeof h === 'string' && /^[0-9a-f]{64}$/.test(h));
-    while (hintQueue.length > 0) {
-        const hTx = hintQueue.shift();
-        if (seenHints.has(hTx)) continue;
-        seenHints.add(hTx);
-        try {
-            const rd = await rpc.limit(() => readRegisterData(hTx, c));
-            const h = BigInt(rd.blockHeight);
-            if (h > regHeight && h < tipH) hintHeightSet.add(h);
-            const dec = decodeAnchor(rd.data);
-            if (dec.prevAnchorTx && !seenHints.has(dec.prevAnchorTx)) hintQueue.push(dec.prevAnchorTx);
-        } catch {
-            // Hints are strictly advisory; exhaustive nonce scanning guarantees completeness.
-        }
-    }
-
-    // 6. Check owner nonce span <= maxOwnerTxs.
+    // 5. Check owner nonce span <= maxOwnerTxs BEFORE following hint links.
     const [nStart, nEnd] = await Promise.all([nonceAt(regHeight), nonceAt(tipH)]);
     if (nEnd < nStart) {
         throw new Error(`non-monotonic owner accountNonce (${nEnd} < ${nStart})`);
     }
     if (nEnd - nStart > BigInt(maxOwnerTxs)) {
         throw new Error(`owner ${owner} executed ${nEnd - nStart} transactions between block ${regHeight} and ${tipH}, exceeding maxOwnerTxs=${maxOwnerTxs}`);
+    }
+
+    // 6. Follow hintAnchorTxHashes / prevAnchorTx links (bounded & owner/token/height-validated) to get split hints.
+    const maxHintHops = Math.min(Number(maxOwnerTxs), 256);
+    const seenHints = new Set();
+    const hintHeightSet = new Set();
+    const hintQueue = [...hintAnchorTxHashes].filter((h) => typeof h === 'string' && /^[0-9a-f]{64}$/.test(h));
+    let hintHops = 0;
+    while (hintQueue.length > 0 && hintHops < maxHintHops) {
+        const hTx = hintQueue.shift();
+        if (seenHints.has(hTx)) continue;
+        seenHints.add(hTx);
+        hintHops += 1;
+        try {
+            const rd = await rpc.limit(() => readRegisterData(hTx, c));
+            if (!isSameAccount(rd.sender, owner)) continue;
+            const h = BigInt(rd.blockHeight);
+            if (!(h > regHeight && h < tipH)) continue;
+            const dec = decodeAnchor(rd.data);
+            if (dec.tokenId !== targetTokenId) continue;
+            hintHeightSet.add(h);
+            if (dec.prevAnchorTx && !seenHints.has(dec.prevAnchorTx)) hintQueue.push(dec.prevAnchorTx);
+        } catch {
+            // Hints are strictly advisory; exhaustive nonce scanning guarantees completeness.
+        }
     }
 
     // 7. Exhaustively find every block in (regHeight, tipH] where owner's accountNonce increased.
@@ -698,7 +835,6 @@ export async function readRegistryHistory(
         return [];
     };
 
-    // Split at both (h - 1) and h for each hint height so known anchor blocks resolve in 1 probe instead of binary search.
     const splitSet = new Set([regHeight, tipH]);
     for (const h of hintHeightSet) {
         if (h - 1n > regHeight) splitSet.add(h - 1n);
@@ -720,6 +856,7 @@ export async function readRegistryHistory(
             const summary = summaries[txIdx];
             if (!Array.isArray(summary.events) || summary.rejectReason) continue;
             const txHash = summary.hash.toString();
+            const txSender = addressToString(summary.sender);
             for (let traceIdx = 0; traceIdx < summary.events.length; traceIdx++) {
                 const traceEv = summary.events[traceIdx];
                 if (traceEv.tag === 'Upgraded' && isRegistryAddress(traceEv.address)) {
@@ -736,18 +873,24 @@ export async function readRegistryHistory(
                     }
                     const rawHex = eventToHex(logs[logIdx]);
                     const parsed = parseCis2Event(rawHex);
+                    if (parsed.type === 'Unknown') {
+                        throw new Error(`unknown CIS-8004 event tag 0x${parsed.tag.toString(16)} at block ${h} (tx ${txHash})`);
+                    }
                     if (parsed.type === 'Transfer' && parsed.tokenId === targetTokenId) {
-                        if (parsed.from !== owner || parsed.to !== owner) {
+                        if (!isSameAccount(parsed.from, owner) || !isSameAccount(parsed.to, owner)) {
                             throw new Error(`token ${targetTokenId} was transferred (${parsed.from} -> ${parsed.to}) at block ${h} (tx ${txHash})`);
                         }
                     } else if (parsed.type === 'Burn' && parsed.tokenId === targetTokenId) {
                         throw new Error(`token ${targetTokenId} was burned at block ${h} (tx ${txHash})`);
-                    } else if (parsed.type === 'UpdateOperator' && parsed.update === 'Add' && parsed.owner === owner) {
+                    } else if (parsed.type === 'UpdateOperator' && parsed.update === 'Add' && typeof parsed.owner === 'string' && isSameAccount(parsed.owner, owner)) {
                         throw new Error(`owner ${owner} added CIS-2 operator ${parsed.operator} at block ${h} (tx ${txHash})`);
                     } else if (parsed.type === 'MetadataSet') {
                         const meta = parseMetadataSetEvent(rawHex, targetTokenId);
                         if (meta) {
-                            collected.push({ ...meta, txHash, blockHeight: Number(h) });
+                            if (summary.type !== 'accountTransaction' || !isSameAccount(txSender, owner)) {
+                                throw new Error(`MetadataSet for token ${targetTokenId} at block ${h} was submitted by ${txSender || 'non-account'}, not owner ${owner}`);
+                            }
+                            collected.push({ ...meta, sender: txSender, txHash, blockHeight: Number(h) });
                         }
                     }
                 }

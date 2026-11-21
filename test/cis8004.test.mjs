@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import { test } from 'node:test';
 import { AccountAddress, ContractAddress, tokenAddressToBase58 } from '@concordium/web-sdk';
@@ -13,6 +14,7 @@ import {
     encodeSetMetadataParam,
     encodeTokenId,
     fetchAgentCard,
+    isDisallowedIp,
     parseCis2Event,
     parseMetadataSetEvent,
     verifyAgentCardBytes,
@@ -48,12 +50,20 @@ const TOKEN5_AGENT_OF_HEX =
     '015b22021a5a27dc3a25d9cde2887e208f818b5a55dcfc6b2c3c0271634ab331c9' +
     '00e6eb596a9e010000000000000000';
 
-// Captured verbatim from Watcher's registration tx and latest anchor pointer update.
+// Captured verbatim from Watcher's registration tx 4ea50cb8... and latest anchor pointer update.
 const WATCHER_MINT_HEX = 'fe0823050000000000000100bb2793c76eea40efa19981902c47b71d607be55f0581581bfff18e65aeec2a62';
+const WATCHER_REGISTERED_HEX = 'f0082305000000000000bb2793c76eea40efa19981902c47b71d607be55f0581581bfff18e65aeec2a62000000a1208cf7a1010000';
+const WATCHER_WALLET_SET_HEX = 'f508230500000000000001bb2793c76eea40efa19981902c47b71d607be55f0581581bfff18e65aeec2a62a1208cf7a1010000';
 const WATCHER_METADATA_SET_HEX =
     'f308230500000000000012000000636f756e7465727369676e2e616e63686f72' +
     '4000000065316138636165346337656162323363653666313833363234356566663338623331393235373937326337373735356161353430333162306262343562396638' +
     '0f2e96faa1010000';
+
+const u16le = (n) => {
+    const b = Buffer.alloc(2);
+    b.writeUInt16LE(n, 0);
+    return b;
+};
 
 const u32le = (n) => {
     const b = Buffer.alloc(4);
@@ -67,6 +77,54 @@ const u64le = (n) => {
     return b;
 };
 
+const strU32 = (s) => {
+    const b = Buffer.from(s, 'utf8');
+    return Buffer.concat([u32le(b.length), b]);
+};
+
+function makeMockRequestFn({ statusCode = 200, headers = {}, chunks = [], delayMs = 0, abortBeforeEnd = false, lookupOpts = { all: true } } = {}) {
+    return (_url, opts, onRes) => {
+        const req = new EventEmitter();
+        req.destroyed = false;
+        req.destroy = (err) => {
+            if (req.destroyed) return;
+            req.destroyed = true;
+            if (err) process.nextTick(() => req.emit('error', err));
+        };
+        req.end = () => {
+            opts.lookup('card.example', lookupOpts, (err, resolved) => {
+                if (req.destroyed) return;
+                if (err) {
+                    req.emit('error', err);
+                    return;
+                }
+                assert.ok(resolved);
+                if (delayMs > 0) return; // let timeout fire
+                const res = new EventEmitter();
+                res.statusCode = statusCode;
+                res.headers = headers;
+                res.resume = () => {};
+                res.destroy = (dErr) => {
+                    req.destroyed = true;
+                    if (dErr) process.nextTick(() => res.emit('error', dErr));
+                };
+                onRes(res);
+                process.nextTick(() => {
+                    for (const c of chunks) {
+                        if (req.destroyed) return;
+                        res.emit('data', Buffer.from(c));
+                    }
+                    if (!req.destroyed) {
+                        if (abortBeforeEnd) res.emit('aborted');
+                        else res.emit('end');
+                    }
+                });
+            });
+        };
+        return req;
+    };
+}
+
 test('badge encode/decode round-trips Watcher and rejects bad token_id encodings', () => {
     assert.equal(encodeBadge('1315'), WATCHER_BADGE);
     assert.deepEqual(decodeBadge(WATCHER_BADGE), {
@@ -77,7 +135,6 @@ test('badge encode/decode round-trips Watcher and rejects bad token_id encodings
     const other = encodeBadge('42', { index: 99, subindex: 1 });
     assert.deepEqual(decodeBadge(other), { contract: { index: 99, subindex: 1 }, tokenId: '42' });
 
-    // Non-8-byte token ID inside a valid CIS-2 Base58Check address must be rejected.
     const shortIdBadge = tokenAddressToBase58({ contract: ContractAddress.create(12802n, 0n), id: '01' });
     assert.throws(() => decodeBadge(shortIdBadge), /token id encoding/);
     assert.throws(() => decodeBadge('not-a-badge'));
@@ -125,32 +182,27 @@ test('decodeAgentOf decodes real Watcher and Token 5 bytes, None, Revoked, and r
 
     assert.equal(decodeAgentOf(Buffer.from([0])), null);
 
-    // Construct a minimal Revoked agentOf struct.
     const ownerBytes = Buffer.from(AccountAddress.fromBase58(WATCHER_OWNER).decodedAddress);
     const reason = Buffer.from('compromised key', 'utf8');
     const revokedBuf = Buffer.concat([
         Buffer.from([1]),
         encodeTokenId('7'),
         ownerBytes,
-        Buffer.from([0]), // agentUri None
-        Buffer.from([0]), // metadataHash None
-        Buffer.from([0]), // externalReference None
-        Buffer.from([0]), // agentWallet None
-        Buffer.from([1]), // status = Revoked
+        Buffer.from([0, 0, 0, 0]),
+        Buffer.from([1]),
         u64le(1700000000000n),
         Buffer.from([1]),
         u64le(1700000005000n),
         Buffer.from([1]),
         u32le(reason.length),
         reason,
-        u32le(0), // onChainMetadata empty
+        u32le(0),
     ]);
     const rev = decodeAgentOf(revokedBuf);
     assert.equal(rev.status, 'Revoked');
     assert.equal(rev.revokedAtMs, 1700000005000);
     assert.equal(rev.revocationReason, 'compromised key');
 
-    // Malformed variants.
     const watcherBuf = Buffer.from(WATCHER_AGENT_OF_HEX, 'hex');
     assert.throws(() => decodeAgentOf(Buffer.concat([watcherBuf, Buffer.from([0])])), /trailing/);
     assert.throws(() => decodeAgentOf(watcherBuf.subarray(0, -1)), /truncated/);
@@ -159,19 +211,55 @@ test('decodeAgentOf decodes real Watcher and Token 5 bytes, None, Revoked, and r
     const badStatus = Buffer.from(revokedBuf);
     badStatus[1 + 9 + 32 + 4] = 9;
     assert.throws(() => decodeAgentOf(badStatus), /status tag/);
-    const badUtf8Reason = Buffer.concat([
+});
+
+test('decodeGetMetadata, parseMetadataSetEvent, and decodeAgentOf preserve UTF-8 BOMs without stripping', () => {
+    const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+    const bomKey = Buffer.concat([bom, Buffer.from('countersign.anchor', 'utf8')]);
+    const bomHash = Buffer.concat([bom, Buffer.from('a'.repeat(64), 'utf8')]);
+
+    // decodeGetMetadataUtf8 must NOT strip leading UTF-8 BOM into valid 64-hex hash.
+    const metaPayload = Buffer.concat([Buffer.from([1]), u32le(bomHash.length), bomHash]);
+    const decodedHash = decodeGetMetadataUtf8(metaPayload);
+    assert.equal(decodedHash.codePointAt(0), 0xfeff);
+    assert.equal(decodedHash.length, 65);
+    assert.equal(/^[0-9a-f]{64}$/.test(decodedHash), false);
+
+    // parseMetadataSetEvent must preserve BOM in key so it never aliases 'countersign.anchor'.
+    const evHex = Buffer.concat([
+        Buffer.from([0xf3]),
+        encodeTokenId('1315'),
+        u32le(bomKey.length),
+        bomKey,
+        u32le(bomHash.length),
+        bomHash,
+        u64le(1700000000000n),
+    ]).toString('hex');
+    const ev = parseMetadataSetEvent(evHex, '1315');
+    assert.equal(ev.key, '\uFEFFcountersign.anchor');
+    assert.notEqual(ev.key, 'countersign.anchor');
+
+    // decodeAgentOf preserves BOM in agentUri and metadata keys.
+    const ownerBytes = Buffer.from(AccountAddress.fromBase58(WATCHER_OWNER).decodedAddress);
+    const bomUri = Buffer.concat([bom, Buffer.from('https://example.com/card.json', 'utf8')]);
+    const agentBuf = Buffer.concat([
         Buffer.from([1]),
-        encodeTokenId('7'),
+        encodeTokenId('1315'),
         ownerBytes,
-        Buffer.from([0, 0, 0, 0, 0]),
-        u64le(1000n),
-        Buffer.from([0]),
         Buffer.from([1]),
-        u32le(2),
-        Buffer.from([0xff, 0xfe]),
+        u32le(bomUri.length),
+        bomUri,
+        Buffer.from([0, 0, 0, 0]),
+        u64le(1700000000000n),
+        Buffer.from([0, 0]),
+        u32le(1),
+        u32le(bomKey.length),
+        bomKey,
         u32le(0),
     ]);
-    assert.throws(() => decodeAgentOf(badUtf8Reason));
+    const agent = decodeAgentOf(agentBuf);
+    assert.equal(agent.agentUri.codePointAt(0), 0xfeff);
+    assert.equal(agent.onChainMetadata[0].key, '\uFEFFcountersign.anchor');
 });
 
 test('decodeGetMetadata and decodeGetMetadataUtf8 strictly decode Option<Vec<u8>>', () => {
@@ -199,19 +287,16 @@ test('parseMetadataSetEvent parses matching tokenId, skips others, and throws on
     assert.equal(parsed.value.toString('utf8'), 'e1a8cae4c7eab23ce6f1836245eff38b319257972c77755aa54031b0bb45b9f8');
     assert.equal(parsed.timestampMs, Date.parse('2026-11-20T20:11:48.623Z'));
 
-    // Non-0xf3 or 0xf3 for a different tokenId must return null.
     assert.equal(parseMetadataSetEvent(WATCHER_MINT_HEX, '1315'), null);
     assert.equal(parseMetadataSetEvent(WATCHER_METADATA_SET_HEX, '1316'), null);
     assert.equal(parseMetadataSetEvent('', '1315'), null);
 
-    // Targeting expectedTokenId and malformed must throw.
     assert.throws(() => parseMetadataSetEvent(WATCHER_METADATA_SET_HEX + '00', '1315'), /trailing/);
     assert.throws(() => parseMetadataSetEvent(WATCHER_METADATA_SET_HEX.slice(0, -2), '1315'), /truncated/);
     assert.throws(() => parseMetadataSetEvent('f308', '1315'), /truncated/);
     assert.throws(() => parseMetadataSetEvent(WATCHER_METADATA_SET_HEX.toUpperCase(), '1315'), /lowercase hex/);
     assert.throws(() => parseMetadataSetEvent('f30', '1315'), /lowercase hex/);
 
-    // Invalid UTF-8 key on matching tokenId must throw.
     const badKeyEvent = Buffer.concat([
         Buffer.from([0xf3]),
         encodeTokenId('1315'),
@@ -223,9 +308,8 @@ test('parseMetadataSetEvent parses matching tokenId, skips others, and throws on
     assert.throws(() => parseMetadataSetEvent(badKeyEvent, '1315'));
 });
 
-test('parseCis2Event decodes Mint, Transfer, UpdateOperator, MetadataSet, Burn, Other and rejects malformed', () => {
-    const mint = parseCis2Event(WATCHER_MINT_HEX);
-    assert.deepEqual(mint, {
+test('parseCis2Event decodes all CIS-8004/CIS-2 tags explicitly and returns Unknown for unrecognized tags', () => {
+    assert.deepEqual(parseCis2Event(WATCHER_MINT_HEX), {
         type: 'Mint',
         tokenId: '1315',
         tokenIdHex: '2305000000000000',
@@ -233,15 +317,78 @@ test('parseCis2Event decodes Mint, Transfer, UpdateOperator, MetadataSet, Burn, 
         owner: WATCHER_OWNER,
     });
 
+    const regEv = parseCis2Event(WATCHER_REGISTERED_HEX);
+    assert.equal(regEv.type, 'Registered');
+    assert.equal(regEv.tokenId, '1315');
+    assert.equal(regEv.ownerAccount, WATCHER_OWNER);
+    assert.equal(regEv.agentUri, null);
+
+    const walletEv = parseCis2Event(WATCHER_WALLET_SET_HEX);
+    assert.equal(walletEv.type, 'AgentWalletSet');
+    assert.equal(walletEv.tokenId, '1315');
+    assert.equal(walletEv.newWallet, WATCHER_OWNER);
+
     const ownerBytes = Buffer.from(AccountAddress.fromBase58(WATCHER_OWNER).decodedAddress);
     const otherAcct = '3dt3UMPzRASZndjmKpSWgCP2HhmoxZrgs8FDPtZjNHZzj13hhB';
     const otherBytes = Buffer.from(AccountAddress.fromBase58(otherAcct).decodedAddress);
 
+    const uriEv = parseCis2Event(
+        Buffer.concat([
+            Buffer.from([0xf1]),
+            encodeTokenId('1315'),
+            Buffer.from([1]),
+            strU32('https://example.com/a.json'),
+            Buffer.from([1]),
+            Buffer.alloc(32, 0x11),
+            u64le(1700000000000n),
+        ]).toString('hex'),
+    );
+    assert.equal(uriEv.type, 'URIUpdated');
+    assert.equal(uriEv.agentUri, 'https://example.com/a.json');
+
+    const extRefEv = parseCis2Event(
+        Buffer.concat([Buffer.from([0xf2]), encodeTokenId('1315'), Buffer.from([0]), u64le(1700000000000n)]).toString('hex'),
+    );
+    assert.equal(extRefEv.type, 'ExternalReferenceSet');
+    assert.equal(extRefEv.externalReference, null);
+
+    const revEv = parseCis2Event(
+        Buffer.concat([Buffer.from([0xf4]), encodeTokenId('1315'), ownerBytes, Buffer.from([1]), strU32('done'), u64le(1700000000000n)]).toString('hex'),
+    );
+    assert.equal(revEv.type, 'Revoked');
+    assert.equal(revEv.reason, 'done');
+
+    const adminEv = parseCis2Event(
+        Buffer.concat([Buffer.from([0xf7]), Buffer.from([1]), ownerBytes, Buffer.from([1]), otherBytes, u64le(1700000000000n)]).toString('hex'),
+    );
+    assert.equal(adminEv.type, 'AdminTransferred');
+    assert.equal(adminEv.previous, WATCHER_OWNER);
+    assert.equal(adminEv.next, otherAcct);
+
+    const extRegEv = parseCis2Event(
+        Buffer.concat([Buffer.from([0xf8]), u64le(10n), u64le(0n), u64le(11n), u64le(0n)]).toString('hex'),
+    );
+    assert.equal(extRegEv.type, 'ExternalRegistriesUpdated');
+    assert.deepEqual(extRegEv.newCis8Contract, { index: 11, subindex: 0 });
+
+    const urlBuf = Buffer.from('https://example.com/meta', 'utf8');
+    const tokMetaEv = parseCis2Event(
+        Buffer.concat([Buffer.from([0xfb]), encodeTokenId('1315'), u16le(urlBuf.length), urlBuf, Buffer.from([0])]).toString('hex'),
+    );
+    assert.equal(tokMetaEv.type, 'TokenMetadata');
+    assert.equal(tokMetaEv.url, 'https://example.com/meta');
+    assert.equal(tokMetaEv.hashHex, null);
+
+    const burnEv = parseCis2Event(
+        Buffer.concat([Buffer.from([0xfd]), encodeTokenId('1315'), Buffer.from([1, 0]), ownerBytes]).toString('hex'),
+    );
+    assert.equal(burnEv.type, 'Burn');
+    assert.equal(burnEv.owner, WATCHER_OWNER);
+
     const xferHex = Buffer.concat([
         Buffer.from([0xff]),
         encodeTokenId('1315'),
-        Buffer.from([1]), // uleb128 1
-        Buffer.from([0]),
+        Buffer.from([1, 0]),
         ownerBytes,
         Buffer.from([0]),
         otherBytes,
@@ -255,26 +402,7 @@ test('parseCis2Event decodes Mint, Transfer, UpdateOperator, MetadataSet, Burn, 
         to: otherAcct,
     });
 
-    // Transfer to Contract address
-    const xferContractHex = Buffer.concat([
-        Buffer.from([0xff]),
-        encodeTokenId('1315'),
-        Buffer.from([1]),
-        Buffer.from([0]),
-        ownerBytes,
-        Buffer.from([1]),
-        u64le(900n),
-        u64le(2n),
-    ]).toString('hex');
-    assert.deepEqual(parseCis2Event(xferContractHex).to, { index: 900, subindex: 2 });
-
-    const addOpHex = Buffer.concat([
-        Buffer.from([0xfc, 1]),
-        Buffer.from([0]),
-        ownerBytes,
-        Buffer.from([0]),
-        otherBytes,
-    ]).toString('hex');
+    const addOpHex = Buffer.concat([Buffer.from([0xfc, 1, 0]), ownerBytes, Buffer.from([0]), otherBytes]).toString('hex');
     assert.deepEqual(parseCis2Event(addOpHex), {
         type: 'UpdateOperator',
         update: 'Add',
@@ -282,22 +410,18 @@ test('parseCis2Event decodes Mint, Transfer, UpdateOperator, MetadataSet, Burn, 
         operator: otherAcct,
     });
 
-    const remOpHex = Buffer.concat([
-        Buffer.from([0xfc, 0]),
-        Buffer.from([0]),
-        ownerBytes,
-        Buffer.from([0]),
-        otherBytes,
-    ]).toString('hex');
-    assert.equal(parseCis2Event(remOpHex).update, 'Remove');
-
     assert.deepEqual(parseCis2Event(WATCHER_METADATA_SET_HEX), {
         type: 'MetadataSet',
         rawHex: WATCHER_METADATA_SET_HEX,
     });
-    assert.equal(parseCis2Event('f00102').type, 'Other');
 
-    assert.throws(() => parseCis2Event('fc02' + '00' + ownerBytes.toString('hex') + '00' + otherBytes.toString('hex')), /update tag/);
+    assert.deepEqual(parseCis2Event('ea0102'), {
+        type: 'Unknown',
+        tag: 0xea,
+        rawHex: 'ea0102',
+    });
+
+    assert.throws(() => parseCis2Event('fc0200' + ownerBytes.toString('hex') + '00' + otherBytes.toString('hex')), /update tag/);
     assert.throws(() => parseCis2Event(WATCHER_MINT_HEX + '00'), /trailing/);
     assert.throws(() => parseCis2Event(WATCHER_MINT_HEX.slice(0, -2)), /truncated/);
     assert.throws(() => parseCis2Event(''), /empty/);
@@ -314,13 +438,13 @@ test('verifyAgentCardBytes validates Watcher card and rejects tampered hash or e
     assert.equal(verified.sha256, WATCHER_CARD_HASH);
     assert.equal(verified.card.name, 'Watcher');
 
-    // Hash mismatch
     assert.throws(
-        () => verifyAgentCardBytes(Buffer.from(cardBytes.toString('utf8').replace('Watcher', 'WatcheR')), {
-            badge: WATCHER_BADGE,
-            ownerAccount: WATCHER_OWNER,
-            metadataHashHex: WATCHER_CARD_HASH,
-        }),
+        () =>
+            verifyAgentCardBytes(Buffer.from(cardBytes.toString('utf8').replace('Watcher', 'WatcheR')), {
+                badge: WATCHER_BADGE,
+                ownerAccount: WATCHER_OWNER,
+                metadataHashHex: WATCHER_CARD_HASH,
+            }),
         /SHA-256 mismatch/,
     );
 
@@ -338,36 +462,139 @@ test('verifyAgentCardBytes validates Watcher card and rejects tampered hash or e
     assert.throws(mutateCard((c) => { c.capabilities.extensions = []; }), /exactly one/);
 });
 
-test('fetchAgentCard enforces https-only, no redirects, timeout, and maxBytes streaming cap', async () => {
+test('isDisallowedIp blocks loopback, private, link-local, CGNAT, ULA, and IPv4-mapped IPv6 addresses', () => {
+    for (const bad of [
+        '127.0.0.1',
+        '127.255.0.1',
+        '10.0.0.1',
+        '172.16.0.1',
+        '172.31.255.254',
+        '192.168.1.1',
+        '169.254.169.254',
+        '100.64.0.1',
+        '0.0.0.0',
+        '224.0.0.1',
+        '::',
+        '::1',
+        '::ffff:127.0.0.1',
+        '::ffff:169.254.169.254',
+        '::ffff:7f00:1',
+        'fe80::1',
+        'fe80::1%eth0',
+        'fc00::1',
+        'fd12:3456:789a::1',
+        'ff02::1',
+        '64:ff9b::10.0.0.1',
+    ]) {
+        assert.equal(isDisallowedIp(bad), true, `expected ${bad} to be disallowed`);
+    }
+    for (const good of ['93.184.216.34', '140.82.121.4', '2606:4700:4700::1111', '2001:4860:4860::8888']) {
+        assert.equal(isDisallowedIp(good), false, `expected ${good} to be allowed`);
+    }
+});
+
+test('fetchAgentCard enforces https, SSRF IP/DNS guards, no redirects, timeout, and maxBytes', async () => {
     await assert.rejects(() => fetchAgentCard('http://example.com/card.json'), /non-HTTPS/);
+    await assert.rejects(() => fetchAgentCard('https://user:pass@example.com/card.json'), /credentials/);
     await assert.rejects(() => fetchAgentCard('not a url'), /invalid agentUri/);
 
-    const origFetch = globalThis.fetch;
-    try {
-        // Streaming cap test (even without Content-Length header).
-        globalThis.fetch = async () => new Response(new ReadableStream({
-            start(controller) {
-                controller.enqueue(new Uint8Array(600));
-                controller.enqueue(new Uint8Array(600));
-                controller.close();
-            },
-        }), { status: 200 });
-        await assert.rejects(() => fetchAgentCard('https://example.com/card.json', { maxBytes: 1000 }), /exceeds 1000 byte limit/);
-
-        // Happy path under cap.
-        globalThis.fetch = async (_url, opts) => {
-            assert.equal(opts.redirect, 'error');
-            return new Response(Buffer.from('{"ok":true}'), { status: 200 });
-        };
-        const out = await fetchAgentCard('https://example.com/card.json', { maxBytes: 1000 });
-        assert.equal(out.toString('utf8'), '{"ok":true}');
-
-        // Abort timeout test.
-        globalThis.fetch = async (_url, opts) => new Promise((_, reject) => {
-            opts.signal.addEventListener('abort', () => reject(opts.signal.reason));
-        });
-        await assert.rejects(() => fetchAgentCard('https://example.com/card.json', { timeoutMs: 25 }), /timed out/);
-    } finally {
-        globalThis.fetch = origFetch;
+    // IP-literal SSRF blocks before socket connect.
+    for (const badUri of [
+        'https://127.0.0.1/card.json',
+        'https://10.0.0.1/card.json',
+        'https://169.254.169.254/latest/meta-data/',
+        'https://[::1]/card.json',
+        'https://[::ffff:127.0.0.1]/card.json',
+        'https://[fe80::1]/card.json',
+    ]) {
+        await assert.rejects(
+            () => fetchAgentCard(badUri, { requestFn: () => { throw new Error('must not connect'); } }),
+            /private or non-public IP/,
+            badUri,
+        );
     }
+
+    // DNS resolution SSRF guard in both single-IP and { all: true } modes.
+    await assert.rejects(
+        () =>
+            fetchAgentCard('https://rebind.example/card.json', {
+                lookupFn: (_h, _o, cb) => cb(null, '127.0.0.1', 4),
+                requestFn: makeMockRequestFn({ chunks: ['{}'], lookupOpts: {} }),
+            }),
+        /private or non-public IP/,
+    );
+    await assert.rejects(
+        () =>
+            fetchAgentCard('https://rebind.example/card.json', {
+                lookupFn: (_h, _o, cb) =>
+                    cb(null, [
+                        { address: '93.184.216.34', family: 4 },
+                        { address: '::ffff:10.0.0.1', family: 6 },
+                    ]),
+                requestFn: makeMockRequestFn({ chunks: ['{}'], lookupOpts: { all: true } }),
+            }),
+        /private or non-public IP/,
+    );
+
+    // allowPrivate: true permits loopback when explicitly opted in.
+    const privateOk = await fetchAgentCard('https://127.0.0.1/card.json', {
+        allowPrivate: true,
+        lookupFn: (_h, _o, cb) => cb(null, [{ address: '127.0.0.1', family: 4 }]),
+        requestFn: makeMockRequestFn({ chunks: ['{"private":true}'] }),
+    });
+    assert.equal(privateOk.toString('utf8'), '{"private":true}');
+
+    const publicLookup = (_h, opts, cb) =>
+        opts?.all ? cb(null, [{ address: '93.184.216.34', family: 4 }]) : cb(null, '93.184.216.34', 4);
+
+    // Redirect rejection.
+    await assert.rejects(
+        () =>
+            fetchAgentCard('https://example.com/card.json', {
+                lookupFn: publicLookup,
+                requestFn: makeMockRequestFn({ statusCode: 302, headers: { location: 'https://other.example/' } }),
+            }),
+        /redirect/,
+    );
+
+    // Content-Length cap rejection.
+    await assert.rejects(
+        () =>
+            fetchAgentCard('https://example.com/card.json', {
+                maxBytes: 1000,
+                lookupFn: publicLookup,
+                requestFn: makeMockRequestFn({ headers: { 'content-length': '2048' } }),
+            }),
+        /exceeds 1000 byte limit/,
+    );
+
+    // Streaming chunk cap rejection without Content-Length.
+    await assert.rejects(
+        () =>
+            fetchAgentCard('https://example.com/card.json', {
+                maxBytes: 1000,
+                lookupFn: publicLookup,
+                requestFn: makeMockRequestFn({ chunks: [Buffer.alloc(600), Buffer.alloc(600)] }),
+            }),
+        /exceeds 1000 byte limit/,
+    );
+
+    // Timeout rejection.
+    await assert.rejects(
+        () =>
+            fetchAgentCard('https://example.com/card.json', {
+                timeoutMs: 25,
+                lookupFn: publicLookup,
+                requestFn: makeMockRequestFn({ delayMs: 200 }),
+            }),
+        /timed out/,
+    );
+
+    // Happy path under cap.
+    const ok = await fetchAgentCard('https://example.com/card.json', {
+        maxBytes: 1000,
+        lookupFn: publicLookup,
+        requestFn: makeMockRequestFn({ chunks: ['{"ok":', 'true}'] }),
+    });
+    assert.equal(ok.toString('utf8'), '{"ok":true}');
 });

@@ -64,15 +64,15 @@ Given a badge (a CIS-2 Base58Check token address) and a trail file, a verifier m
 
 1. decode the badge locally, enforce an 8-byte little-endian `u64` token id, and accept only the pinned testnet registry instance (`<12802,0>`) and testnet genesis (`4221332d34e1694168c2a0c0b3fd0f273809612cb13d000d5c2e00e85f50f796`);
 2. pin a single finalized tip block `(tipBlockHash, tipBlockHeight)` and read `CIS-8004.agentOf` and `CIS-8004.getMetadata` directly via `invokeContract` at `tipBlockHash`;
-3. confirm the entry is registered (`Some`) and `Active`, fetch the Agent Card over HTTPS (no redirects, 1 MiB streaming cap) or read a local `--card` file, confirm its SHA-256 equals the on-chain `metadata_hash`, and validate the `concordium-badge/v1` extension (`tokenAddress`, `owner.account`, `contracts.cis8004`);
-4. confirm the trail header's `token_id` and `registry` match the badge, and that `unitares.agent_uuid` on chain equals the header's `agent_uuid`;
+3. confirm the entry is registered (`Some`) and `Active`, fetch the Agent Card over HTTPS (no redirects, pre-connect public-IP SSRF check, 1 MiB streaming cap) or read a local `--card` file, confirm its SHA-256 equals the on-chain `metadata_hash`, and validate the `concordium-badge/v1` extension (`tokenAddress`, `owner.account`, `contracts.cis8004`);
+4. confirm the trail header's `token_id` and `registry` match the badge, and that `unitares.agent_uuid` on chain equals the header's `agent_uuid` (using BOM-preserving strict UTF-8);
 5. reconstruct the complete `MetadataSet` history directly from finalized blocks between registration and `tipBlockHeight` (fail-closed continuity):
-   - locate the registration block from `agent.registeredAtMs` and confirm a unique `Mint` (`0xfe`) event for `token_id` whose `owner` equals the current `owner_account`;
-   - confirm the contract's `sourceModule.moduleRef` at registration matches `tipBlockHash`;
+   - locate the registration block from `agent.registeredAtMs` and confirm a unique `Mint` (`0xfe`) event for `token_id` whose `owner` matches the current `owner_account`;
+   - confirm the contract's `sourceModule.moduleRef` at both registration and `tipBlockHash` equals the pinned module reference `0e57473715d1c2a364fa626b8783688db32b7fac9d0e2fc97043da91e1a7d3eb`;
    - confirm zero pre-existing CIS-2 operators for `owner_account` at the registration block via contract state lookup (`0500000000000000 || owner_account_bytes`);
-   - confirm the owner's `accountNonce` span since registration does not exceed `maxOwnerTxs` (`2000`), exhaustively locate every block in `(regHeight, tipBlockHeight]` where `owner_account`'s `accountNonce` increased, stream `getBlockTransactionEvents` in ascending height order (plus any post-`Mint` events in `regHeight`), fail closed on any `Transfer`, `Burn`, or `UpdateOperator(Add)` affecting `token_id` or `owner_account`, and collect every `MetadataSet` (`0xf3`) event targeting `token_id`;
+   - confirm the owner's `accountNonce` span since registration does not exceed `maxOwnerTxs` (`2000`), exhaustively locate every block in `(regHeight, tipBlockHeight]` where `owner_account`'s `accountNonce` increased, stream `getBlockTransactionEvents` in ascending height order (plus any post-`Mint` events in `regHeight`), fail closed on any `Transfer`, `Burn`, `UpdateOperator(Add)`, non-owner `MetadataSet` sender, or unknown `<12802,0>` contract event tag, and collect every `MetadataSet` (`0xf3`) event targeting `token_id`;
 6. list every value `countersign.anchor` has held from the collected `MetadataSet` events and confirm the last one equals the current value at `tipBlockHash`;
-7. confirm every listed anchor transaction is finalized at `blockHeight <= tipBlockHeight`, was sent by the entry's current owner account, and names the same token id;
+7. confirm every listed anchor transaction is finalized at `blockHeight <= tipBlockHeight`, was sent by the entry's current owner account (canonically including account aliases), and names the same token id;
 8. confirm the anchors form one chain: the first has no previous anchor, each later one names the anchor listed immediately before it, and the last sequence number covered strictly increases;
 9. recompute `h` from the trail file and confirm it equals the anchored value at every anchor's sequence number.
 
@@ -81,9 +81,9 @@ Records after the latest anchor's sequence number are outside the commitment.
 Notes:
 
 - An anchor counts only once a `MetadataSet` event names it. The deployed registry does not emit that event for metadata supplied at registration, so a pointer set that way is not an anchor: the verifier fails while it is current and ignores it afterwards. A register-data transaction that the entry never pointed at is likewise not an anchor.
-- Anchors must come from the entry's current owner. If the token is transferred, anchors sent by the previous owner stop verifying. That is deliberate: the verifier does not reconstruct ownership history.
+- Anchors and `MetadataSet` updates must come from the entry's current owner, and uninterrupted exclusive ownership since `Mint` is enforced: any `Transfer`, `Burn`, or `Mint` to a non-owner fails closed.
 - A verifier reports the highest sequence number covered. A trail may carry newer records; they are outside the commitment until the next anchor.
-- The trail file must be valid UTF-8, and every line must equal the canonical serialization of the value it parses to.
+- The trail file and on-chain UTF-8 metadata must be valid UTF-8, decoded with BOM preservation (leading `U+FEFF` is never silently stripped), and every trail line must equal the canonical serialization of the value it parses to.
 
 ## Test vector
 

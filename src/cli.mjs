@@ -12,6 +12,7 @@ import {
     client,
     configureNode,
     createRpcPool,
+    isSameAccount,
     loadSigner,
     readAgentOf,
     readMetadataText,
@@ -30,13 +31,20 @@ const UUID_KEY = 'unitares.agent_uuid';
 const ANCHOR_KEY = 'countersign.anchor';
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const TX_RE = /^[0-9a-f]{64}$/;
-const utf8Fatal = new TextDecoder('utf-8', { fatal: true });
+const utf8Fatal = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 const hex = (s) => Buffer.from(s, 'utf8').toString('hex');
 const sha256hex = (b) => crypto.createHash('sha256').update(b).digest('hex');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const chainIsUnbroken = (anchors) => anchors.every((a, i) => a.prevAnchorTx === (i === 0 ? null : anchors[i - 1].txHash));
 const coverageGrows = (anchors) => anchors.every((a, i) => a.toSeq > (i === 0 ? 0 : anchors[i - 1].toSeq));
+
+function applyNodeOptions(node, nodeInsecure) {
+    if (!node && !nodeInsecure) return;
+    const cfg = typeof node === 'string' ? { host: node } : (node && typeof node === 'object' ? { ...node } : {});
+    if (nodeInsecure) cfg.tls = false;
+    configureNode(cfg);
+}
 
 async function loadAnchorsFromHistory(history, nodeClient, tipBlockHeight) {
     const pointers = history.events.filter((e) => e.key === ANCHOR_KEY);
@@ -103,10 +111,11 @@ export const commands = {
     },
 
     /** Pin the hosted card's URL and hash on chain. Run after the card is publicly served. */
-    async 'pin-card'({ token, url, file }) {
+    async 'pin-card'({ token, url, file, ...opts }) {
         const who = loadSigner();
+        const allowPrivate = Boolean(opts.allowPrivateCard ?? opts['allow-private-card']);
         const local = sha256hex(fs.readFileSync(file));
-        const served = sha256hex(Buffer.from(await (await fetch(url, { redirect: 'error' })).arrayBuffer()));
+        const served = sha256hex(await fetchAgentCard(url, { allowPrivate }));
         if (local !== served) throw new Error(`the bytes served at ${url} differ from ${file}; host the file verbatim first`);
         const built = await mcp('build_set_agent_uri', { token_id: String(token), agent_uri: url, metadata_hash_hex: local, sender: who.address });
         const { hash } = await sendRegistryUpdate(built, who, { receiveName: 'CIS-8004.setAgentURI' });
@@ -136,9 +145,10 @@ export const commands = {
     },
 
     /** Write the trail's current commitment to testnet and point the registry entry at it. */
-    async anchor({ trail, tx, node, nodeClient }) {
-        if (node) configureNode(node);
-        const who = loadSigner();
+    async anchor({ trail, tx, node, nodeClient, who: providedWho, ...opts }) {
+        const nodeInsecure = Boolean(opts.nodeInsecure ?? opts['node-insecure']);
+        applyNodeOptions(node, nodeInsecure);
+        const who = providedWho ?? loadSigner();
         const { header, records } = readTrail(trail);
         const tokenId = header.token_id;
         const c = nodeClient ?? (await client());
@@ -149,7 +159,7 @@ export const commands = {
 
         const agent = await readAgentOf(tokenId, { blockHash: tipBlockHash, nodeClient: c });
         if (!agent) throw new Error(`registry token ${tokenId} is not registered`);
-        if (agent.ownerAccount !== who.address) {
+        if (!isSameAccount(agent.ownerAccount, who.address)) {
             throw new Error(`signer ${who.address} does not own token ${tokenId} (owner is ${agent.ownerAccount})`);
         }
         const current = await readMetadataText(tokenId, ANCHOR_KEY, { blockHash: tipBlockHash, nodeClient: c });
@@ -165,9 +175,16 @@ export const commands = {
         const existing = await loadAnchorsFromHistory(history, c, tipBlockHeight);
         const { last, count, at } = commitments(header, records, new Set(existing.map((a) => a.toSeq)));
         // Never extend a chain this trail no longer agrees with: a new anchor over a drifted record would break every earlier one.
-        if (!chainIsUnbroken(existing)) throw new Error('the existing anchors do not form one chain; refusing to add to it');
+        if (!chainIsUnbroken(existing) || !coverageGrows(existing)) {
+            throw new Error('the existing anchors do not form one chain; refusing to add to it');
+        }
         for (const a of existing) {
-            if (at.get(a.toSeq)?.toString('hex') !== a.commitment) throw new Error(`this trail does not match the anchor covering records 1..${a.toSeq} (${a.txHash}); refusing to anchor`);
+            if (!isSameAccount(a.sender, agent.ownerAccount) || a.tokenId !== tokenId) {
+                throw new Error(`existing anchor ${a.txHash} does not belong to owner ${agent.ownerAccount} / token ${tokenId}`);
+            }
+            if (at.get(a.toSeq)?.toString('hex') !== a.commitment) {
+                throw new Error(`this trail does not match the anchor covering records 1..${a.toSeq} (${a.txHash}); refusing to anchor`);
+            }
         }
         const prev = existing.at(-1) ?? null;
         if (current !== (prev?.txHash ?? null)) throw new Error('the current pointer is not the last one in the event history yet; retry shortly');
@@ -178,21 +195,37 @@ export const commands = {
             if (!TX_RE.test(hash)) throw new Error('--tx must be a transaction hash');
             const sent = await readRegisterData(hash, c);
             const d = decodeAnchor(sent.data);
-            const ok = sent.sender === who.address && d.tokenId === tokenId && d.toSeq === count && d.commitment === last.toString('hex') && d.prevAnchorTx === (prev?.txHash ?? null);
+            const ok =
+                isSameAccount(sent.sender, who.address) &&
+                d.tokenId === tokenId &&
+                d.toSeq === count &&
+                d.commitment === last.toString('hex') &&
+                d.prevAnchorTx === (prev?.txHash ?? null);
             if (!ok) throw new Error('--tx is not the next anchor for this trail');
         } else {
+            const latestBeforeAnchor = await readMetadataText(tokenId, ANCHOR_KEY, { nodeClient: c });
+            if (latestBeforeAnchor !== (prev?.txHash ?? null)) {
+                throw new Error('countersign.anchor moved concurrently; refusing to overwrite pointer');
+            }
             const data = encodeAnchor({ tokenId, toSeq: count, commitment: last, prevAnchorTx: prev?.txHash ?? null });
-            ({ hash } = await sendRegisterData(data, who));
+            ({ hash } = await sendRegisterData(data, who, c));
             console.log(`anchored seq 1..${count}: ${EXPLORER_TX(hash)}`);
         }
-        const set = await sendSetMetadata(tokenId, ANCHOR_KEY, hash, who);
+
+        const latestBeforeSet = await readMetadataText(tokenId, ANCHOR_KEY, { nodeClient: c });
+        if (latestBeforeSet !== (prev?.txHash ?? null)) {
+            throw new Error('countersign.anchor moved concurrently; refusing to overwrite pointer');
+        }
+        const set = await sendSetMetadata(tokenId, ANCHOR_KEY, hash, who, c);
         console.log('registry entry now points at the anchor:', EXPLORER_TX(set.hash));
     },
 
     /** Anyone: check a badge and a trail file directly against a Concordium testnet node. Needs no keys. */
-    async verify({ badge, trail, card, node, nodeClient }) {
+    async verify({ badge, trail, card, node, nodeClient, fetchCard = fetchAgentCard, ...opts }) {
         process.exitCode = 1; // only a completed, fully passing run resets this
-        if (node) configureNode(node);
+        const nodeInsecure = Boolean(opts.nodeInsecure ?? opts['node-insecure']);
+        const allowPrivate = Boolean(opts.allowPrivateCard ?? opts['allow-private-card']);
+        applyNodeOptions(node, nodeInsecure);
         const checks = [];
         let covered = 0;
         const check = (name, ok, detail = '') => {
@@ -244,7 +277,7 @@ export const commands = {
                 sourceLabel = card;
             } else {
                 if (!agent.agentUri) throw new Error('on-chain agent_uri is not set');
-                cardBytes = await fetchAgentCard(agent.agentUri);
+                cardBytes = await fetchCard(agent.agentUri, { allowPrivate });
                 sourceLabel = agent.agentUri;
             }
             verifyAgentCardBytes(cardBytes, {
@@ -300,7 +333,7 @@ export const commands = {
             return finish(checks);
         }
         check('the current pointer is the last one in the registry event history', anchors.at(-1)?.txHash === current, `${anchors.length} pointer updates`);
-        check('every anchor was sent by the registry entry owner', Boolean(owner) && anchors.every((a) => a.sender === owner), owner);
+        check('every anchor was sent by the registry entry owner', Boolean(owner) && anchors.every((a) => isSameAccount(a.sender, owner)), owner);
         check('every anchor names this registry token', anchors.every((a) => a.tokenId === tokenId));
         check('anchors form one unbroken chain (each names the one before it, none was skipped or replaced)', chainIsUnbroken(anchors));
         check('each anchor covers more records than the one before', coverageGrows(anchors));
@@ -344,9 +377,14 @@ if (isMainEntry()) {
         console.log(`usage: countersign <${Object.keys(commands).join(' | ')}> [--options]`);
         process.exit(name ? 2 : 0);
     }
+    const stringOpts = ['uuid', 'token', 'name', 'description', 'url', 'out', 'file', 'trail', 'badge', 'psql', 'tx', 'node', 'card'];
+    const boolOpts = ['node-insecure', 'allow-private-card'];
     const { values } = parseArgs({
         args: rest,
-        options: Object.fromEntries(['uuid', 'token', 'name', 'description', 'url', 'out', 'file', 'trail', 'badge', 'psql', 'tx', 'node', 'card'].map((k) => [k, { type: 'string' }])),
+        options: {
+            ...Object.fromEntries(stringOpts.map((k) => [k, { type: 'string' }])),
+            ...Object.fromEntries(boolOpts.map((k) => [k, { type: 'boolean' }])),
+        },
     });
     commands[name](values).catch((e) => {
         console.error('error:', e.message);

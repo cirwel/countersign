@@ -1,10 +1,13 @@
-// Pure CIS-8004 / CIS-2 binary codecs, Concordium badge codec, and Agent Card validator.
+// Pure CIS-8004 / CIS-2 binary codecs, Concordium badge codec, and SSRF-hardened Agent Card validator.
 import crypto from 'node:crypto';
+import dns from 'node:dns';
+import https from 'node:https';
+import net from 'node:net';
 import { AccountAddress, ContractAddress, tokenAddressFromBase58, tokenAddressToBase58 } from '@concordium/web-sdk';
 import { REGISTRY, TESTNET_GENESIS } from './registry.mjs';
 
 const BADGE_EXTENSION_URI = 'https://docs.concordium.com/a2a-extensions/concordium-badge/v1';
-const utf8Fatal = new TextDecoder('utf-8', { fatal: true });
+const utf8Fatal = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 const U64_MAX = (1n << 64n) - 1n;
 const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 const HEX_EVEN_LOWER_RE = /^(?:[0-9a-f]{2})*$/;
@@ -67,6 +70,13 @@ class BinaryReader {
         return this.buf[this.offset++];
     }
 
+    readU16LE() {
+        this.assertRemaining(2);
+        const v = this.buf.readUInt16LE(this.offset);
+        this.offset += 2;
+        return v;
+    }
+
     readU32LE() {
         this.assertRemaining(4);
         const v = this.buf.readUInt32LE(this.offset);
@@ -93,10 +103,14 @@ class BinaryReader {
         return Buffer.from(this.readBytes(len));
     }
 
+    readStringU16() {
+        const len = this.readU16LE();
+        return utf8Fatal.decode(this.readBytes(len));
+    }
+
     readStringU32() {
         const len = this.readU32LE();
-        const bytes = this.readBytes(len);
-        return utf8Fatal.decode(bytes);
+        return utf8Fatal.decode(this.readBytes(len));
     }
 
     readAccountAddress() {
@@ -130,6 +144,16 @@ class BinaryReader {
         if (tag === 0) return null;
         if (tag === 1) return readInner();
         throw new Error(`${this.label}: invalid Option tag ${tag}`);
+    }
+
+    readExternalReference() {
+        const contractAddress = this.readContractAddress();
+        const kindTag = this.readU8();
+        if (kindTag !== 0) throw new Error(`${this.label}: unsupported external_reference kind ${kindTag}`);
+        const namespace = this.readStringU32();
+        const keyType = this.readStringU32();
+        const publicKeyHex = this.readByteListU32().toString('hex');
+        return { contractAddress, kind: 'Cis8', namespace, keyType, publicKeyHex };
     }
 
     readULeb128(maxBytes = 37) {
@@ -217,15 +241,7 @@ export function decodeAgentOf(bytes) {
         const ownerAccount = r.readAccountAddress();
         const agentUri = r.readOption(() => r.readStringU32());
         const metadataHashHex = r.readOption(() => Buffer.from(r.readBytes(32)).toString('hex'));
-        const externalReference = r.readOption(() => {
-            const contractAddress = r.readContractAddress();
-            const kindTag = r.readU8();
-            if (kindTag !== 0) throw new Error(`agentOf: unsupported external_reference kind ${kindTag}`);
-            const namespace = r.readStringU32();
-            const keyType = r.readStringU32();
-            const publicKeyHex = r.readByteListU32().toString('hex');
-            return { contractAddress, kind: 'Cis8', namespace, keyType, publicKeyHex };
-        });
+        const externalReference = r.readOption(() => r.readExternalReference());
         const agentWallet = r.readOption(() => r.readAccountAddress());
         const statusTag = r.readU8();
         let status;
@@ -238,7 +254,6 @@ export function decodeAgentOf(bytes) {
         const metaCount = r.readU32LE();
         const onChainMetadata = [];
         for (let i = 0; i < metaCount; i++) {
-            // Bound remaining length check implicitly via BinaryReader inside each entry.
             const key = r.readStringU32();
             const value = r.readByteListU32();
             onChainMetadata.push({ key, value });
@@ -269,7 +284,7 @@ export function decodeGetMetadata(bytes) {
     return val;
 }
 
-/** Strictly decodes CIS-8004.getMetadata as fatal UTF-8 text (or null when absent). */
+/** Strictly decodes CIS-8004.getMetadata as fatal, BOM-preserving UTF-8 text (or null when absent). */
 export function decodeGetMetadataUtf8(bytes) {
     const raw = decodeGetMetadata(bytes);
     return raw === null ? null : utf8Fatal.decode(raw);
@@ -305,49 +320,112 @@ function readCis2TokenId(r) {
     return { tokenId, tokenIdHex };
 }
 
-/** Decodes CIS-2 / CIS-8004 contract event hex strictly with cursor exhaustion checks. */
+/** Decodes every CIS-8004 / CIS-2 contract event tag strictly with cursor exhaustion checks. */
 export function parseCis2Event(hex) {
     assertEvenLowerHex(hex, 'CIS-2 event');
     if (hex.length === 0) throw new Error('empty CIS-2 event hex');
     const r = new BinaryReader(Buffer.from(hex, 'hex'), 'CIS-2 event');
     const tag = r.readU8();
-    if (tag === 0xfe) {
-        const { tokenId, tokenIdHex } = readCis2TokenId(r);
-        const amount = r.readULeb128();
-        const owner = r.readAddress();
-        r.assertEnd();
-        return { type: 'Mint', tokenId, tokenIdHex, amount, owner };
+    switch (tag) {
+        case 0xf0: {
+            const { tokenId, tokenIdHex } = readCis2TokenId(r);
+            const ownerAccount = r.readAccountAddress();
+            const agentUri = r.readOption(() => r.readStringU32());
+            const metadataHashHex = r.readOption(() => Buffer.from(r.readBytes(32)).toString('hex'));
+            const externalReference = r.readOption(() => r.readExternalReference());
+            const registeredAtMs = r.readTimestampMs();
+            r.assertEnd();
+            return { type: 'Registered', tokenId, tokenIdHex, ownerAccount, agentUri, metadataHashHex, externalReference, registeredAtMs };
+        }
+        case 0xf1: {
+            const { tokenId, tokenIdHex } = readCis2TokenId(r);
+            const agentUri = r.readOption(() => r.readStringU32());
+            const metadataHashHex = r.readOption(() => Buffer.from(r.readBytes(32)).toString('hex'));
+            const updatedAtMs = r.readTimestampMs();
+            r.assertEnd();
+            return { type: 'URIUpdated', tokenId, tokenIdHex, agentUri, metadataHashHex, updatedAtMs };
+        }
+        case 0xf2: {
+            const { tokenId, tokenIdHex } = readCis2TokenId(r);
+            const externalReference = r.readOption(() => r.readExternalReference());
+            const updatedAtMs = r.readTimestampMs();
+            r.assertEnd();
+            return { type: 'ExternalReferenceSet', tokenId, tokenIdHex, externalReference, updatedAtMs };
+        }
+        case 0xf3: {
+            return { type: 'MetadataSet', rawHex: hex };
+        }
+        case 0xf4: {
+            const { tokenId, tokenIdHex } = readCis2TokenId(r);
+            const ownerAccount = r.readAccountAddress();
+            const reason = r.readOption(() => r.readStringU32());
+            const revokedAtMs = r.readTimestampMs();
+            r.assertEnd();
+            return { type: 'Revoked', tokenId, tokenIdHex, ownerAccount, reason, revokedAtMs };
+        }
+        case 0xf5: {
+            const { tokenId, tokenIdHex } = readCis2TokenId(r);
+            const newWallet = r.readOption(() => r.readAccountAddress());
+            const updatedAtMs = r.readTimestampMs();
+            r.assertEnd();
+            return { type: 'AgentWalletSet', tokenId, tokenIdHex, newWallet, updatedAtMs };
+        }
+        case 0xf7: {
+            const previous = r.readOption(() => r.readAccountAddress());
+            const next = r.readOption(() => r.readAccountAddress());
+            const updatedAtMs = r.readTimestampMs();
+            r.assertEnd();
+            return { type: 'AdminTransferred', previous, next, updatedAtMs };
+        }
+        case 0xf8: {
+            const previousCis8Contract = r.readContractAddress();
+            const newCis8Contract = r.readContractAddress();
+            r.assertEnd();
+            return { type: 'ExternalRegistriesUpdated', previousCis8Contract, newCis8Contract };
+        }
+        case 0xfb: {
+            const { tokenId, tokenIdHex } = readCis2TokenId(r);
+            const url = r.readStringU16();
+            const hashHex = r.readOption(() => Buffer.from(r.readBytes(32)).toString('hex'));
+            r.assertEnd();
+            return { type: 'TokenMetadata', tokenId, tokenIdHex, url, hashHex };
+        }
+        case 0xfc: {
+            const opTag = r.readU8();
+            let update;
+            if (opTag === 0) update = 'Remove';
+            else if (opTag === 1) update = 'Add';
+            else throw new Error(`UpdateOperator: invalid update tag ${opTag}`);
+            const owner = r.readAddress();
+            const operator = r.readAddress();
+            r.assertEnd();
+            return { type: 'UpdateOperator', update, owner, operator };
+        }
+        case 0xfd: {
+            const { tokenId, tokenIdHex } = readCis2TokenId(r);
+            const amount = r.readULeb128();
+            const owner = r.readAddress();
+            r.assertEnd();
+            return { type: 'Burn', tokenId, tokenIdHex, amount, owner };
+        }
+        case 0xfe: {
+            const { tokenId, tokenIdHex } = readCis2TokenId(r);
+            const amount = r.readULeb128();
+            const owner = r.readAddress();
+            r.assertEnd();
+            return { type: 'Mint', tokenId, tokenIdHex, amount, owner };
+        }
+        case 0xff: {
+            const { tokenId, tokenIdHex } = readCis2TokenId(r);
+            const amount = r.readULeb128();
+            const from = r.readAddress();
+            const to = r.readAddress();
+            r.assertEnd();
+            return { type: 'Transfer', tokenId, tokenIdHex, amount, from, to };
+        }
+        default:
+            return { type: 'Unknown', tag, rawHex: hex };
     }
-    if (tag === 0xff) {
-        const { tokenId, tokenIdHex } = readCis2TokenId(r);
-        const amount = r.readULeb128();
-        const from = r.readAddress();
-        const to = r.readAddress();
-        r.assertEnd();
-        return { type: 'Transfer', tokenId, tokenIdHex, amount, from, to };
-    }
-    if (tag === 0xfc) {
-        const opTag = r.readU8();
-        let update;
-        if (opTag === 0) update = 'Remove';
-        else if (opTag === 1) update = 'Add';
-        else throw new Error(`UpdateOperator: invalid update tag ${opTag}`);
-        const owner = r.readAddress();
-        const operator = r.readAddress();
-        r.assertEnd();
-        return { type: 'UpdateOperator', update, owner, operator };
-    }
-    if (tag === 0xfd) {
-        const { tokenId, tokenIdHex } = readCis2TokenId(r);
-        const amount = r.readULeb128();
-        const owner = r.readAddress();
-        r.assertEnd();
-        return { type: 'Burn', tokenId, tokenIdHex, amount, owner };
-    }
-    if (tag === 0xf3) {
-        return { type: 'MetadataSet', rawHex: hex };
-    }
-    return { type: 'Other', tag, rawHex: hex };
 }
 
 /**
@@ -413,10 +491,93 @@ export function verifyAgentCardBytes(
     return { sha256: actualHash, card, extension: matches[0] };
 }
 
+function isDisallowedIpv4Octets(a, b, c) {
+    if (a === 0) return true; // 0.0.0.0/8 unspecified
+    if (a === 10) return true; // 10.0.0.0/8 RFC1918
+    if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
+    if (a === 127) return true; // 127.0.0.0/8 loopback
+    if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local / IMDS
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 RFC1918
+    if (a === 192 && b === 0 && (c === 0 || c === 2)) return true; // 192.0.0.0/24 & TEST-NET-1
+    if (a === 192 && b === 168) return true; // 192.168.0.0/16 RFC1918
+    if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 benchmarking
+    if (a === 198 && b === 51 && c === 100) return true; // TEST-NET-2
+    if (a === 203 && b === 0 && c === 113) return true; // TEST-NET-3
+    if (a >= 224) return true; // 224.0.0.0/4 multicast + 240.0.0.0/4 reserved
+    return false;
+}
+
+function parseIpv6Groups(raw) {
+    let ip = raw.toLowerCase();
+    // Handle embedded trailing IPv4 dotted quad (e.g. ::ffff:127.0.0.1).
+    const lastColon = ip.lastIndexOf(':');
+    let tailV4 = null;
+    if (lastColon !== -1 && ip.slice(lastColon + 1).includes('.')) {
+        const v4 = ip.slice(lastColon + 1);
+        if (!net.isIPv4(v4)) return null;
+        const oct = v4.split('.').map(Number);
+        tailV4 = [(oct[0] << 8) | oct[1], (oct[2] << 8) | oct[3]];
+        ip = ip.slice(0, lastColon);
+        if (ip.endsWith(':')) ip += ':';
+        // Wait: for `::ffff:127.0.0.1`, slice gives `::ffff`, while for `::127.0.0.1`, slice gives `:`.
+        if (ip === ':') ip = '::';
+    }
+    const halves = ip.split('::');
+    if (halves.length > 2) return null;
+    const parseSide = (s) => (s === '' ? [] : s.split(':').map((g) => parseInt(g, 16)));
+    const left = parseSide(halves[0]);
+    const right = halves.length === 2 ? parseSide(halves[1]) : [];
+    const targetLen = tailV4 ? 6 : 8;
+    const missing = targetLen - (left.length + right.length);
+    if (halves.length === 1 && missing !== 0) return null;
+    if (halves.length === 2 && missing < 0) return null;
+    const groups = [...left, ...new Array(Math.max(0, missing)).fill(0), ...right, ...(tailV4 ?? [])];
+    return groups.length === 8 && groups.every((n) => Number.isInteger(n) && n >= 0 && n <= 0xffff) ? groups : null;
+}
+
+export function isDisallowedIp(rawIp) {
+    if (typeof rawIp !== 'string' || rawIp.length === 0) return true;
+    if (rawIp.includes('%')) return true; // scoped zone ID (e.g. link-local)
+    const ip = rawIp.trim();
+    if (net.isIPv4(ip)) {
+        const [a, b, c] = ip.split('.').map(Number);
+        return isDisallowedIpv4Octets(a, b, c);
+    }
+    if (!net.isIPv6(ip)) return true;
+    const g = parseIpv6Groups(ip);
+    if (!g) return true;
+    // Unspecified :: or loopback ::1
+    if (g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0 && g[6] === 0 && g[7] <= 1) {
+        return true;
+    }
+    // IPv4-mapped (::ffff:0:0/96), IPv4-compatible (::/96), IPv4-translated (::ffff:0:0:0/96), NAT64 (64:ff9b::/96)
+    const isV4Mapped = g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0 && (g[5] === 0xffff || g[5] === 0);
+    const isV4Translated = g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0xffff && g[5] === 0;
+    const isNat64 = g[0] === 0x0064 && g[1] === 0xff9b && g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0;
+    if (isV4Mapped || isV4Translated || isNat64) {
+        return isDisallowedIpv4Octets(g[6] >>> 8, g[6] & 0xff, g[7] >>> 8);
+    }
+    // 6to4 (2002::/16) embedding private IPv4
+    if (g[0] === 0x2002 && isDisallowedIpv4Octets(g[1] >>> 8, g[1] & 0xff, g[2] >>> 8)) return true;
+    // ULA fc00::/7
+    if ((g[0] & 0xfe00) === 0xfc00) return true;
+    // Link-local fe80::/10 & deprecated site-local fec0::/10
+    if ((g[0] & 0xffc0) === 0xfe80 || (g[0] & 0xffc0) === 0xfec0) return true;
+    // Multicast ff00::/8
+    if ((g[0] & 0xff00) === 0xff00) return true;
+    // Documentation 2001:db8::/32
+    if (g[0] === 0x2001 && g[1] === 0x0db8) return true;
+    return false;
+}
+
 /**
- * Fetches an Agent Card over HTTPS without redirects, enforcing a timeout and streaming byte cap.
+ * Fetches an Agent Card over HTTPS without redirects, enforcing pre-connect SSRF IP checks,
+ * timeout, and a streaming byte cap.
  */
-export async function fetchAgentCard(uri, { timeoutMs = 15000, maxBytes = 1048576 } = {}) {
+export async function fetchAgentCard(
+    uri,
+    { timeoutMs = 15000, maxBytes = 1048576, allowPrivate = false, lookupFn = dns.lookup, requestFn = https.request } = {},
+) {
     let url;
     try {
         url = new URL(uri);
@@ -426,42 +587,109 @@ export async function fetchAgentCard(uri, { timeoutMs = 15000, maxBytes = 104857
     if (url.protocol !== 'https:') {
         throw new Error(`refusing non-HTTPS agentUri protocol ${url.protocol}`);
     }
+    if (url.username || url.password) {
+        throw new Error('refusing agentUri containing embedded credentials');
+    }
     if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
         throw new Error(`invalid maxBytes: ${maxBytes}`);
     }
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error(`fetching agent card timed out after ${timeoutMs}ms`)), timeoutMs);
-    try {
-        const res = await fetch(url, { redirect: 'error', signal: controller.signal });
-        if (!res.ok) {
-            await res.body?.cancel?.().catch(() => {});
-            throw new Error(`HTTP ${res.status} fetching agent card from ${url.origin}${url.pathname}`);
-        }
-        const cl = res.headers.get('content-length');
-        if (cl !== null && /^\d+$/.test(cl) && Number(cl) > maxBytes) {
-            await res.body?.cancel?.().catch(() => {});
-            throw new Error(`agent card Content-Length (${cl}) exceeds ${maxBytes} byte limit`);
-        }
-        if (!res.body) return Buffer.alloc(0);
-
-        const reader = res.body.getReader();
-        const chunks = [];
-        let total = 0;
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (value) {
-                total += value.byteLength;
-                if (total > maxBytes) {
-                    await reader.cancel().catch(() => {});
-                    throw new Error(`agent card exceeds ${maxBytes} byte limit`);
-                }
-                chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
-            }
-        }
-        return Buffer.concat(chunks, total);
-    } finally {
-        clearTimeout(timer);
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+        throw new Error(`invalid timeoutMs: ${timeoutMs}`);
     }
+
+    const hostname = url.hostname.startsWith('[') && url.hostname.endsWith(']') ? url.hostname.slice(1, -1) : url.hostname;
+    if (!allowPrivate && net.isIP(hostname) && isDisallowedIp(hostname)) {
+        throw new Error(`refusing private or non-public IP address ${hostname} in agentUri`);
+    }
+
+    const safeLookup = (host, options, cb) => {
+        let opts = options;
+        let callback = cb;
+        if (typeof opts === 'function') {
+            callback = opts;
+            opts = {};
+        }
+        lookupFn(host, opts, (err, addrOrList, family) => {
+            if (err) return callback(err);
+            if (Array.isArray(addrOrList)) {
+                if (addrOrList.length === 0) return callback(new Error(`DNS lookup returned no addresses for ${host}`));
+                for (const entry of addrOrList) {
+                    if (!allowPrivate && isDisallowedIp(entry.address)) {
+                        return callback(new Error(`refusing private or non-public IP ${entry.address} for ${host}`));
+                    }
+                }
+                return callback(null, addrOrList);
+            }
+            if (!allowPrivate && isDisallowedIp(addrOrList)) {
+                return callback(new Error(`refusing private or non-public IP ${addrOrList} for ${host}`));
+            }
+            return callback(null, addrOrList, family);
+        });
+    };
+
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        const done = (err, value) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            if (err) reject(err);
+            else resolve(value);
+        };
+
+        const req = requestFn(
+            url,
+            {
+                method: 'GET',
+                agent: false,
+                lookup: safeLookup,
+                headers: { accept: 'application/json' },
+            },
+            (res) => {
+                const status = res.statusCode ?? 0;
+                if (status >= 300 && status < 400) {
+                    res.resume();
+                    done(new Error(`refusing HTTP ${status} redirect fetching agent card`));
+                    return;
+                }
+                if (status < 200 || status >= 300) {
+                    res.resume();
+                    done(new Error(`HTTP ${status} fetching agent card from ${url.origin}${url.pathname}`));
+                    return;
+                }
+                const cl = res.headers?.['content-length'];
+                if (typeof cl === 'string' && /^\d+$/.test(cl) && Number(cl) > maxBytes) {
+                    res.destroy();
+                    done(new Error(`agent card Content-Length (${cl}) exceeds ${maxBytes} byte limit`));
+                    return;
+                }
+
+                const chunks = [];
+                let total = 0;
+                res.on('data', (chunk) => {
+                    const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                    total += b.byteLength;
+                    if (total > maxBytes) {
+                        const err = new Error(`agent card exceeds ${maxBytes} byte limit`);
+                        res.destroy(err);
+                        done(err);
+                        return;
+                    }
+                    chunks.push(b);
+                });
+                res.on('end', () => done(null, Buffer.concat(chunks, total)));
+                res.on('error', (err) => done(err));
+                res.on('aborted', () => done(new Error('agent card response aborted')));
+            },
+        );
+
+        const timer = setTimeout(() => {
+            const err = new Error(`fetching agent card timed out after ${timeoutMs}ms`);
+            req.destroy(err);
+            done(err);
+        }, timeoutMs);
+
+        req.on('error', (err) => done(err));
+        req.end();
+    });
 }
