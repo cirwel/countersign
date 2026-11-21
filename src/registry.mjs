@@ -3,6 +3,7 @@
 // refuses any response that reports another network.
 export const MCP_URL = 'https://agent-registry-mcp.concordium.com/mcp';
 export const NETWORK = 'testnet';
+export const TESTNET_GENESIS = '4221332d34e1694168c2a0c0b3fd0f273809612cb13d000d5c2e00e85f50f796';
 export const REGISTRY = { index: 12802, subindex: 0 }; // CIS-8004 on testnet; the verifier trusts only this instance
 
 let nextId = 1;

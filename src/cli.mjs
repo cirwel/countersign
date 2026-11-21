@@ -3,8 +3,26 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { EXPLORER_TX, loadSigner, readRegisterData, sendRegisterData, sendRegistryUpdate } from './chain.mjs';
+import {
+    EXPLORER_TX,
+    TESTNET_GENESIS,
+    assertTestnet,
+    client,
+    configureNode,
+    createRpcPool,
+    loadSigner,
+    readAgentOf,
+    readMetadataText,
+    readRegisterData,
+    readRegistryHistory,
+    sendRegisterData,
+    sendRegistryUpdate,
+    sendSetMetadata,
+    withRpcRetry,
+} from './chain.mjs';
+import { decodeBadge, encodeBadge, fetchAgentCard, verifyAgentCardBytes } from './cis8004.mjs';
 import { NETWORK, REGISTRY, mcp } from './registry.mjs';
 import { SCHEMA, commitments, decodeAnchor, encodeAnchor, readTrail, writeTrail } from './trail.mjs';
 
@@ -12,91 +30,37 @@ const UUID_KEY = 'unitares.agent_uuid';
 const ANCHOR_KEY = 'countersign.anchor';
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const TX_RE = /^[0-9a-f]{64}$/;
+const utf8Fatal = new TextDecoder('utf-8', { fatal: true });
 const hex = (s) => Buffer.from(s, 'utf8').toString('hex');
 const sha256hex = (b) => crypto.createHash('sha256').update(b).digest('hex');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** CIS-2 token id as the registry serializes it: one length byte, then the id little-endian. */
-function tokenIdBytes(tokenId) {
-    const b = Buffer.alloc(9);
-    b[0] = 8;
-    b.writeBigUInt64LE(BigInt(tokenId), 1);
-    return b;
-}
-const u32le = (n) => {
-    const b = Buffer.alloc(4);
-    b.writeUInt32LE(n);
-    return b;
-};
-/** setMetadata parameter, built locally so the payload returned by the registry server can be checked before signing. */
-function setMetadataParam(tokenId, key, valueUtf8) {
-    const k = Buffer.from(key, 'utf8');
-    const v = Buffer.from(valueUtf8, 'utf8');
-    return Buffer.concat([tokenIdBytes(tokenId), u32le(k.length), k, u32le(v.length), v]).toString('hex');
-}
-
-async function badgeOf(tokenId) {
-    const r = await mcp('token_address', { contract_index: REGISTRY.index, contract_subindex: REGISTRY.subindex, token_id: String(tokenId) });
-    return r.token_address;
-}
-
-async function metadataText(tokenId, key) {
-    const r = await mcp('get_metadata', { token_id: String(tokenId), key });
-    return r?.value_hex ? Buffer.from(r.value_hex, 'hex').toString('utf8') : null;
-}
-
-async function anchorPointer(tokenId) {
-    const text = await metadataText(tokenId, ANCHOR_KEY);
-    if (text !== null && !TX_RE.test(text)) throw new Error(`metadata ${ANCHOR_KEY} is not a transaction hash`);
-    return text;
-}
-
-/**
- * Every value the entry's anchor pointer has ever held, oldest first, read from the registry's MetadataSet events.
- * Event layout: 0xf3 | token id (length byte + little-endian id) | key length u32 LE | key | value length u32 LE | value | timestamp u64.
- * The server returns events oldest first; that order is kept within a block.
- */
-async function anchorPointerHistory(tokenId) {
-    const LIMIT = 1000;
-    const r = await mcp('agent_history', { token_id: String(tokenId), limit: LIMIT });
-    const events = r.events ?? [];
-    if (events.length >= LIMIT) throw new Error('registry history is longer than this verifier reads; refusing to give a partial answer');
-    const idBytes = tokenIdBytes(tokenId);
-    const out = [];
-    for (const e of events) {
-        if (e.event_name !== 'MetadataSet') continue;
-        const raw = e.payload?.raw_hex;
-        if (typeof raw !== 'string' || raw.length % 2 !== 0 || !/^[0-9a-f]*$/.test(raw)) throw new Error('registry event payload is not hex');
-        if (!Number.isInteger(e.block_height)) throw new Error('registry event has no block height');
-        const b = Buffer.from(raw, 'hex');
-        if (b.length < 18 || b[0] !== 0xf3 || !b.subarray(1, 10).equals(idBytes)) throw new Error('unexpected MetadataSet event layout');
-        const klen = b.readUInt32LE(10);
-        if (b.length < 18 + klen) throw new Error('unexpected MetadataSet event layout');
-        const vlen = b.readUInt32LE(14 + klen);
-        // The deployed contract appends an 8-byte timestamp after the value; anything else is not a layout this verifier knows.
-        if (b.length !== 18 + klen + vlen + 8) throw new Error('unexpected MetadataSet event layout');
-        const key = b.subarray(14, 14 + klen).toString('utf8');
-        const value = b.subarray(18 + klen, 18 + klen + vlen).toString('utf8');
-        if (key === ANCHOR_KEY) out.push({ txHash: value, setIn: e.tx_hash, height: e.block_height });
-    }
-    return out.map((p, i) => ({ ...p, i })).sort((x, y) => x.height - y.height || x.i - y.i);
-}
-
-/** Reads every anchor the entry has pointed at. Throws if a pointer was ever set to something that is not an anchor. */
-async function loadAnchors(tokenId) {
-    const anchors = [];
-    for (const p of await anchorPointerHistory(tokenId)) {
-        if (!TX_RE.test(p.txHash)) throw new Error(`the pointer was once set to a value that is not a transaction hash (in ${p.setIn})`);
-        const tx = await readRegisterData(p.txHash);
-        anchors.push({ txHash: p.txHash, ...decodeAnchor(tx.data), sender: tx.sender, blockTime: tx.blockTime });
-    }
-    return anchors;
-}
-
 const chainIsUnbroken = (anchors) => anchors.every((a, i) => a.prevAnchorTx === (i === 0 ? null : anchors[i - 1].txHash));
 const coverageGrows = (anchors) => anchors.every((a, i) => a.toSeq > (i === 0 ? 0 : anchors[i - 1].toSeq));
 
-const commands = {
+async function loadAnchorsFromHistory(history, nodeClient, tipBlockHeight) {
+    const pointers = history.events.filter((e) => e.key === ANCHOR_KEY);
+    const pool = createRpcPool(5);
+    return pool.map(pointers, async (p) => {
+        const txHash = utf8Fatal.decode(p.value);
+        if (!TX_RE.test(txHash)) {
+            throw new Error(`the pointer was once set to a value that is not a transaction hash (in ${p.txHash})`);
+        }
+        const tx = await readRegisterData(txHash, nodeClient);
+        if (tipBlockHeight !== undefined && tx.blockHeight > Number(tipBlockHeight)) {
+            throw new Error(`anchor transaction ${txHash} at block ${tx.blockHeight} is after pinned tip block ${tipBlockHeight}`);
+        }
+        return {
+            txHash,
+            ...decodeAnchor(tx.data),
+            sender: tx.sender,
+            blockTime: tx.blockTime,
+            blockHeight: tx.blockHeight,
+        };
+    });
+}
+
+export const commands = {
     /** Mint a registry entry whose on-chain metadata names the agent's UNITARES UUID. */
     async register({ uuid }) {
         if (!UUID_RE.test(uuid ?? '')) throw new Error('--uuid <agent uuid> is required');
@@ -109,7 +73,7 @@ const commands = {
             const mine = ((await mcp('agents_by_owner', { owner_account: who.address }))?.agents ?? []).map((a) => String(a.token_id));
             const fresh = mine.filter((t) => !before.has(t));
             if (fresh.length === 1) {
-                console.log('token_id:', fresh[0], 'badge:', await badgeOf(fresh[0]));
+                console.log('token_id:', fresh[0], 'badge:', encodeBadge(fresh[0]));
                 return;
             }
             if (fresh.length > 1) throw new Error(`several new entries appeared (${fresh.join(', ')}); find yours by transaction ${hash}`);
@@ -172,11 +136,33 @@ const commands = {
     },
 
     /** Write the trail's current commitment to testnet and point the registry entry at it. */
-    async anchor({ trail, tx }) {
+    async anchor({ trail, tx, node, nodeClient }) {
+        if (node) configureNode(node);
         const who = loadSigner();
         const { header, records } = readTrail(trail);
         const tokenId = header.token_id;
-        const existing = await loadAnchors(tokenId);
+        const c = nodeClient ?? (await client());
+        await assertTestnet(c);
+        const cs = await withRpcRetry(() => c.getConsensusStatus());
+        const tipBlockHash = cs.lastFinalizedBlock;
+        const tipBlockHeight = cs.lastFinalizedBlockHeight;
+
+        const agent = await readAgentOf(tokenId, { blockHash: tipBlockHash, nodeClient: c });
+        if (!agent) throw new Error(`registry token ${tokenId} is not registered`);
+        if (agent.ownerAccount !== who.address) {
+            throw new Error(`signer ${who.address} does not own token ${tokenId} (owner is ${agent.ownerAccount})`);
+        }
+        const current = await readMetadataText(tokenId, ANCHOR_KEY, { blockHash: tipBlockHash, nodeClient: c });
+        if (current !== null && !TX_RE.test(current)) throw new Error(`metadata ${ANCHOR_KEY} is not a transaction hash`);
+
+        const history = await readRegistryHistory(tokenId, {
+            tipBlockHash,
+            tipBlockHeight,
+            agent,
+            hintAnchorTxHashes: current ? [current] : [],
+            nodeClient: c,
+        });
+        const existing = await loadAnchorsFromHistory(history, c, tipBlockHeight);
         const { last, count, at } = commitments(header, records, new Set(existing.map((a) => a.toSeq)));
         // Never extend a chain this trail no longer agrees with: a new anchor over a drifted record would break every earlier one.
         if (!chainIsUnbroken(existing)) throw new Error('the existing anchors do not form one chain; refusing to add to it');
@@ -184,13 +170,13 @@ const commands = {
             if (at.get(a.toSeq)?.toString('hex') !== a.commitment) throw new Error(`this trail does not match the anchor covering records 1..${a.toSeq} (${a.txHash}); refusing to anchor`);
         }
         const prev = existing.at(-1) ?? null;
-        if ((await anchorPointer(tokenId)) !== (prev?.txHash ?? null)) throw new Error('the current pointer is not the last one in the event history yet; retry shortly');
+        if (current !== (prev?.txHash ?? null)) throw new Error('the current pointer is not the last one in the event history yet; retry shortly');
         if (prev && prev.toSeq >= count) throw new Error(`the latest anchor already covers seq ${prev.toSeq}; nothing new to anchor`);
 
         let hash = tx; // --tx <hash>: an anchor that was sent but whose pointer update did not land
         if (hash) {
             if (!TX_RE.test(hash)) throw new Error('--tx must be a transaction hash');
-            const sent = await readRegisterData(hash);
+            const sent = await readRegisterData(hash, c);
             const d = decodeAnchor(sent.data);
             const ok = sent.sender === who.address && d.tokenId === tokenId && d.toSeq === count && d.commitment === last.toString('hex') && d.prevAnchorTx === (prev?.txHash ?? null);
             if (!ok) throw new Error('--tx is not the next anchor for this trail');
@@ -199,14 +185,14 @@ const commands = {
             ({ hash } = await sendRegisterData(data, who));
             console.log(`anchored seq 1..${count}: ${EXPLORER_TX(hash)}`);
         }
-        const built = await mcp('build_set_metadata', { token_id: tokenId, key: ANCHOR_KEY, value_hex: hex(hash), sender: who.address });
-        const set = await sendRegistryUpdate(built, who, { receiveName: 'CIS-8004.setMetadata', parameterHex: setMetadataParam(tokenId, ANCHOR_KEY, hash) });
+        const set = await sendSetMetadata(tokenId, ANCHOR_KEY, hash, who);
         console.log('registry entry now points at the anchor:', EXPLORER_TX(set.hash));
     },
 
-    /** Anyone: check a badge and a trail file against the chain. Needs no keys. */
-    async verify({ badge, trail }) {
+    /** Anyone: check a badge and a trail file directly against a Concordium testnet node. Needs no keys. */
+    async verify({ badge, trail, card, node, nodeClient }) {
         process.exitCode = 1; // only a completed, fully passing run resets this
+        if (node) configureNode(node);
         const checks = [];
         let covered = 0;
         const check = (name, ok, detail = '') => {
@@ -214,6 +200,7 @@ const commands = {
             console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  ' + detail : ''}`);
             return ok;
         };
+
         let header, records;
         try {
             ({ header, records } = readTrail(trail));
@@ -222,30 +209,92 @@ const commands = {
             return finish(checks);
         }
 
-        const parsed = await mcp('parse_token_address', { token_address: badge });
-        const tokenId = String(parsed.token_id);
-        const onTrustedRegistry = Number(parsed.contract_index) === REGISTRY.index && Number(parsed.contract_subindex) === REGISTRY.subindex;
-        if (!check('badge resolves to the trusted testnet registry', onTrustedRegistry, `<${parsed.contract_index},${parsed.contract_subindex}> token ${tokenId}`)) return finish(checks);
+        let parsed;
+        try {
+            parsed = decodeBadge(badge);
+        } catch (e) {
+            check('badge resolves to the trusted testnet registry', false, e.message);
+            return finish(checks);
+        }
+        const tokenId = parsed.tokenId;
+        const onTrustedRegistry = parsed.contract.index === REGISTRY.index && parsed.contract.subindex === REGISTRY.subindex;
+        if (!check('badge resolves to the trusted testnet registry', onTrustedRegistry, `<${parsed.contract.index},${parsed.contract.subindex}> token ${tokenId}`)) return finish(checks);
 
-        const v = await mcp('check_badge', { id: badge });
-        const failed = Object.entries(v.checks ?? {}).filter(([, ok]) => ok === false).map(([k]) => k);
-        check('badge check (registered, active, card matches on-chain hash)', v.badge_valid === true && String(v.token_id) === tokenId, failed.length ? `failed: ${failed.join(', ')}` : `${Object.keys(v.checks ?? {}).length} registry checks`);
+        const c = nodeClient ?? (await client());
+        await assertTestnet(c);
+        const cs = await withRpcRetry(() => c.getConsensusStatus());
+        const tipBlockHash = cs.lastFinalizedBlock;
+        const tipBlockHeight = cs.lastFinalizedBlockHeight;
 
-        const owner = (await mcp('agent_of', { token_id: tokenId }))?.owner_account;
+        const agent = await readAgentOf(tokenId, { blockHash: tipBlockHash, nodeClient: c });
+        if (!agent) {
+            check('badge check (registered, active, card matches on-chain hash)', false, `token ${tokenId} is not registered`);
+            return finish(checks);
+        }
+
+        let badgeOk = false;
+        let badgeDetail = '';
+        try {
+            if (agent.status !== 'Active') throw new Error(`agent status is ${agent.status}`);
+            if (!agent.metadataHashHex) throw new Error('on-chain metadata_hash is not set');
+            let cardBytes;
+            let sourceLabel;
+            if (card) {
+                cardBytes = fs.readFileSync(card);
+                sourceLabel = card;
+            } else {
+                if (!agent.agentUri) throw new Error('on-chain agent_uri is not set');
+                cardBytes = await fetchAgentCard(agent.agentUri);
+                sourceLabel = agent.agentUri;
+            }
+            verifyAgentCardBytes(cardBytes, {
+                badge,
+                ownerAccount: agent.ownerAccount,
+                metadataHashHex: agent.metadataHashHex,
+                registry: REGISTRY,
+                genesisPrefix: TESTNET_GENESIS.slice(0, 32),
+            });
+            badgeOk = true;
+            badgeDetail = `Active, card verified (${sourceLabel})`;
+        } catch (e) {
+            badgeDetail = e.message;
+        }
+        check('badge check (registered, active, card matches on-chain hash)', badgeOk, badgeDetail);
+
+        const owner = agent.ownerAccount;
         const r = header.registry ?? {};
         check('trail header names this registry token', header.token_id === tokenId && r.network === NETWORK && r.index === REGISTRY.index && r.subindex === REGISTRY.subindex);
 
-        const onChainUuid = await metadataText(tokenId, UUID_KEY);
+        const onChainUuid = await readMetadataText(tokenId, UUID_KEY, { blockHash: tipBlockHash, nodeClient: c });
         check('on-chain metadata names the same UNITARES agent as the trail', UUID_RE.test(onChainUuid ?? '') && onChainUuid === header.agent_uuid, onChainUuid ?? 'not set');
 
-        const current = await anchorPointer(tokenId);
+        const current = await readMetadataText(tokenId, ANCHOR_KEY, { blockHash: tipBlockHash, nodeClient: c });
+        if (current !== null && !TX_RE.test(current)) {
+            check('registry entry points at an anchor', false, `metadata ${ANCHOR_KEY} is not a transaction hash`);
+            return finish(checks);
+        }
         if (!check('registry entry points at an anchor', Boolean(current))) return finish(checks);
 
-        // Check every anchor the entry has ever pointed at, not only the current one.
+        // Check every anchor the entry has ever pointed at, reconstructed directly from the node's block events.
         // Otherwise the owner could repoint the entry at a fresh anchor over an edited trail.
+        let history;
+        try {
+            history = await readRegistryHistory(tokenId, {
+                tipBlockHash,
+                tipBlockHeight,
+                agent,
+                hintAnchorTxHashes: [current],
+                nodeClient: c,
+            });
+        } catch (e) {
+            check('on-chain ownership and event history are intact since registration', false, e.message);
+            return finish(checks);
+        }
+        check('on-chain ownership and event history are intact since registration', true, `reg block ${history.regHeight}, ${history.scannedBlocks} owner tx block(s)`);
+
         let anchors;
         try {
-            anchors = await loadAnchors(tokenId);
+            anchors = await loadAnchorsFromHistory(history, c, tipBlockHeight);
         } catch (e) {
             check('every pointer the entry has held is an anchor transaction', false, e.message);
             return finish(checks);
@@ -277,18 +326,30 @@ function finish(checks, covered = 0) {
     const ok = checks.length > 0 && checks.every(Boolean) && covered > 0;
     console.log(ok ? `\nVERIFIED: records 1..${covered} match what was anchored.` : '\nNOT VERIFIED.');
     process.exitCode = ok ? 0 : 1;
+    return ok;
 }
 
-const [name, ...rest] = process.argv.slice(2);
-if (!commands[name]) {
-    console.log(`usage: countersign <${Object.keys(commands).join(' | ')}> [--options]`);
-    process.exit(name ? 2 : 0);
+function isMainEntry() {
+    if (!process.argv[1]) return false;
+    try {
+        return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+    } catch {
+        return false;
+    }
 }
-const { values } = parseArgs({
-    args: rest,
-    options: Object.fromEntries(['uuid', 'token', 'name', 'description', 'url', 'out', 'file', 'trail', 'badge', 'psql', 'tx'].map((k) => [k, { type: 'string' }])),
-});
-commands[name](values).catch((e) => {
-    console.error('error:', e.message);
-    process.exit(1);
-});
+
+if (isMainEntry()) {
+    const [name, ...rest] = process.argv.slice(2);
+    if (!commands[name]) {
+        console.log(`usage: countersign <${Object.keys(commands).join(' | ')}> [--options]`);
+        process.exit(name ? 2 : 0);
+    }
+    const { values } = parseArgs({
+        args: rest,
+        options: Object.fromEntries(['uuid', 'token', 'name', 'description', 'url', 'out', 'file', 'trail', 'badge', 'psql', 'tx', 'node', 'card'].map((k) => [k, { type: 'string' }])),
+    });
+    commands[name](values).catch((e) => {
+        console.error('error:', e.message);
+        process.exit(1);
+    });
+}
