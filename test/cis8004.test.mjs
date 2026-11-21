@@ -1,8 +1,13 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
+import https from 'node:https';
+import os from 'node:os';
+import path from 'node:path';
 import { test } from 'node:test';
+import zlib from 'node:zlib';
 import { AccountAddress, ContractAddress, tokenAddressToBase58 } from '@concordium/web-sdk';
 import {
     decodeAgentOf,
@@ -640,4 +645,91 @@ test('decodeGetAdmin strictly decodes Option<AccountAddress>', () => {
     assert.throws(() => decodeGetAdmin(Buffer.from([0, 0])), /trailing/);
     assert.throws(() => decodeGetAdmin(Buffer.concat([Buffer.from([1]), adminBytes.subarray(0, 16)])), /truncated/);
     assert.throws(() => decodeGetAdmin(Buffer.from([2])), /Option tag/);
+});
+
+test('fetchAgentCard decodes gzip/br/deflate via real node:https and rejects zip bombs and unsupported encodings', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'countersign-https-test-'));
+    const keyPath = path.join(dir, 'key.pem');
+    const certPath = path.join(dir, 'cert.pem');
+    execFileSync('openssl', [
+        'req',
+        '-x509',
+        '-newkey',
+        'rsa:2048',
+        '-nodes',
+        '-keyout',
+        keyPath,
+        '-out',
+        certPath,
+        '-days',
+        '1',
+        '-subj',
+        '/CN=127.0.0.1',
+        '-addext',
+        'subjectAltName=IP:127.0.0.1',
+    ]);
+    const key = fs.readFileSync(keyPath);
+    const cert = fs.readFileSync(certPath);
+
+    const cardBytes = fs.readFileSync(new URL('../agent-card/watcher.json', import.meta.url));
+    const bombBytes = Buffer.alloc(4096, 0x41); // compresses to <100 bytes, expands >1000 bytes
+
+    let sawAcceptEncoding = null;
+    const server = https.createServer({ key, cert }, (req, res) => {
+        sawAcceptEncoding = req.headers['accept-encoding'];
+        if (req.url === '/gzip') {
+            res.writeHead(200, { 'content-type': 'application/json', 'content-encoding': 'gzip' });
+            res.end(zlib.gzipSync(cardBytes));
+        } else if (req.url === '/br') {
+            res.writeHead(200, { 'content-type': 'application/json', 'content-encoding': 'br' });
+            res.end(zlib.brotliCompressSync(cardBytes));
+        } else if (req.url === '/deflate') {
+            res.writeHead(200, { 'content-type': 'application/json', 'content-encoding': 'deflate' });
+            res.end(zlib.deflateSync(cardBytes));
+        } else if (req.url === '/bomb') {
+            const gz = zlib.gzipSync(bombBytes);
+            res.writeHead(200, { 'content-type': 'application/json', 'content-encoding': 'gzip', 'content-length': String(gz.length) });
+            res.end(gz);
+        } else if (req.url === '/zstd') {
+            res.writeHead(200, { 'content-type': 'application/json', 'content-encoding': 'zstd' });
+            res.end('raw');
+        } else {
+            res.writeHead(404);
+            res.end();
+        }
+    });
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address();
+    const base = `https://127.0.0.1:${port}`;
+    try {
+        const gzOut = await fetchAgentCard(`${base}/gzip`, { allowPrivate: true, ca: cert });
+        assert.deepEqual(gzOut, cardBytes);
+        assert.equal(crypto.createHash('sha256').update(gzOut).digest('hex'), WATCHER_CARD_HASH);
+        assert.match(sawAcceptEncoding, /gzip/);
+        assert.match(sawAcceptEncoding, /br/);
+        assert.match(sawAcceptEncoding, /deflate/);
+
+        const brOut = await fetchAgentCard(`${base}/br`, { allowPrivate: true, ca: cert });
+        assert.deepEqual(brOut, cardBytes);
+        assert.equal(crypto.createHash('sha256').update(brOut).digest('hex'), WATCHER_CARD_HASH);
+
+        const defOut = await fetchAgentCard(`${base}/deflate`, { allowPrivate: true, ca: cert });
+        assert.deepEqual(defOut, cardBytes);
+
+        // Zip bomb: compressed < 100B, decompressed 4096B > maxBytes=1000 must fail closed!
+        await assert.rejects(
+            () => fetchAgentCard(`${base}/bomb`, { allowPrivate: true, ca: cert, maxBytes: 1000 }),
+            /exceeds 1000 byte limit/,
+        );
+
+        await assert.rejects(
+            () => fetchAgentCard(`${base}/zstd`, { allowPrivate: true, ca: cert }),
+            /unsupported Content-Encoding: zstd/,
+        );
+    } finally {
+        server.closeAllConnections?.();
+        await new Promise((resolve) => server.close(resolve));
+        fs.rmSync(dir, { recursive: true });
+    }
 });

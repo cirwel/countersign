@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import dns from 'node:dns';
 import https from 'node:https';
 import net from 'node:net';
+import zlib from 'node:zlib';
 import { AccountAddress, ContractAddress, tokenAddressFromBase58, tokenAddressToBase58 } from '@concordium/web-sdk';
 import { REGISTRY, TESTNET_GENESIS } from './registry.mjs';
 
@@ -584,7 +585,7 @@ export function isDisallowedIp(rawIp) {
  */
 export async function fetchAgentCard(
     uri,
-    { timeoutMs = 15000, maxBytes = 1048576, allowPrivate = false, lookupFn = dns.lookup, requestFn = https.request } = {},
+    { timeoutMs = 15000, maxBytes = 1048576, allowPrivate = false, lookupFn = dns.lookup, requestFn = https.request, ca } = {},
 ) {
     let url;
     try {
@@ -638,6 +639,7 @@ export async function fetchAgentCard(
     return new Promise((resolve, reject) => {
         let settled = false;
         let activeRes = null;
+        let activeDecompressor = null;
         const done = (err, value) => {
             if (settled) return;
             settled = true;
@@ -652,12 +654,14 @@ export async function fetchAgentCard(
                 method: 'GET',
                 agent: false,
                 lookup: safeLookup,
-                headers: { accept: 'application/json' },
+                ...(ca !== undefined ? { ca } : {}),
+                headers: { accept: 'application/json', 'accept-encoding': 'gzip, br, deflate, identity' },
             },
             (res) => {
                 activeRes = res;
                 const fail = (err) => {
                     done(err);
+                    activeDecompressor?.destroy();
                     res.destroy();
                     req.destroy();
                 };
@@ -676,29 +680,72 @@ export async function fetchAgentCard(
                     return;
                 }
 
-                const chunks = [];
-                let total = 0;
+                const encHeader = String(res.headers?.['content-encoding'] ?? '').trim().toLowerCase();
+                let decompressor = null;
+                if (encHeader === '' || encHeader === 'identity') {
+                    decompressor = null;
+                } else if (encHeader === 'gzip' || encHeader === 'x-gzip') {
+                    decompressor = zlib.createGunzip();
+                } else if (encHeader === 'deflate') {
+                    decompressor = zlib.createInflate();
+                } else if (encHeader === 'br') {
+                    decompressor = zlib.createBrotliDecompress();
+                } else {
+                    fail(new Error(`unsupported Content-Encoding: ${encHeader}`));
+                    return;
+                }
+                activeDecompressor = decompressor;
+
+                if (!decompressor) {
+                    const chunks = [];
+                    let total = 0;
+                    res.on('data', (chunk) => {
+                        const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                        total += b.byteLength;
+                        if (total > maxBytes) {
+                            fail(new Error(`agent card exceeds ${maxBytes} byte limit`));
+                            return;
+                        }
+                        chunks.push(b);
+                    });
+                    res.on('end', () => done(null, Buffer.concat(chunks, total)));
+                    res.on('error', (err) => fail(err));
+                    res.on('aborted', () => fail(new Error('agent card response aborted')));
+                    return;
+                }
+
+                let wireTotal = 0;
                 res.on('data', (chunk) => {
                     const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-                    total += b.byteLength;
-                    if (total > maxBytes) {
-                        const err = new Error(`agent card exceeds ${maxBytes} byte limit`);
-                        done(err);
-                        res.destroy(err);
-                        req.destroy();
+                    wireTotal += b.byteLength;
+                    if (wireTotal > maxBytes) {
+                        fail(new Error(`agent card exceeds ${maxBytes} byte limit`));
+                    }
+                });
+                res.on('error', (err) => fail(err));
+                res.on('aborted', () => fail(new Error('agent card response aborted')));
+
+                const chunks = [];
+                let decodedTotal = 0;
+                decompressor.on('data', (chunk) => {
+                    const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                    decodedTotal += b.byteLength;
+                    if (decodedTotal > maxBytes) {
+                        fail(new Error(`agent card exceeds ${maxBytes} byte limit`));
                         return;
                     }
                     chunks.push(b);
                 });
-                res.on('end', () => done(null, Buffer.concat(chunks, total)));
-                res.on('error', (err) => done(err));
-                res.on('aborted', () => done(new Error('agent card response aborted')));
+                decompressor.on('end', () => done(null, Buffer.concat(chunks, decodedTotal)));
+                decompressor.on('error', (err) => fail(new Error(`invalid compressed agent card: ${err.message}`)));
+                res.pipe(decompressor);
             },
         );
 
         const timer = setTimeout(() => {
             const err = new Error(`fetching agent card timed out after ${timeoutMs}ms`);
             done(err);
+            activeDecompressor?.destroy();
             activeRes?.destroy();
             req.destroy(err);
         }, timeoutMs);

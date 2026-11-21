@@ -343,13 +343,26 @@ export function loadSigner() {
 
 async function waitForFinalizedPolling(c, hash, { timeoutMs = 180000, pollIntervalMs = 2000 } = {}) {
     const deadline = Date.now() + timeoutMs;
+    const timeoutErr = () => new Error(`transaction ${hash} did not finalize within ${timeoutMs}ms`);
     while (true) {
         const remaining = deadline - Date.now();
+        if (remaining <= 0) throw timeoutErr();
         const retryOpts =
             remaining <= 1500
                 ? { maxRetries: 0, baseDelayMs: 0, deadlineMs: deadline }
                 : { maxRetries: 2, baseDelayMs: Math.min(500, Math.max(1, Math.floor(remaining / 4))), deadlineMs: deadline };
-        const status = await withRpcRetry(() => c.getBlockItemStatus(hash), retryOpts);
+        let timer;
+        let status;
+        try {
+            status = await Promise.race([
+                withRpcRetry(() => c.getBlockItemStatus(hash), retryOpts),
+                new Promise((_, reject) => {
+                    timer = setTimeout(() => reject(timeoutErr()), remaining);
+                }),
+            ]);
+        } finally {
+            clearTimeout(timer);
+        }
         if (status.status === 'finalized') {
             const summary = status.outcome?.summary;
             if (!summary) throw new Error(`transaction ${hash} finalized without outcome summary`);
@@ -359,9 +372,7 @@ async function waitForFinalizedPolling(c, hash, { timeoutMs = 180000, pollInterv
             return { hash: hash.toString(), summary };
         }
         const afterPollRemaining = deadline - Date.now();
-        if (afterPollRemaining <= 0) {
-            throw new Error(`transaction ${hash} did not finalize within ${timeoutMs}ms`);
-        }
+        if (afterPollRemaining <= 0) throw timeoutErr();
         await sleep(Math.min(pollIntervalMs, Math.max(1, afterPollRemaining)));
     }
 }
@@ -596,7 +607,7 @@ export async function readRegistryHistory(
         return p;
     };
 
-    const collectStreamWithTimeout = async (streamFn) => {
+    const collectStreamWithTimeout = async (streamFn, isEarlyStop = null) => {
         const ac = new AbortController();
         let timedOut = false;
         const timeoutErr = Object.assign(
@@ -607,9 +618,11 @@ export async function readRegistryHistory(
             timedOut = true;
             ac.abort(timeoutErr);
         }, streamTimeoutMs);
+        const abortEarly = (reason) => ac.abort(reason);
         try {
-            return await streamFn(ac.signal);
+            return await streamFn(ac.signal, abortEarly);
         } catch (err) {
+            if (isEarlyStop && isEarlyStop()) return true;
             if (timedOut) throw timeoutErr;
             throw err;
         } finally {
@@ -805,15 +818,23 @@ export async function readRegistryHistory(
         if (!/^[0-9a-f]{16}$/.test(opSubmap)) {
             throw new Error(`unexpected operator submap prefix for ${owner} at block ${regHeight}`);
         }
+        let matched = false;
         const hasInitialOperator = await rpc.run(() =>
-            collectStreamWithTimeout(async (signal) => {
-                for await (const entry of c.getInstanceState(registryAddr, regBlockHash, signal)) {
-                    if (signal.aborted) throw signal.reason;
-                    const k = typeof entry.key === 'string' ? entry.key.toLowerCase() : Buffer.from(entry.key).toString('hex');
-                    if (k.startsWith(opSubmap)) return true;
-                }
-                return false;
-            }),
+            collectStreamWithTimeout(
+                async (signal, abortEarly) => {
+                    for await (const entry of c.getInstanceState(registryAddr, regBlockHash, signal)) {
+                        if (signal.aborted) throw signal.reason;
+                        const k = typeof entry.key === 'string' ? entry.key.toLowerCase() : Buffer.from(entry.key).toString('hex');
+                        if (k.startsWith(opSubmap)) {
+                            matched = true;
+                            abortEarly();
+                            return true;
+                        }
+                    }
+                    return false;
+                },
+                () => matched,
+            ),
         );
         if (hasInitialOperator) {
             throw new Error(`owner ${owner} had pre-existing CIS-2 operator(s) at registration block ${regHeight}`);

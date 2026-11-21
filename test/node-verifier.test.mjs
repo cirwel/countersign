@@ -1422,3 +1422,80 @@ test('readRegisterData returns blockHeight alongside sender, data, and blockTime
         fs.rmSync(s.dir, { recursive: true });
     }
 });
+
+test('enforces wall-clock timeout even when in-flight getBlockItemStatus resolves after deadline', async () => {
+    const s = buildScenario({ anchorHeights: [], anchorToSeqs: [] });
+    const slowNode = createMockNode({ tipHeight: 60000n, agent: s.agent });
+    const origGetStatus = slowNode.getBlockItemStatus.bind(slowNode);
+    slowNode.getBlockItemStatus = async (txHash) => {
+        await new Promise((r) => setTimeout(r, 120));
+        return origGetStatus(txHash);
+    };
+    const origLog = console.log;
+    console.log = () => {};
+    const t0 = Date.now();
+    try {
+        const who = {
+            address: OWNER_A,
+            sender: AccountAddress.fromBase58(OWNER_A),
+            signer: (await import('@concordium/web-sdk')).buildBasicAccountSigner(crypto.randomBytes(32).toString('hex')),
+        };
+        await assert.rejects(
+            () => sendSetMetadata(TOKEN_ID, 'k', 'v', who, slowNode, { pollIntervalMs: 10, timeoutMs: 40 }),
+            /did not finalize within 40ms/,
+        );
+        const elapsed = Date.now() - t0;
+        assert.ok(elapsed < 100, `expected timeout around 40ms before 120ms RPC resolved, took ${elapsed}ms`);
+    } finally {
+        console.log = origLog;
+        fs.rmSync(s.dir, { recursive: true });
+    }
+});
+
+test('cancels getInstanceState stream immediately on first matching operator key without retrying', async () => {
+    const s = buildScenario({
+        agentOwner: LIVE_OWNER_WITH_OP,
+        mintOwner: LIVE_OWNER_WITH_OP,
+        anchorHeights: [1050n],
+        anchorToSeqs: [2],
+        stateLookupMap: new Map([[LIVE_OWNER_WITH_OP_STATE_KEY, LIVE_OWNER_WITH_OP_SUBMAP_HEX]]),
+    });
+    let getInstanceStateCalls = 0;
+    let yieldedCount = 0;
+    let signalAbortedOnExit = false;
+    const entries = [
+        { key: LIVE_OWNER_WITH_OP_SUBMAP_ENTRY, value: '' },
+        { key: '0700000000000000deadbeef', value: '' },
+        { key: '0700000000000000cafebabe', value: '' },
+        { key: '080000000000000000000001', value: '' },
+    ];
+    s.node.getInstanceState = async function* (_addr, _bh, signal) {
+        getInstanceStateCalls += 1;
+        try {
+            for (const e of entries) {
+                yieldedCount += 1;
+                yield e;
+            }
+        } finally {
+            signalAbortedOnExit = Boolean(signal?.aborted);
+        }
+    };
+    try {
+        await assert.rejects(
+            () =>
+                readRegistryHistory(TOKEN_ID, {
+                    tipBlockHash: blockHashFor(60000n),
+                    tipBlockHeight: 60000n,
+                    agent: s.agent,
+                    hintAnchorTxHashes: [s.lastAnchor],
+                    nodeClient: s.node,
+                }),
+            /pre-existing CIS-2 operator/,
+        );
+        assert.equal(getInstanceStateCalls, 1, 'must not retry after intentional early match');
+        assert.equal(yieldedCount, 1, 'must stop iterating immediately on first matching key');
+        assert.equal(signalAbortedOnExit, true, 'abortSignal must be aborted immediately on first match');
+    } finally {
+        fs.rmSync(s.dir, { recursive: true });
+    }
+});
