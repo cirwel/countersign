@@ -71,7 +71,7 @@ function sendJson(res, statusCode, body, extraHeaders = {}) {
     res.end(payload);
 }
 
-async function readJsonBody(req, res, maxBodyBytes) {
+async function readJsonBody(req, res, maxBodyBytes, activeUploads = null) {
     const rawCt = String(req.headers['content-type'] ?? '');
     const mime = rawCt.split(';')[0].trim().toLowerCase();
     if (mime !== 'application/json') {
@@ -89,11 +89,22 @@ async function readJsonBody(req, res, maxBodyBytes) {
         const chunks = [];
         let total = 0;
         let finished = false;
+        let abortUpload = null;
         const finish = (val) => {
             if (finished) return;
             finished = true;
+            if (abortUpload) activeUploads?.delete(abortUpload);
             resolve(val);
         };
+        abortUpload = () => {
+            if (finished) return;
+            if (!res.headersSent && !res.destroyed && !res.writableEnded) {
+                sendJson(res, 503, { error: 'witness server is shutting down' }, { connection: 'close' });
+            }
+            req.destroy();
+            finish(null);
+        };
+        activeUploads?.add(abortUpload);
         req.on('data', (chunk) => {
             if (finished) return;
             const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -131,6 +142,9 @@ async function readJsonBody(req, res, maxBodyBytes) {
             finish(null);
         });
         req.on('aborted', () => finish(null));
+        req.on('close', () => {
+            if (!req.complete) finish(null);
+        });
     });
 }
 
@@ -431,6 +445,7 @@ export async function createWitnessServer(opts = {}) {
     };
 
     let server;
+    const activeUploads = new Set();
     const getConfiguredOrigin = () => {
         if (configuredPublicOrigin) return configuredPublicOrigin;
         const addr = server?.listening ? server.address() : null;
@@ -440,7 +455,7 @@ export async function createWitnessServer(opts = {}) {
     };
 
     const handleAnchor = async (req, res, reqUrl, isDisconnected) => {
-        const rawBody = await readJsonBody(req, res, maxBodyBytes);
+        const rawBody = await readJsonBody(req, res, maxBodyBytes, activeUploads);
         if (!rawBody || isDisconnected()) return;
         const { tokenId, toSeq, commitment, prevAnchorTx } = validateAnchorRequestBody(rawBody);
         const binding = { tokenId, toSeq, commitment, prevAnchorTx };
@@ -502,7 +517,7 @@ export async function createWitnessServer(opts = {}) {
                 return { [HEADER_PAYMENT_RESPONSE]: encodeX402Header(body) };
             };
 
-            const reconcileExistingEntry = async (paymentId) => {
+            const reconcileExistingEntry = async (paymentId, { aliasFrom = null } = {}) => {
                 let entry = ledger.get(paymentId);
                 if (!entry) return null;
                 if (
@@ -512,6 +527,9 @@ export async function createWitnessServer(opts = {}) {
                     (entry.binding?.prevAnchorTx ?? null) !== (prevAnchorTx ?? null)
                 ) {
                     throw new HttpError(409, `payment ${paymentId} was already claimed for a different anchor binding`);
+                }
+                if (aliasFrom && aliasFrom !== paymentId && entry.status !== 'claimed') {
+                    ledger.recordAlias(aliasFrom, paymentId);
                 }
                 if (entry.status === 'committed') {
                     const cached = entry.result;
@@ -591,7 +609,7 @@ export async function createWitnessServer(opts = {}) {
             let paymentId = null;
             if (typeof verifier.derivePaymentId === 'function') {
                 try {
-                    paymentId = verifier.derivePaymentId(rawPaymentSig);
+                    paymentId = ledger.resolvePaymentId(verifier.derivePaymentId(rawPaymentSig));
                 } catch (err) {
                     ledger.assertNoEquivocation(binding, null);
                     sendJson(
@@ -629,7 +647,7 @@ export async function createWitnessServer(opts = {}) {
                     );
                     return;
                 }
-                paymentId = paymentResult.paymentId;
+                paymentId = ledger.resolvePaymentId(paymentResult.paymentId);
 
                 reconciled = await reconcileExistingEntry(paymentId);
                 if (reconciled?.handled) return;
@@ -641,6 +659,7 @@ export async function createWitnessServer(opts = {}) {
 
             let broadcastStarted = false;
             let claimedPaymentId = null;
+            let pendingAliasFrom = null;
             try {
                 if (!alreadySettled) {
                     const preSettledAlias = paymentResult?.transaction
@@ -650,12 +669,15 @@ export async function createWitnessServer(opts = {}) {
                           })
                         : null;
                     if (preSettledAlias && preSettledAlias.paymentId !== paymentId) {
+                        const aliasFrom = paymentId;
                         paymentId = preSettledAlias.paymentId;
-                        reconciled = await reconcileExistingEntry(paymentId);
+                        reconciled = await reconcileExistingEntry(paymentId, { aliasFrom });
                         if (reconciled?.handled) return;
                         if (reconciled?.alreadySettled) {
                             alreadySettled = true;
                             paymentResult = { paymentId, ...(reconciled.settledInfo ?? {}) };
+                        } else {
+                            pendingAliasFrom = aliasFrom;
                         }
                     }
                 }
@@ -682,10 +704,11 @@ export async function createWitnessServer(opts = {}) {
                             ? ledger.findBySettlementTx({ network: settledNet, transaction: settledTx })
                             : null;
                         if (settledAlias && settledAlias.paymentId !== paymentId) {
-                            ledger.releasePreBroadcast(paymentId);
+                            const aliasFrom = paymentId;
+                            ledger.releasePreBroadcast(aliasFrom);
                             claimedPaymentId = null;
                             paymentId = settledAlias.paymentId;
-                            reconciled = await reconcileExistingEntry(paymentId);
+                            reconciled = await reconcileExistingEntry(paymentId, { aliasFrom });
                             if (reconciled?.handled) return;
                             if (reconciled?.alreadySettled) {
                                 alreadySettled = true;
@@ -693,6 +716,7 @@ export async function createWitnessServer(opts = {}) {
                             } else {
                                 ledger.claim(paymentId, binding);
                                 claimedPaymentId = paymentId;
+                                pendingAliasFrom = aliasFrom;
                             }
                         }
                         if (!alreadySettled) {
@@ -711,6 +735,10 @@ export async function createWitnessServer(opts = {}) {
                             network: paymentResult?.network ?? CONCORDIUM_TESTNET_CAIP2,
                         });
                         claimedPaymentId = null;
+                        if (pendingAliasFrom && pendingAliasFrom !== paymentId) {
+                            ledger.recordAlias(pendingAliasFrom, paymentId);
+                            pendingAliasFrom = null;
+                        }
                     }
                 }
                 ledger.assertNoEquivocation(binding, paymentId);
@@ -719,27 +747,37 @@ export async function createWitnessServer(opts = {}) {
                     if (isDisconnected()) {
                         throw new HttpError(499, 'client disconnected before witness broadcast');
                     }
+                    const verifyBroadcastStateAtTip = async (tipHash) => {
+                        const [bcastAgent, bcastWitness, latestAnchor] = await Promise.all([
+                            readAgentOf(tokenId, { blockHash: tipHash, nodeClient: c }),
+                            readMetadataText(tokenId, WITNESS_KEY, { blockHash: tipHash, nodeClient: c }),
+                            readMetadataText(tokenId, ANCHOR_KEY, { blockHash: tipHash, nodeClient: c }),
+                        ]);
+                        if (
+                            !bcastAgent ||
+                            bcastAgent.status !== 'Active' ||
+                            !isSameAccount(bcastAgent.ownerAccount, agent.ownerAccount) ||
+                            isSameAccount(signer.address, bcastAgent.ownerAccount)
+                        ) {
+                            throw new HttpError(409, `token ${tokenId} state or ownership changed before witness broadcast`);
+                        }
+                        if (bcastWitness === null || !isSameAccount(bcastWitness, signer.address)) {
+                            throw new HttpError(
+                                409,
+                                `witness authorization changed (${bcastWitness ?? 'cleared'}) before broadcast`,
+                            );
+                        }
+                        if (latestAnchor !== (prev?.txHash ?? null)) {
+                            throw new HttpError(409, 'countersign.anchor moved concurrently; refusing to anchor');
+                        }
+                    };
                     const bcastCs = await withRpcRetry(() => c.getConsensusStatus());
                     const bcastTip = bcastCs.lastFinalizedBlock;
-                    const bcastAgent = await readAgentOf(tokenId, { blockHash: bcastTip, nodeClient: c });
-                    if (
-                        !bcastAgent ||
-                        bcastAgent.status !== 'Active' ||
-                        !isSameAccount(bcastAgent.ownerAccount, agent.ownerAccount) ||
-                        isSameAccount(signer.address, bcastAgent.ownerAccount)
-                    ) {
-                        throw new HttpError(409, `token ${tokenId} state or ownership changed before witness broadcast`);
-                    }
-                    const bcastWitness = await readMetadataText(tokenId, WITNESS_KEY, { blockHash: bcastTip, nodeClient: c });
-                    if (bcastWitness === null || !isSameAccount(bcastWitness, signer.address)) {
-                        throw new HttpError(
-                            409,
-                            `witness authorization changed (${bcastWitness ?? 'cleared'}) before broadcast`,
-                        );
-                    }
-                    const latestAnchor = await readMetadataText(tokenId, ANCHOR_KEY, { blockHash: bcastTip, nodeClient: c });
-                    if (latestAnchor !== (prev?.txHash ?? null)) {
-                        throw new HttpError(409, 'countersign.anchor moved concurrently; refusing to anchor');
+                    await verifyBroadcastStateAtTip(bcastTip);
+                    const freshCs = await withRpcRetry(() => c.getConsensusStatus());
+                    const freshTip = freshCs.lastFinalizedBlock;
+                    if (String(freshTip) !== String(bcastTip)) {
+                        await verifyBroadcastStateAtTip(freshTip);
                     }
                     const nextNonceRes = await withRpcRetry(() => c.getNextAccountNonce(signer.sender));
                     if (!nextNonceRes?.allFinal) {
@@ -794,7 +832,7 @@ export async function createWitnessServer(opts = {}) {
             sendJson(res, 403, { error: 'sponsorPointer is disabled on this witness' });
             return;
         }
-        const rawBody = await readJsonBody(req, res, maxBodyBytes);
+        const rawBody = await readJsonBody(req, res, maxBodyBytes, activeUploads);
         if (!rawBody || isDisconnected()) return;
         const { tokenId, anchorTxHash, transactionJson } = validateSponsorRequestBody(rawBody);
         const requestHash = crypto.createHash('sha256').update(transactionJson, 'utf8').digest('hex');
@@ -1000,6 +1038,9 @@ export async function createWitnessServer(opts = {}) {
                 : Promise.resolve();
             if (wasListening) {
                 server.closeIdleConnections?.();
+            }
+            for (const abortUpload of [...activeUploads]) {
+                abortUpload();
             }
             while (inFlightRequests.size > 0) {
                 await Promise.allSettled([...inFlightRequests]);

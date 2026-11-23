@@ -218,6 +218,7 @@ export class PaymentLedger {
     constructor(filePath = null) {
         this.filePath = filePath;
         this.payments = new Map();
+        this.paymentAliases = new Map();
         this.sponsorPointers = new Map();
         if (this.filePath) {
             this.load();
@@ -226,6 +227,7 @@ export class PaymentLedger {
 
     load() {
         this.payments.clear();
+        this.paymentAliases.clear();
         this.sponsorPointers.clear();
         if (!this.filePath || !fs.existsSync(this.filePath)) return;
         let parsed;
@@ -246,6 +248,17 @@ export class PaymentLedger {
                 this.payments.set(k, v);
             }
         }
+        if (parsed.paymentAliases !== undefined) {
+            if (!isPlainObject(parsed.paymentAliases)) {
+                throw new Error(`invalid payment ledger ${this.filePath}: paymentAliases must be an object`);
+            }
+            for (const [k, v] of Object.entries(parsed.paymentAliases)) {
+                if (typeof v !== 'string' || v.length === 0) {
+                    throw new Error(`corrupt paymentAliases entry ${k} in ${this.filePath}`);
+                }
+                this.paymentAliases.set(k, v);
+            }
+        }
         if (parsed.sponsorPointers !== undefined) {
             if (!isPlainObject(parsed.sponsorPointers)) {
                 throw new Error(`invalid payment ledger ${this.filePath}: sponsorPointers must be an object`);
@@ -261,20 +274,62 @@ export class PaymentLedger {
         if (!this.filePath) return;
         const payments = Object.create(null);
         for (const [k, v] of this.payments.entries()) payments[k] = v;
+        const paymentAliases = Object.create(null);
+        for (const [k, v] of this.paymentAliases.entries()) paymentAliases[k] = v;
         const sponsorPointers = Object.create(null);
         for (const [k, v] of this.sponsorPointers.entries()) sponsorPointers[k] = v;
         const payload = {
             version: 1,
             payments,
+            paymentAliases,
             sponsorPointers,
             updatedAt: new Date().toISOString(),
         };
         writeFileAtomic(this.filePath, JSON.stringify(payload, null, 2) + '\n', { mode: 0o600 });
     }
 
+    resolvePaymentId(paymentId) {
+        if (typeof paymentId !== 'string' || paymentId.length === 0) return paymentId;
+        const seen = new Set();
+        let cur = paymentId;
+        while (this.paymentAliases.has(cur)) {
+            if (seen.has(cur)) {
+                throw new Error(`cyclic payment alias involving ${cur}`);
+            }
+            seen.add(cur);
+            cur = this.paymentAliases.get(cur);
+        }
+        return cur;
+    }
+
+    recordAlias(aliasPaymentId, canonicalPaymentId) {
+        if (typeof aliasPaymentId !== 'string' || aliasPaymentId.trim().length === 0) {
+            throw new Error('aliasPaymentId must be a non-empty string');
+        }
+        if (typeof canonicalPaymentId !== 'string' || canonicalPaymentId.trim().length === 0) {
+            throw new Error('canonicalPaymentId must be a non-empty string');
+        }
+        const resolvedAlias = this.resolvePaymentId(aliasPaymentId);
+        const target = this.resolvePaymentId(canonicalPaymentId);
+        if (aliasPaymentId === target || resolvedAlias === target) return;
+        if (!this.payments.has(target)) {
+            throw new Error(`unknown canonical paymentId ${target} in recordAlias`);
+        }
+        const existingTarget = this.paymentAliases.get(aliasPaymentId);
+        if (existingTarget !== undefined) {
+            if (this.resolvePaymentId(existingTarget) === target) return;
+            throw conflictError(`payment ${aliasPaymentId} is already aliased to ${existingTarget}`);
+        }
+        if (this.payments.has(aliasPaymentId)) {
+            throw conflictError(`cannot alias existing payment entry ${aliasPaymentId} to ${target}`);
+        }
+        this.paymentAliases.set(aliasPaymentId, target);
+        this._persist();
+    }
+
     get(paymentId) {
         if (typeof paymentId !== 'string' || paymentId.length === 0) return null;
-        return this.payments.get(paymentId) ?? null;
+        return this.payments.get(this.resolvePaymentId(paymentId)) ?? null;
     }
 
     findBySettlementTx({ network = CONCORDIUM_TESTNET_CAIP2, transaction } = {}) {

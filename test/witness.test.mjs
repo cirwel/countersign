@@ -3014,11 +3014,15 @@ test('unsigned 402 equivocation 409, facilitator settlement-tx & legacy dedup, w
     node.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: WITNESS_1 });
 
     let currentSettleTx = 'fac-settled-tx-1';
+    let facVerifyCalls = 0;
+    let facSettleCalls = 0;
     const facSrv = https.createServer({ key: TEST_KEY_PEM, cert: TEST_CERT_PEM }, (req, res) => {
         if (req.url === '/verify') {
+            facVerifyCalls += 1;
             res.writeHead(200, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ isValid: true, payer: PAYER_3 }));
         } else if (req.url === '/settle') {
+            facSettleCalls += 1;
             res.writeHead(200, { 'content-type': 'application/json' });
             res.end(
                 JSON.stringify({
@@ -3041,11 +3045,12 @@ test('unsigned 402 equivocation 409, facilitator settlement-tx & legacy dedup, w
         allowPrivate: true,
         ca: Buffer.from(TEST_CERT_PEM),
     });
+    const facLedgerPath = path.join(dir, 'fac-dedup-ledger.json');
     const srv = await startWitnessServer({
         host: '127.0.0.1',
         port: 0,
         signer: witnessSigner,
-        ledgerPath: path.join(dir, 'fac-dedup-ledger.json'),
+        ledgerPath: facLedgerPath,
         nodeClient: node,
         verifier: facVerifier,
         fetchCard: async () => node.card.bytes,
@@ -3090,18 +3095,47 @@ test('unsigned 402 equivocation 409, facilitator settlement-tx & legacy dedup, w
     assert.equal(unsignedEq.status, 409);
     const unsignedEqBody = await unsignedEq.json();
     assert.match(unsignedEqBody.error, /equivocating anchor request/i);
+    await srv.close();
+
+    // Restart witness server on the same ledger and retry sigA2 -> recovers cached 200 via persisted alias with 0 facilitator calls
+    const srvRestarted = await startWitnessServer({
+        host: '127.0.0.1',
+        port: 0,
+        signer: witnessSigner,
+        ledgerPath: facLedgerPath,
+        nodeClient: node,
+        verifier: facVerifier,
+        fetchCard: async () => node.card.bytes,
+        log: () => {},
+    });
+    cleanups.push(() => srvRestarted.close());
+    facVerifyCalls = 0;
+    facSettleCalls = 0;
+    const r2Retry = await fetch(`${srvRestarted.url}/v1/anchor`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [HEADER_PAYMENT_SIGNATURE]: sigA2 },
+        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 1, commitment: commitA, prevAnchorTx: null }),
+    });
+    assert.equal(r2Retry.status, 200);
+    const b2Retry = await r2Retry.json();
+    assert.equal(b2Retry.txHash, b1.txHash);
+    assert.equal(decodeX402Header(r2Retry.headers.get(HEADER_PAYMENT_RESPONSE)).cached, true);
+    assert.equal(facVerifyCalls, 0, 'persisted payment alias must recover locally without /verify');
+    assert.equal(facSettleCalls, 0, 'persisted payment alias must recover locally without /settle');
 
     // Move ANCHOR_KEY forward and send a different binding whose /settle returns the same settled transaction -> 409,
-    // without releasing or overwriting the original committed entry
+    // without releasing the original committed entry or persisting a conflicting alias
     node.addSetMetadata({ sender: OWNER_A, key: ANCHOR_KEY, value: b1.txHash });
-    const rConflict = await fetch(`${srv.url}/v1/anchor`, {
+    const rConflict = await fetch(`${srvRestarted.url}/v1/anchor`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', [HEADER_PAYMENT_SIGNATURE]: sigConflict },
         body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 2, commitment: commitB, prevAnchorTx: b1.txHash }),
     });
     assert.equal(rConflict.status, 409);
     assert.equal(node.submitted.filter((t) => t.payload.type === AccountTransactionType.RegisterData).length, 1);
-    await srv.close();
+    const persistedFacLedger = JSON.parse(fs.readFileSync(facLedgerPath, 'utf8'));
+    assert.equal(Object.keys(persistedFacLedger.paymentAliases).length, 1, 'only matching alias sigA2->sigA1 should be persisted');
+    await srvRestarted.close();
 
     // 2. Legacy facilitator:<network>:<transaction> ledger key dedup on retry after upgrade
     const legacyNode = createWitnessMockNode({
@@ -3351,4 +3385,128 @@ test('unsigned 402 equivocation 409, facilitator settlement-tx & legacy dedup, w
         errLogs.some((line) => /witness request failed after payment .* finalized; retry with --payment-signature [A-Za-z0-9+/=_-]+/.test(line)),
         `expected recovery hint in stderr, got: ${errLogs.join('\n')}`,
     );
+
+    // 5. close() aborts incomplete body uploads instead of hanging forever while keeping the ledger locked
+    const uploadLedgerPath = path.join(dir, 'upload-abort-ledger.json');
+    const uploadSrv = await startWitnessServer({
+        host: '127.0.0.1',
+        port: 0,
+        priceMicroCcd: '0',
+        signer: witnessSigner,
+        ledgerPath: uploadLedgerPath,
+        nodeClient: node,
+        fetchCard: async () => node.card.bytes,
+        log: () => {},
+    });
+    cleanups.push(() => uploadSrv.close());
+
+    let markUploadSeen;
+    const uploadSeen = new Promise((r) => {
+        markUploadSeen = r;
+    });
+    uploadSrv.server.once('request', markUploadSeen);
+    const partialReq = http.request(`${uploadSrv.url}/v1/anchor`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'content-length': '120' },
+    });
+    partialReq.on('error', () => {});
+    partialReq.write('{"tokenId":');
+    await uploadSeen;
+    await new Promise((r) => setTimeout(r, 15));
+
+    let hangTimer;
+    try {
+        await Promise.race([
+            uploadSrv.close(),
+            new Promise((_, reject) => {
+                hangTimer = setTimeout(() => reject(new Error('close() hung on incomplete upload')), 1000);
+            }),
+        ]);
+    } finally {
+        clearTimeout(hangTimer);
+        partialReq.destroy();
+    }
+
+    const uploadSrvReopen = await startWitnessServer({
+        host: '127.0.0.1',
+        port: 0,
+        priceMicroCcd: '0',
+        signer: witnessSigner,
+        ledgerPath: uploadLedgerPath,
+        nodeClient: node,
+        fetchCard: async () => node.card.bytes,
+        log: () => {},
+    });
+    cleanups.push(() => uploadSrvReopen.close());
+    await uploadSrvReopen.close();
+
+    // 6. Tip advancement during withSignerLock auth checks triggers fresh-tip recheck -> 409 with 0 broadcasts
+    let armedTipRace = false;
+    let tipRaced = false;
+    const baseTipNode = createWitnessMockNode({
+        owner: OWNER_A,
+        accountVerifyKeys: new Map([
+            [OWNER_A, ownerSigner.verifyKey],
+            [WITNESS_1, witnessSigner.verifyKey],
+        ]),
+    });
+    baseTipNode.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: WITNESS_1 });
+    const baseTipHeightStr = `block-${baseTipNode.state.tipHeight}`;
+    const racedAnchorHash = txHashFor('raced-anchor-after-bcast-tip');
+    const tipRaceNode = Object.assign(Object.create(baseTipNode), {
+        async invokeContract(ctx, bh) {
+            const method = ctx.method.value ?? String(ctx.method);
+            if (method === 'CIS-8004.getMetadata') {
+                const p = Buffer.from(ctx.parameter.buffer);
+                const klen = p.readUInt32LE(9);
+                const key = p.subarray(13, 13 + klen).toString('utf8');
+                if (armedTipRace && key === WITNESS_KEY && String(bh) === baseTipHeightStr) {
+                    armedTipRace = false;
+                    tipRaced = true;
+                    baseTipNode.state.tipHeight += 1n;
+                }
+                if (key === ANCHOR_KEY) {
+                    const anchorVal = String(bh) === baseTipHeightStr ? null : tipRaced ? racedAnchorHash : null;
+                    return {
+                        tag: 'success',
+                        usedEnergy: { value: 1000n },
+                        returnValue: ReturnValue.fromBuffer(encodeGetMetadataReturn(anchorVal)),
+                    };
+                }
+            }
+            return baseTipNode.invokeContract(ctx, bh);
+        },
+    });
+
+    const tipRaceSrv = await startWitnessServer({
+        host: '127.0.0.1',
+        port: 0,
+        priceMicroCcd: '0',
+        signer: witnessSigner,
+        ledgerPath: path.join(dir, 'tip-race-ledger.json'),
+        nodeClient: tipRaceNode,
+        verifier: {
+            async verify() {
+                armedTipRace = true;
+                return { paymentId: 'tip-race-pay-1', payer: PAYER_3 };
+            },
+        },
+        fetchCard: async () => baseTipNode.card.bytes,
+        log: () => {},
+    });
+    cleanups.push(() => tipRaceSrv.close());
+
+    const rTipRace = await fetch(`${tipRaceSrv.url}/v1/anchor`, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            [HEADER_PAYMENT_SIGNATURE]: encodeX402Header({ x402Version: 2, payload: { race: 1 } }),
+        },
+        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 1, commitment: commitA, prevAnchorTx: null }),
+    });
+    assert.equal(rTipRace.status, 409);
+    assert.match((await rTipRace.json()).error, /moved concurrently/i);
+    assert.equal(tipRaced, true, 'test should have simulated tip advancement during withSignerLock checks');
+    assert.equal(baseTipNode.submitted.filter((t) => t.payload.type === AccountTransactionType.RegisterData).length, 0);
+    await tipRaceSrv.close();
 });
