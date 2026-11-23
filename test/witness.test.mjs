@@ -33,6 +33,7 @@ import {
     loadSignerFromFile,
     readAccountTransfer,
     readRegistryHistory,
+    sendRegisterData,
     sendTransferWithMemo,
     validateAndSponsorSetMetadata,
     verifyExistingAnchors,
@@ -844,11 +845,16 @@ test('ConcordiumTransferVerifier and SSRF-hardened FacilitatorVerifier validate 
         ca: Buffer.from(TEST_CERT_PEM),
     });
     const facRes = await fac.verify({ header: hdrFor(goodTx), requirements: reqs, expectedMemoHex: expectedMemo });
-    assert.equal(facRes.paymentId, `facilitator:${CONCORDIUM_TESTNET_CAIP2}:fac-tx-1`);
+    assert.match(facRes.paymentId, /^facilitator:sha256:[0-9a-f]{64}$/);
+    const facSettle = await fac.settle({ header: hdrFor(goodTx), requirements: reqs, expectedMemoHex: expectedMemo });
+    assert.equal(facSettle.transaction, 'fac-tx-1');
+    assert.equal(facSettle.network, CONCORDIUM_TESTNET_CAIP2);
     mode = 'bad_verify';
     await assert.rejects(() => fac.verify({ header: hdrFor(goodTx), requirements: reqs, expectedMemoHex: expectedMemo }), /bad sig/);
     mode = 'bad_settle';
-    await assert.rejects(() => fac.verify({ header: hdrFor(goodTx), requirements: reqs, expectedMemoHex: expectedMemo }), /reverted/);
+    const okVerify = await fac.verify({ header: hdrFor(goodTx), requirements: reqs, expectedMemoHex: expectedMemo });
+    assert.equal(okVerify.paymentId, facRes.paymentId);
+    await assert.rejects(() => fac.settle({ header: hdrFor(goodTx), requirements: reqs, expectedMemoHex: expectedMemo }), /reverted/);
 });
 
 test('loadSignerFromFile enforces 0600 permissions and never falls back to owner keyfile', async () => {
@@ -1125,14 +1131,15 @@ test('Witness HTTP service enforces testnet startup, body/header limits, pre-pay
     assert.equal(rB.status, 200);
     assert.equal(node.submitted.length - beforeMutexSubmits, 1, 'mutex must serialize identical concurrent payments into 1 registerData');
 
-    // Replay of pay5 for a DIFFERENT commitment/seq is rejected with 402 by memo verification, and 409 by PaymentLedger if verifier didn't bind memo
+    // Replay of committed pay5 for a DIFFERENT commitment/seq is rejected with 409 by PaymentLedger before verification/settlement
     const resReplayMismatch = await fetch(`${srv.url}/v1/anchor`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', [HEADER_PAYMENT_SIGNATURE]: sig5 },
         body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 6, commitment: c5Hex, prevAnchorTx: anchored.txHash }),
     });
-    assert.equal(resReplayMismatch.status, 402);
+    assert.equal(resReplayMismatch.status, 409);
 
+    const r5Data = await rA.json();
     const ledgerConflictSrv = await startWitnessServer({
         host: '127.0.0.1',
         port: 0,
@@ -1151,20 +1158,32 @@ test('Witness HTTP service enforces testnet startup, body/header limits, pre-pay
     });
     assert.equal(res409Binding.status, 409);
 
+    // Advance on-chain pointer to seq 5's anchor so seq 6 tests non-equivocating memo / seq guards
+    node.addSetMetadata({ sender: OWNER_A, key: ANCHOR_KEY, value: r5Data.txHash });
+
+    // An unused valid payment whose memo matches seq 5 is rejected with 402 if sent for seq 6
+    const freshMemo5Pay = await sendTransferWithMemo({ to: WITNESS_1, microCcd: 1000000n, memoBytes: Buffer.from(memo5, 'hex'), who: payer, nodeClient: node });
+    const resFreshMemoMismatch = await fetch(`${srv.url}/v1/anchor`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [HEADER_PAYMENT_SIGNATURE]: encodeX402Header({ x402Version: 2, payload: { txHash: freshMemo5Pay.hash } }) },
+        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 6, commitment: c5Hex, prevAnchorTx: r5Data.txHash }),
+    });
+    assert.equal(resFreshMemoMismatch.status, 402);
+
     // Wrong memo payment rejected with 402
     const wrongMemoPay = await sendTransferWithMemo({ to: WITNESS_1, microCcd: 1000000n, memoBytes: Buffer.alloc(32, 0x99), who: payer, nodeClient: node });
     const resWrongMemo = await fetch(`${srv.url}/v1/anchor`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', [HEADER_PAYMENT_SIGNATURE]: encodeX402Header({ x402Version: 2, payload: { txHash: wrongMemoPay.hash } }) },
-        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 6, commitment: 'e'.repeat(64), prevAnchorTx: anchored.txHash }),
+        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 6, commitment: 'e'.repeat(64), prevAnchorTx: r5Data.txHash }),
     });
     assert.equal(resWrongMemo.status, 402);
 
-    // Non-monotonic toSeq (toSeq <= prev.toSeq = 4) -> 409
+    // Non-monotonic toSeq (toSeq <= prev.toSeq = 5) -> 409
     const resNonMono = await fetch(`${srv.url}/v1/anchor`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 4, commitment: c4Hex, prevAnchorTx: anchored.txHash }),
+        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 5, commitment: c5Hex, prevAnchorTx: r5Data.txHash }),
     });
     assert.equal(resNonMono.status, 409);
 
@@ -1487,6 +1506,7 @@ test('cli.mjs set-witness, cli.mjs anchor --witness-url, and AnchorWorker witnes
             nodeClient: node,
             witnessUrl: srv.url,
             allowPrivateWitness: true,
+            maxPriceMicroCcd: '1000000',
             payerKeyfile,
         }),
     );
@@ -1527,6 +1547,7 @@ test('cli.mjs set-witness, cli.mjs anchor --witness-url, and AnchorWorker witnes
         signer: ownerSigner,
         witnessUrl: srv.url,
         allowPrivateWitness: true,
+        maxPriceMicroCcd: '1000000',
         // Notice no payerKeyfile -> ownerSigner pays on chain (+1 nonce), then worker refreshes nonce before sponsored setMetadata!
         source: () => [],
         log: () => {},
@@ -1674,6 +1695,7 @@ test('cli.mjs anchor --witness-url --no-sponsor-pointer falls back to direct set
             nodeClient: node,
             witnessUrl: srv.url,
             allowPrivateWitness: true,
+            maxPriceMicroCcd: '1000000',
             noSponsorPointer: true,
             payerKeyfile,
         }),
@@ -1786,7 +1808,7 @@ test('AnchorWorker allows witnessUrl anchoring at remainingOwnerBudget === 1 (vs
     const statePath = path.join(dir, 'budget.state.json');
     writeTrail(trailPath, header, records);
 
-    // Self-anchoring worker at remainingOwnerBudget === 1 MUST refuse (+2 required)
+    // Self-anchoring worker when active witness exists MUST refuse immediately BEFORE broadcast/budget
     const selfWorker = new AnchorWorker({
         uuid: AGENT_UUID,
         tokenId: TOKEN_ID,
@@ -1799,9 +1821,29 @@ test('AnchorWorker allows witnessUrl anchoring at remainingOwnerBudget === 1 (vs
         source: () => [],
         log: () => {},
     });
-    await assert.rejects(() => selfWorker.tick(), /\+ 2 exceeds maxOwnerTxs=2000/);
+    await assert.rejects(() => selfWorker.tick(), /--witness-url is required and self-anchoring is disabled/);
 
-    // Witnessed worker at remainingOwnerBudget === 1 MUST succeed (+1 required when payer != owner)
+    // Owner-pays witness worker at remainingOwnerBudget === 1 MUST refuse BEFORE paying (+2 required: payment + pointer)
+    const ownerPayerWorker = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath,
+        statePath,
+        everyRecords: 1,
+        once: true,
+        nodeClient: node,
+        signer: ownerSigner,
+        witnessUrl: srv.url,
+        allowPrivateWitness: true,
+        maxPriceMicroCcd: '1000000',
+        source: () => [],
+        log: () => {},
+    });
+    const beforeBudgetSubmits = node.submitted.length;
+    await assert.rejects(() => ownerPayerWorker.tick(), /\+ 2 exceeds maxOwnerTxs=2000/);
+    assert.equal(node.submitted.length, beforeBudgetSubmits, 'owner must not send CCD payment when budget < 2');
+
+    // Witnessed worker at remainingOwnerBudget === 1 MUST succeed (+1 required when 3rd-party payer != owner)
     const witnessWorker = new AnchorWorker({
         uuid: AGENT_UUID,
         tokenId: TOKEN_ID,
@@ -1813,6 +1855,7 @@ test('AnchorWorker allows witnessUrl anchoring at remainingOwnerBudget === 1 (vs
         signer: ownerSigner,
         witnessUrl: srv.url,
         allowPrivateWitness: true,
+        maxPriceMicroCcd: '1000000',
         payerSigner,
         source: () => [],
         log: () => {},
@@ -1820,4 +1863,1034 @@ test('AnchorWorker allows witnessUrl anchoring at remainingOwnerBudget === 1 (vs
     const res = await witnessWorker.tick();
     assert.equal(res.anchored, true);
     assert.equal(res.anchoredSeq, 2);
+});
+
+test('enforces active witness on all anchor/--tx paths, verifies /v1/anchor on-chain via readRegisterData, and re-checks at setTipHash', async () => {
+    const dir = makeTempDir();
+    const ownerSigner = await makeRealSigner(OWNER_A);
+    const witnessSigner = await makeRealSigner(WITNESS_1);
+
+    const node = createWitnessMockNode({
+        owner: OWNER_A,
+        accountVerifyKeys: new Map([
+            [OWNER_A, ownerSigner.verifyKey],
+            [WITNESS_1, witnessSigner.verifyKey],
+        ]),
+    });
+    node.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: WITNESS_1 });
+
+    const { header, records } = makeTrailFixtures(3);
+    const trailPath = path.join(dir, 'enforce-witness.jsonl');
+    writeTrail(trailPath, header, records.slice(0, 1));
+    const c1 = commitments(header, records.slice(0, 1)).last;
+    const ownerRd1 = await sendRegisterData(
+        encodeAnchor({ tokenId: TOKEN_ID, toSeq: 1, commitment: c1, prevAnchorTx: null }),
+        ownerSigner,
+        node,
+    );
+    const witnessRd1 = await sendRegisterData(
+        encodeAnchor({ tokenId: TOKEN_ID, toSeq: 1, commitment: c1, prevAnchorTx: null }),
+        witnessSigner,
+        node,
+    );
+
+    const submitsBeforeRefusals = node.submitted.length;
+    await assert.rejects(
+        () => commands.anchor({ trail: trailPath, who: ownerSigner, nodeClient: node }),
+        /--witness-url is required and owner self-anchoring is disabled/,
+    );
+    assert.equal(node.submitted.length, submitsBeforeRefusals, 'must refuse before broadcasting any tx');
+
+    await assert.rejects(
+        () => commands.anchor({ trail: trailPath, tx: ownerRd1.hash, who: ownerSigner, nodeClient: node }),
+        /not the next anchor for this trail/,
+    );
+    assert.equal(node.submitted.length, submitsBeforeRefusals);
+
+    // Witness-signed --tx succeeds while WITNESS_1 is active
+    await runQuiet(() =>
+        commands.anchor({ trail: trailPath, tx: witnessRd1.hash, who: ownerSigner, nodeClient: node }),
+    );
+    assert.equal(node.state.metadata[ANCHOR_KEY], witnessRd1.hash);
+
+    // Clear countersign.witness to "" -> witness-signed --tx is now refused, owner-signed --tx succeeds
+    node.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: '' });
+    writeTrail(trailPath, header, records.slice(0, 2));
+    const c2 = commitments(header, records.slice(0, 2)).last;
+    const witnessRd2 = await sendRegisterData(
+        encodeAnchor({ tokenId: TOKEN_ID, toSeq: 2, commitment: c2, prevAnchorTx: witnessRd1.hash }),
+        witnessSigner,
+        node,
+    );
+    const ownerRd2 = await sendRegisterData(
+        encodeAnchor({ tokenId: TOKEN_ID, toSeq: 2, commitment: c2, prevAnchorTx: witnessRd1.hash }),
+        ownerSigner,
+        node,
+    );
+    await assert.rejects(
+        () => commands.anchor({ trail: trailPath, tx: witnessRd2.hash, who: ownerSigner, nodeClient: node }),
+        /not the next anchor for this trail/,
+    );
+    await runQuiet(() =>
+        commands.anchor({ trail: trailPath, tx: ownerRd2.hash, who: ownerSigner, nodeClient: node }),
+    );
+    assert.equal(node.state.metadata[ANCHOR_KEY], ownerRd2.hash);
+
+    // Re-enable WITNESS_1 for seq 3 and test tampered /v1/anchor node-direct verification + setTipHash rotation abort
+    node.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: WITNESS_1 });
+    writeTrail(trailPath, header, records.slice(0, 3));
+    const c3 = commitments(header, records.slice(0, 3)).last;
+    const wrongSenderRd3 = await sendRegisterData(
+        encodeAnchor({ tokenId: TOKEN_ID, toSeq: 3, commitment: c3, prevAnchorTx: ownerRd2.hash }),
+        ownerSigner,
+        node,
+    );
+    const wrongCommitmentRd3 = await sendRegisterData(
+        encodeAnchor({ tokenId: TOKEN_ID, toSeq: 3, commitment: Buffer.alloc(32, 0xaa), prevAnchorTx: ownerRd2.hash }),
+        witnessSigner,
+        node,
+    );
+    const goodWitnessRd3 = await sendRegisterData(
+        encodeAnchor({ tokenId: TOKEN_ID, toSeq: 3, commitment: c3, prevAnchorTx: ownerRd2.hash }),
+        witnessSigner,
+        node,
+    );
+
+    const fakeHealthFn = async () => ({
+        ok: true,
+        network: 'testnet',
+        genesis: TESTNET_GENESIS,
+        registry: { ...REGISTRY },
+        witnessAccount: WITNESS_1,
+        payTo: WITNESS_1,
+        priceMicroCcd: '0',
+        sponsorPointer: false,
+    });
+
+    const statePathTamper = path.join(dir, 'tamper.state.json');
+    const submitsBeforeTamper = node.submitted.length;
+    await assert.rejects(
+        () =>
+            commands.anchor({
+                trail: trailPath,
+                state: statePathTamper,
+                who: ownerSigner,
+                nodeClient: node,
+                witnessUrl: 'https://witness.example',
+                fetchWitnessHealthFn: fakeHealthFn,
+                requestWitnessAnchorFn: async () => ({ txHash: wrongSenderRd3.hash, witnessAccount: WITNESS_1 }),
+            }),
+        /does not match active countersign\.witness/,
+    );
+    assert.equal(node.submitted.length, submitsBeforeTamper);
+
+    const workerTamper = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath,
+        statePath: statePathTamper,
+        everyRecords: 1,
+        once: true,
+        nodeClient: node,
+        signer: ownerSigner,
+        witnessUrl: 'https://witness.example',
+        fetchWitnessHealthFn: fakeHealthFn,
+        requestWitnessAnchorFn: async () => ({ txHash: wrongCommitmentRd3.hash, witnessAccount: WITNESS_1 }),
+        source: () => [],
+        log: () => {},
+    });
+    await assert.rejects(() => workerTamper.tick(), /does not match expected anchor/);
+    assert.equal(fs.existsSync(statePathTamper) && JSON.parse(fs.readFileSync(statePathTamper, 'utf8')).pendingAnchor, false);
+
+    // setTipHash rotation abort: simulate witness changing on-chain right after witness returns rd3
+    let rotated = false;
+    const rotatingNode = Object.assign(Object.create(node), {
+        async invokeContract(ctx, bh) {
+            const method = ctx.method.value ?? String(ctx.method);
+            const p = Buffer.from(ctx.parameter.buffer);
+            if (rotated && method === 'CIS-8004.getMetadata' && p.includes(Buffer.from(WITNESS_KEY))) {
+                return {
+                    tag: 'success',
+                    usedEnergy: { value: 1000n },
+                    returnValue: ReturnValue.fromBuffer(encodeGetMetadataReturn(WITNESS_2)),
+                };
+            }
+            return node.invokeContract(ctx, bh);
+        },
+    });
+    const submitsBeforeRotate = node.submitted.length;
+    await assert.rejects(
+        () =>
+            commands.anchor({
+                trail: trailPath,
+                state: path.join(dir, 'rotate-cli.state.json'),
+                who: ownerSigner,
+                nodeClient: rotatingNode,
+                witnessUrl: 'https://witness.example',
+                fetchWitnessHealthFn: fakeHealthFn,
+                requestWitnessAnchorFn: async () => {
+                    rotated = true;
+                    return { txHash: goodWitnessRd3.hash, witnessAccount: WITNESS_1 };
+                },
+            }),
+        /countersign\.witness changed concurrently/,
+    );
+    assert.equal(node.submitted.length, submitsBeforeRotate, 'must not submit setMetadata after setTipHash rotation');
+
+    rotated = false;
+    const workerRotate = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath,
+        statePath: path.join(dir, 'rotate-worker.state.json'),
+        everyRecords: 1,
+        once: true,
+        nodeClient: rotatingNode,
+        signer: ownerSigner,
+        witnessUrl: 'https://witness.example',
+        fetchWitnessHealthFn: fakeHealthFn,
+        requestWitnessAnchorFn: async () => {
+            rotated = true;
+            return { txHash: goodWitnessRd3.hash, witnessAccount: WITNESS_1 };
+        },
+        source: () => [],
+        log: () => {},
+    });
+    await assert.rejects(() => workerRotate.tick(), /countersign\.witness changed concurrently/);
+    assert.equal(node.submitted.length, submitsBeforeRotate);
+});
+
+test('client maxPriceMicroCcd, payTo/witness pinning, 210s default timeout, pendingPayment persistence & recovery', async (t) => {
+    const dir = makeTempDir();
+    const ownerSigner = await makeRealSigner(OWNER_A);
+    const witnessSigner = await makeRealSigner(WITNESS_1);
+    const payerSigner = await makeRealSigner(PAYER_3);
+    const witnessKeyfile = writeKeyfile(dir, 'witness.json', witnessSigner, 0o600);
+
+    const node = createWitnessMockNode({
+        owner: OWNER_A,
+        accountVerifyKeys: new Map([
+            [OWNER_A, ownerSigner.verifyKey],
+            [WITNESS_1, witnessSigner.verifyKey],
+        ]),
+    });
+    node.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: WITNESS_1 });
+
+    // Check default 210s timeout on requestWitnessAnchor via setTimeout capture in safeHttpsRequest
+    let capturedTimeoutMs = null;
+    const origSetTimeout = globalThis.setTimeout;
+    const timeoutMock = t.mock.method(globalThis, 'setTimeout', (fn, ms, ...args) => {
+        if (typeof ms === 'number' && ms >= 100000) capturedTimeoutMs = ms;
+        return origSetTimeout(fn, ms, ...args);
+    });
+    try {
+        await assert.rejects(
+            () =>
+                requestWitnessAnchor({
+                    witnessUrl: 'https://witness.example',
+                    tokenId: TOKEN_ID,
+                    toSeq: 1,
+                    commitment: 'a'.repeat(64),
+                    requestFn: () => {
+                        const err = new Error('probe done');
+                        const fakeReq = {
+                            on(ev, cb) {
+                                if (ev === 'error') queueMicrotask(() => cb(err));
+                                return fakeReq;
+                            },
+                            write() {},
+                            end() {},
+                            destroy() {},
+                        };
+                        return fakeReq;
+                    },
+                }),
+            /probe done/,
+        );
+    } finally {
+        timeoutMock.mock.restore();
+    }
+    assert.ok(capturedTimeoutMs >= 210000, `expected timeout >= 210000ms, got ${capturedTimeoutMs}`);
+
+    const srv = await startWitnessServer({
+        host: '127.0.0.1',
+        port: 0,
+        witnessKeyfile,
+        priceMicroCcd: '1000000',
+        ledgerPath: path.join(dir, 'pay-pin-ledger.json'),
+        nodeClient: node,
+        fetchCard: async () => node.card.bytes,
+        log: () => {},
+    });
+    cleanups.push(() => srv.close());
+
+    // Pinning checks before calling payFn
+    let payFnCalls = 0;
+    await assert.rejects(
+        () =>
+            requestWitnessAnchor({
+                witnessUrl: srv.url,
+                tokenId: TOKEN_ID,
+                toSeq: 1,
+                commitment: 'a'.repeat(64),
+                expectedPayTo: PAYER_3,
+                allowPrivate: true,
+                payFn: async () => {
+                    payFnCalls += 1;
+                    return '';
+                },
+            }),
+        /does not match expected/,
+    );
+    await assert.rejects(
+        () =>
+            requestWitnessAnchor({
+                witnessUrl: srv.url,
+                tokenId: TOKEN_ID,
+                toSeq: 1,
+                commitment: 'a'.repeat(64),
+                expectedWitnessAccount: WITNESS_2,
+                allowPrivate: true,
+                payFn: async () => {
+                    payFnCalls += 1;
+                    return '';
+                },
+            }),
+        /extra\.witnessAccount.*does not match/,
+    );
+    await assert.rejects(
+        () =>
+            requestWitnessAnchor({
+                witnessUrl: srv.url,
+                tokenId: TOKEN_ID,
+                toSeq: 1,
+                commitment: 'a'.repeat(64),
+                maxPriceMicroCcd: '999999',
+                allowPrivate: true,
+                payFn: async () => {
+                    payFnCalls += 1;
+                    return '';
+                },
+            }),
+        /exceeds maxPriceMicroCcd/,
+    );
+    assert.equal(payFnCalls, 0);
+
+    const { header, records } = makeTrailFixtures(3);
+    const cliTrail = path.join(dir, 'cli-pay.jsonl');
+    const cliState = path.join(dir, 'cli-pay.state.json');
+    writeTrail(cliTrail, header, records.slice(0, 2));
+
+    // cli.mjs anchor refuses if 402 exceeds /health advertised price
+    const submitsBeforeQuoteMismatch = node.submitted.length;
+    await assert.rejects(
+        () =>
+            commands.anchor({
+                trail: cliTrail,
+                state: cliState,
+                who: ownerSigner,
+                payerSigner,
+                nodeClient: node,
+                witnessUrl: srv.url,
+                allowPrivateWitness: true,
+                maxPriceMicroCcd: '2000000',
+                fetchWitnessHealthFn: async () => ({
+                    ok: true,
+                    network: 'testnet',
+                    genesis: TESTNET_GENESIS,
+                    registry: { ...REGISTRY },
+                    witnessAccount: WITNESS_1,
+                    payTo: WITNESS_1,
+                    priceMicroCcd: '500000',
+                    sponsorPointer: true,
+                }),
+            }),
+        /exceeds \/health priceMicroCcd/,
+    );
+    assert.equal(node.submitted.length, submitsBeforeQuoteMismatch);
+
+    // cli.mjs anchor prints --payment-signature recovery hint if /v1/anchor fails AFTER payment finalizes
+    const origErr = console.error;
+    const errs = [];
+    console.error = (...a) => errs.push(a.join(' '));
+    try {
+        await assert.rejects(
+            () =>
+                commands.anchor({
+                    trail: cliTrail,
+                    state: path.join(dir, 'cli-hint.state.json'),
+                    who: ownerSigner,
+                    payerSigner,
+                    nodeClient: node,
+                    witnessUrl: srv.url,
+                    allowPrivateWitness: true,
+                    maxPriceMicroCcd: '1000000',
+                    requestWitnessAnchorFn: async (arg) => {
+                        await arg.payFn(
+                            createPaymentRequirements({
+                                payTo: WITNESS_1,
+                                amountMicroCcd: '1000000',
+                                resource: `${srv.url}/v1/anchor`,
+                                tokenId: TOKEN_ID,
+                                toSeq: arg.toSeq,
+                                commitment: arg.commitment,
+                                prevAnchorTx: arg.prevAnchorTx,
+                                witnessAccount: WITNESS_1,
+                            }).accepts[0],
+                        );
+                        throw new Error('simulated 503 after payment');
+                    },
+                }),
+            /simulated 503 after payment/,
+        );
+    } finally {
+        console.error = origErr;
+    }
+    assert.match(errs.join('\n'), /retry with --payment-signature /);
+
+    // AnchorWorker built-in payer persists pendingPayment, survives crash, blocks cli.mjs anchor, and reuses paymentSignature even after localSeq grows
+    const workerTrail = path.join(dir, 'worker-pp.jsonl');
+    const workerState = path.join(dir, 'worker-pp.state.json');
+    writeTrail(workerTrail, header, records.slice(0, 2));
+    const countPayments = () =>
+        node.submitted.filter((tx) => tx.payload.type === AccountTransactionType.TransferWithMemo).length;
+    const beforePayCount = countPayments();
+
+    const workerPayFail = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath: workerTrail,
+        statePath: workerState,
+        everyRecords: 1,
+        once: true,
+        nodeClient: node,
+        signer: ownerSigner,
+        payerSigner,
+        witnessUrl: srv.url,
+        allowPrivateWitness: true,
+        maxPriceMicroCcd: '1000000',
+        requestWitnessAnchorFn: async (arg) => {
+            await arg.payFn(
+                createPaymentRequirements({
+                    payTo: WITNESS_1,
+                    amountMicroCcd: '1000000',
+                    resource: `${srv.url}/v1/anchor`,
+                    tokenId: TOKEN_ID,
+                    toSeq: arg.toSeq,
+                    commitment: arg.commitment,
+                    prevAnchorTx: arg.prevAnchorTx,
+                    witnessAccount: WITNESS_1,
+                }).accepts[0],
+            );
+            throw new Error('witness down after payment finalized');
+        },
+        source: () => [],
+        log: () => {},
+    });
+    await assert.rejects(() => workerPayFail.tick(), /witness down after payment finalized/);
+    assert.equal(countPayments() - beforePayCount, 1);
+
+    const savedState = JSON.parse(fs.readFileSync(workerState, 'utf8'));
+    assert.equal(savedState.pendingPayment?.status, 'finalized');
+    assert.equal(savedState.pendingPayment?.toSeq, 2);
+
+    // cli.mjs anchor refuses while pendingPayment exists
+    await assert.rejects(
+        () =>
+            commands.anchor({
+                trail: workerTrail,
+                state: workerState,
+                who: ownerSigner,
+                nodeClient: node,
+                witnessUrl: srv.url,
+                allowPrivateWitness: true,
+                maxPriceMicroCcd: '1000000',
+            }),
+        /pending payment/,
+    );
+
+    // Append seq 3 before restart: AnchorWorker MUST resume pendingPayment for toSeq=2 without paying again, then anchor seq 3 cleanly
+    writeTrail(workerTrail, header, records.slice(0, 3));
+    const workerResume = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath: workerTrail,
+        statePath: workerState,
+        everyRecords: 1,
+        once: true,
+        nodeClient: node,
+        signer: ownerSigner,
+        payerSigner,
+        witnessUrl: srv.url,
+        allowPrivateWitness: true,
+        maxPriceMicroCcd: '1000000',
+        source: () => [],
+        log: () => {},
+    });
+    const resResume = await workerResume.tick();
+    assert.equal(resResume.anchored, true);
+    assert.equal(resResume.anchoredSeq, 3);
+    assert.equal(countPayments() - beforePayCount, 2, 'one payment for resumed seq 2 + one for new seq 3; no double-pay for seq 2');
+    assert.equal(JSON.parse(fs.readFileSync(workerState, 'utf8')).pendingPayment, null);
+
+    // pendingPayment absent before vs after expiry
+    const expTrail = path.join(dir, 'exp-pp.jsonl');
+    const expState = path.join(dir, 'exp-pp.state.json');
+    const f4 = makeTrailFixtures(4);
+    writeTrail(expTrail, f4.header, f4.records.slice(0, 4));
+    const c4Hex = commitments(f4.header, f4.records.slice(0, 4)).last.toString('hex');
+    const curPtr = node.state.metadata[ANCHOR_KEY];
+    const tipSlotSec = Math.floor(node.timeForHeight(node.state.tipHeight) / 1000);
+    fs.writeFileSync(
+        expState,
+        JSON.stringify({
+            version: 1,
+            agentUuid: AGENT_UUID,
+            tokenId: TOKEN_ID,
+            pendingPayment: {
+                witnessUrl: srv.url,
+                tokenId: TOKEN_ID,
+                toSeq: 4,
+                commitment: c4Hex,
+                prevAnchorTx: curPtr,
+                memoHex: computePaymentMemo({ tokenId: TOKEN_ID, toSeq: 4, commitment: c4Hex, prevAnchorTx: curPtr }),
+                paymentTxHash: txHashFor('absent-payment'),
+                expiryEpochSeconds: tipSlotSec + 60,
+                paymentSignature: encodeX402Header({ x402Version: 2, payload: { txHash: txHashFor('absent-payment') } }),
+                payer: payerSigner.address,
+                amountMicroCcd: '1000000',
+                status: 'signed',
+            },
+        }),
+    );
+    const workerExp = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath: expTrail,
+        statePath: expState,
+        everyRecords: 1,
+        once: true,
+        nodeClient: node,
+        signer: ownerSigner,
+        payerSigner,
+        witnessUrl: srv.url,
+        allowPrivateWitness: true,
+        maxPriceMicroCcd: '1000000',
+        source: () => [],
+        log: () => {},
+    });
+    const paysBeforeExp = countPayments();
+    await assert.rejects(() => workerExp.tick(), /in-flight\/ambiguous/);
+    assert.equal(countPayments(), paysBeforeExp);
+
+    node.setTipSlotTimeMs((tipSlotSec + 120) * 1000);
+    const resAfterExp = await workerExp.tick();
+    assert.equal(resAfterExp.anchored, true);
+    assert.equal(resAfterExp.anchoredSeq, 4);
+    assert.equal(countPayments(), paysBeforeExp + 1);
+});
+
+test('witness ledger file lock, cross-token signer nonce mutex, maxQueuedPerToken 429, and publicBaseUrl resource pinning', async () => {
+    const dir = makeTempDir();
+    const ownerSigner = await makeRealSigner(OWNER_A);
+    const witnessSigner = await makeRealSigner(WITNESS_1);
+    const payerSigner = await makeRealSigner(PAYER_3);
+    const ledgerPath = path.join(dir, 'shared-ledger.json');
+
+    const TOKEN_2 = '1316';
+    const baseNode = createWitnessMockNode({
+        owner: OWNER_A,
+        accountVerifyKeys: new Map([
+            [OWNER_A, ownerSigner.verifyKey],
+            [WITNESS_1, witnessSigner.verifyKey],
+        ]),
+    });
+    baseNode.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: WITNESS_1 });
+    const card2 = makeCardBytes({ badge: encodeBadge(TOKEN_2), ownerAccount: OWNER_A });
+    const agent2 = {
+        tokenId: TOKEN_2,
+        ownerAccount: OWNER_A,
+        agentUri: 'https://agent2.example/card.json',
+        metadataHashHex: card2.hashHex,
+        status: 'Active',
+        registeredAtMs: baseNode.timeForHeight(1000n),
+    };
+    const meta2 = { 'unitares.agent_uuid': AGENT_UUID, [WITNESS_KEY]: WITNESS_1 };
+    baseNode.state.txsByHeight.get(1000n).push({
+        height: 1000n,
+        hash: txHashFor('mint-2'),
+        sender: OWNER_A,
+        contractEvents: [evMint(TOKEN_2, OWNER_A), evMetadataSet(TOKEN_2, WITNESS_KEY, WITNESS_1)],
+    });
+
+    let activeRdBroadcasts = 0;
+    let maxConcurrentRdBroadcasts = 0;
+    let rdBroadcastCounter = 0;
+    const multiNode = Object.assign(Object.create(baseNode), {
+        async invokeContract(ctx, bh) {
+            const method = ctx.method.value ?? String(ctx.method);
+            const p = Buffer.from(ctx.parameter.buffer);
+            const reqTid = p.length >= 9 ? p.readBigUInt64LE(1).toString() : null;
+            if (reqTid === TOKEN_2) {
+                if (method === 'CIS-8004.agentOf') {
+                    return {
+                        tag: 'success',
+                        usedEnergy: { value: 1000n },
+                        returnValue: ReturnValue.fromBuffer(encodeAgentOfReturn(agent2)),
+                    };
+                }
+                if (method === 'CIS-8004.getMetadata') {
+                    const klen = p.readUInt32LE(9);
+                    const key = p.subarray(13, 13 + klen).toString('utf8');
+                    return {
+                        tag: 'success',
+                        usedEnergy: { value: 1000n },
+                        returnValue: ReturnValue.fromBuffer(encodeGetMetadataReturn(meta2[key] ?? null)),
+                    };
+                }
+            }
+            return baseNode.invokeContract(ctx, bh);
+        },
+        async sendTransaction(finalized) {
+            if (finalized.payload.type === AccountTransactionType.RegisterData) {
+                activeRdBroadcasts += 1;
+                maxConcurrentRdBroadcasts = Math.max(maxConcurrentRdBroadcasts, activeRdBroadcasts);
+                try {
+                    rdBroadcastCounter += 1;
+                    await new Promise((r) => setTimeout(r, 25));
+                    return await baseNode.sendTransaction(finalized);
+                } finally {
+                    activeRdBroadcasts -= 1;
+                }
+            }
+            return baseNode.sendTransaction(finalized);
+        },
+    });
+
+    // Ledger file lock excludes a second witness server on the same ledgerPath until first closes
+    const srv1 = await startWitnessServer({
+        host: '127.0.0.1',
+        port: 0,
+        publicBaseUrl: 'https://witness.public.example:8443/ignored-path',
+        maxQueuedPerToken: 2,
+        signer: witnessSigner,
+        ledgerPath,
+        nodeClient: multiNode,
+        fetchCard: async (uri) => (uri.includes('agent2') ? card2.bytes : baseNode.card.bytes),
+        log: () => {},
+    });
+    cleanups.push(() => srv1.close());
+    await assert.rejects(
+        () =>
+            startWitnessServer({
+                host: '127.0.0.1',
+                port: 0,
+                signer: witnessSigner,
+                ledgerPath,
+                nodeClient: multiNode,
+                log: () => {},
+            }),
+        /already held/,
+    );
+
+    // Safe resource pinning ignores spoofed Host header
+    const spoofedRes = await fetch(`${srv1.url}/v1/anchor`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', host: 'evil.attacker:9999' },
+        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 1, commitment: 'a'.repeat(64), prevAnchorTx: null }),
+    });
+    assert.equal(spoofedRes.status, 402);
+    const pr = decodeX402Header(spoofedRes.headers.get(HEADER_PAYMENT_REQUIRED));
+    assert.equal(pr.resource.url, 'https://witness.public.example:8443/v1/anchor');
+
+    // Cross-token concurrency serialized cleanly by withSignerLock + consecutive witness nonces
+    const c1 = '1'.repeat(64);
+    const c2 = '2'.repeat(64);
+    const memo1 = computePaymentMemo({ tokenId: TOKEN_ID, toSeq: 1, commitment: c1, prevAnchorTx: null });
+    const memo2 = computePaymentMemo({ tokenId: TOKEN_2, toSeq: 1, commitment: c2, prevAnchorTx: null });
+    const pay1 = await sendTransferWithMemo({
+        to: WITNESS_1,
+        microCcd: 1000000n,
+        memoBytes: Buffer.from(memo1, 'hex'),
+        who: payerSigner,
+        nodeClient: multiNode,
+    });
+    const pay2 = await sendTransferWithMemo({
+        to: WITNESS_1,
+        microCcd: 1000000n,
+        memoBytes: Buffer.from(memo2, 'hex'),
+        who: payerSigner,
+        nodeClient: multiNode,
+    });
+    const beforeSub = multiNode.submitted.length;
+    const [resT1, resT2] = await Promise.all([
+        fetch(`${srv1.url}/v1/anchor`, {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                [HEADER_PAYMENT_SIGNATURE]: encodeX402Header({ x402Version: 2, payload: { txHash: pay1.hash } }),
+            },
+            body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 1, commitment: c1, prevAnchorTx: null }),
+        }),
+        fetch(`${srv1.url}/v1/anchor`, {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                [HEADER_PAYMENT_SIGNATURE]: encodeX402Header({ x402Version: 2, payload: { txHash: pay2.hash } }),
+            },
+            body: JSON.stringify({ tokenId: TOKEN_2, toSeq: 1, commitment: c2, prevAnchorTx: null }),
+        }),
+    ]);
+    assert.equal(resT1.status, 200);
+    assert.equal(resT2.status, 200);
+    const bodyT1 = await resT1.json();
+    multiNode.addSetMetadata({ sender: OWNER_A, key: ANCHOR_KEY, value: bodyT1.txHash });
+    assert.equal(rdBroadcastCounter, 2);
+    assert.equal(maxConcurrentRdBroadcasts, 1, 'withSignerLock must prevent concurrent witness broadcasts');
+    const rdTxs = multiNode.submitted.slice(beforeSub).filter((tx) => tx.payload.type === AccountTransactionType.RegisterData);
+    assert.equal(rdTxs.length, 2);
+    assert.equal(rdTxs[1].header.nonce.value, rdTxs[0].header.nonce.value + 1n);
+
+    // maxQueuedPerToken: 2 rejects 3rd concurrent same-token request with 429
+    const c2Next = '3'.repeat(64);
+    const slowPay = await sendTransferWithMemo({
+        to: WITNESS_1,
+        microCcd: 1000000n,
+        memoBytes: Buffer.from(computePaymentMemo({ tokenId: TOKEN_ID, toSeq: 2, commitment: c2Next, prevAnchorTx: bodyT1.txHash }), 'hex'),
+        who: payerSigner,
+        nodeClient: multiNode,
+    });
+    const bodySlow = JSON.stringify({ tokenId: TOKEN_ID, toSeq: 2, commitment: c2Next, prevAnchorTx: bodyT1.txHash });
+    const sigSlow = encodeX402Header({ x402Version: 2, payload: { txHash: slowPay.hash } });
+    const qReqs = await Promise.all([
+        fetch(`${srv1.url}/v1/anchor`, { method: 'POST', headers: { 'content-type': 'application/json', [HEADER_PAYMENT_SIGNATURE]: sigSlow }, body: bodySlow }),
+        fetch(`${srv1.url}/v1/anchor`, { method: 'POST', headers: { 'content-type': 'application/json', [HEADER_PAYMENT_SIGNATURE]: sigSlow }, body: bodySlow }),
+        fetch(`${srv1.url}/v1/anchor`, { method: 'POST', headers: { 'content-type': 'application/json', [HEADER_PAYMENT_SIGNATURE]: sigSlow }, body: bodySlow }),
+    ]);
+    const statuses = qReqs.map((r) => r.status).sort((a, b) => a - b);
+    assert.deepEqual(statuses, [200, 200, 429]);
+
+    await srv1.close();
+    // Re-opening after close succeeds cleanly
+    const srv2 = await startWitnessServer({
+        host: '127.0.0.1',
+        port: 0,
+        signer: witnessSigner,
+        ledgerPath,
+        nodeClient: multiNode,
+        fetchCard: async () => baseNode.card.bytes,
+        log: () => {},
+    });
+    cleanups.push(() => srv2.close());
+    await srv2.close();
+});
+
+test('FacilitatorVerifier verify->claim->settle order, settled resume, broadcasted reconciliation, equivocation 409, and claimed sponsor cleanup', async () => {
+    const dir = makeTempDir();
+    const ownerSigner = await makeRealSigner(OWNER_A);
+    const witnessSigner = await makeRealSigner(WITNESS_1);
+
+    const node = createWitnessMockNode({
+        owner: OWNER_A,
+        accountVerifyKeys: new Map([
+            [OWNER_A, ownerSigner.verifyKey],
+            [WITNESS_1, witnessSigner.verifyKey],
+        ]),
+    });
+    node.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: WITNESS_1 });
+
+    let verifyCalls = 0;
+    let settleCalls = 0;
+    const facSrv = https.createServer({ key: TEST_KEY_PEM, cert: TEST_CERT_PEM }, (req, res) => {
+        if (req.url === '/verify') {
+            verifyCalls += 1;
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ isValid: true, payer: PAYER_3 }));
+        } else if (req.url === '/settle') {
+            settleCalls += 1;
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ success: true, transaction: `fac-${settleCalls}`, network: CONCORDIUM_TESTNET_CAIP2 }));
+        }
+    });
+    await new Promise((r) => facSrv.listen(0, '127.0.0.1', r));
+    cleanups.push(async () => {
+        facSrv.closeAllConnections?.();
+        await new Promise((r) => facSrv.close(r));
+    });
+
+    const facVerifier = createFacilitatorVerifier({
+        facilitatorUrl: `https://127.0.0.1:${facSrv.address().port}`,
+        allowPrivate: true,
+        ca: Buffer.from(TEST_CERT_PEM),
+    });
+
+    let failBeforeSignOnce = false;
+    let simulateConcurrentAnchorBeforeSettle = false;
+    let getMetaCount = 0;
+    const racingNode = Object.assign(Object.create(node), {
+        async invokeContract(ctx, bh) {
+            const p = Buffer.from(ctx.parameter.buffer);
+            if (simulateConcurrentAnchorBeforeSettle && ctx.method.value === 'CIS-8004.getMetadata' && p.includes(Buffer.from(ANCHOR_KEY))) {
+                getMetaCount += 1;
+                if (getMetaCount === 2) {
+                    return {
+                        tag: 'success',
+                        usedEnergy: { value: 1000n },
+                        returnValue: ReturnValue.fromBuffer(encodeGetMetadataReturn(txHashFor('other-race'))),
+                    };
+                }
+            }
+            return node.invokeContract(ctx, bh);
+        },
+        async getNextAccountNonce(acct) {
+            if (failBeforeSignOnce) {
+                failBeforeSignOnce = false;
+                throw new Error('transient grpc error before signing/broadcast');
+            }
+            return node.getNextAccountNonce(acct);
+        },
+    });
+
+    const srv = await startWitnessServer({
+        host: '127.0.0.1',
+        port: 0,
+        signer: witnessSigner,
+        ledgerPath: path.join(dir, 'fac-ledger.json'),
+        nodeClient: racingNode,
+        verifier: facVerifier,
+        fetchCard: async () => node.card.bytes,
+        log: () => {},
+    });
+    cleanups.push(() => srv.close());
+
+    // 1. Concurrent pointer move before /settle -> 409 and /settle is NOT called
+    simulateConcurrentAnchorBeforeSettle = true;
+    const sig1 = encodeX402Header({ x402Version: 2, payload: { auth: 'token-1' } });
+    const req1 = await fetch(`${srv.url}/v1/anchor`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [HEADER_PAYMENT_SIGNATURE]: sig1 },
+        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 1, commitment: 'a'.repeat(64), prevAnchorTx: null }),
+    });
+    assert.equal(req1.status, 409);
+    assert.equal(settleCalls, 0, '/settle must not run when anchor race fails before settlement');
+    simulateConcurrentAnchorBeforeSettle = false;
+
+    // 2. Pre-broadcast failure AFTER /settle (before onSigned) leaves ledger status === 'settled',
+    //    and retry succeeds with verifyCalls === 1, settleCalls === 1
+    verifyCalls = 0;
+    settleCalls = 0;
+    failBeforeSignOnce = true;
+    const req2Fail = await fetch(`${srv.url}/v1/anchor`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [HEADER_PAYMENT_SIGNATURE]: sig1 },
+        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 1, commitment: 'a'.repeat(64), prevAnchorTx: null }),
+    });
+    assert.equal(req2Fail.status, 500);
+    const pid1 = facVerifier.derivePaymentId(sig1);
+    assert.equal(srv.ledger.get(pid1)?.status, 'settled');
+
+    const req2Ok = await fetch(`${srv.url}/v1/anchor`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [HEADER_PAYMENT_SIGNATURE]: sig1 },
+        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 1, commitment: 'a'.repeat(64), prevAnchorTx: null }),
+    });
+    assert.equal(req2Ok.status, 200);
+    assert.equal(verifyCalls, 1, 'retry after settled must not re-call /verify');
+    assert.equal(settleCalls, 1, 'retry after settled must not re-call /settle');
+    const a1 = await req2Ok.json();
+
+    // 3. Equivocation 409 on same (tokenId, prevAnchorTx) with different (toSeq, commitment) BEFORE /verify or /settle
+    const sigEquiv = encodeX402Header({ x402Version: 2, payload: { auth: 'token-equiv' } });
+    const reqEquiv = await fetch(`${srv.url}/v1/anchor`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [HEADER_PAYMENT_SIGNATURE]: sigEquiv },
+        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 2, commitment: 'b'.repeat(64), prevAnchorTx: null }),
+    });
+    assert.equal(reqEquiv.status, 409);
+    assert.equal(verifyCalls, 1, 'equivocation must fail before /verify');
+    assert.equal(settleCalls, 1);
+
+    // Advance chain pointer to a1.txHash
+    node.addSetMetadata({ sender: OWNER_A, key: ANCHOR_KEY, value: a1.txHash });
+
+    // 4. Broadcasted entry reconciliation: finalized & succeeded -> promotes to committed without re-broadcast
+    const c2 = 'c'.repeat(64);
+    const preLandedRd = node.addRegisterData({
+        sender: WITNESS_1,
+        data: encodeAnchor({ tokenId: TOKEN_ID, toSeq: 2, commitment: Buffer.from(c2, 'hex'), prevAnchorTx: a1.txHash }),
+    });
+    const sigBcastOk = encodeX402Header({ x402Version: 2, payload: { auth: 'token-bcast-ok' } });
+    const pidBcastOk = facVerifier.derivePaymentId(sigBcastOk);
+    srv.ledger.claim(pidBcastOk, { tokenId: TOKEN_ID, toSeq: 2, commitment: c2, prevAnchorTx: a1.txHash });
+    srv.ledger.markSettled(pidBcastOk, { payer: PAYER_3 });
+    srv.ledger.markBroadcast(pidBcastOk, { txHash: preLandedRd.txHash, expiryEpochSeconds: 9999999999 });
+    const subsBeforeBcastOk = node.submitted.length;
+    const resBcastOk = await fetch(`${srv.url}/v1/anchor`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [HEADER_PAYMENT_SIGNATURE]: sigBcastOk },
+        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 2, commitment: c2, prevAnchorTx: a1.txHash }),
+    });
+    assert.equal(resBcastOk.status, 200);
+    assert.equal(srv.ledger.get(pidBcastOk)?.status, 'committed');
+    assert.equal(node.submitted.length, subsBeforeBcastOk);
+    node.addSetMetadata({ sender: OWNER_A, key: ANCHOR_KEY, value: preLandedRd.txHash });
+
+    // 5. Broadcasted entry absent before vs after expiry -> 409 then downgrades & re-broadcasts
+    const c3 = 'd'.repeat(64);
+    const sigAbsent = encodeX402Header({ x402Version: 2, payload: { auth: 'token-absent' } });
+    const pidAbsent = facVerifier.derivePaymentId(sigAbsent);
+    srv.ledger.claim(pidAbsent, { tokenId: TOKEN_ID, toSeq: 3, commitment: c3, prevAnchorTx: preLandedRd.txHash });
+    srv.ledger.markSettled(pidAbsent, { payer: PAYER_3 });
+    const curEpochSec = Math.floor(node.timeForHeight(node.state.tipHeight) / 1000);
+    srv.ledger.markBroadcast(pidAbsent, { txHash: txHashFor('dropped-rd'), expiryEpochSeconds: curEpochSec + 60 });
+
+    const resInFlight = await fetch(`${srv.url}/v1/anchor`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [HEADER_PAYMENT_SIGNATURE]: sigAbsent },
+        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 3, commitment: c3, prevAnchorTx: preLandedRd.txHash }),
+    });
+    assert.equal(resInFlight.status, 409);
+
+    node.setTipSlotTimeMs((curEpochSec + 120) * 1000);
+    const resRebroadcast = await fetch(`${srv.url}/v1/anchor`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [HEADER_PAYMENT_SIGNATURE]: sigAbsent },
+        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 3, commitment: c3, prevAnchorTx: preLandedRd.txHash }),
+    });
+    assert.equal(resRebroadcast.status, 200);
+    const a3 = await resRebroadcast.json();
+    assert.equal(settleCalls, 1, 'expired broadcasted recovery must not re-settle');
+
+    // 6. Orphaned 'claimed' entry in sponsorPointers cleaned up under lock and completes cleanly
+    srv.ledger.claimSponsor(TOKEN_ID, a3.txHash, { requestHash: 'stale-hash' });
+    const accForSp = await node.getAccountInfo(ownerSigner.sender, blockHashFor(node.state.tipHeight));
+    const builtSp = await buildSignedSponsoredSetMetadata({
+        tokenId: TOKEN_ID,
+        key: ANCHOR_KEY,
+        valueUtf8: a3.txHash,
+        who: ownerSigner,
+        sponsorAddress: WITNESS_1,
+        expectedNonce: BigInt(accForSp.accountNonce.value),
+        nodeClient: node,
+    });
+    const spOut = await requestSponsoredPointer({
+        witnessUrl: srv.url,
+        tokenId: TOKEN_ID,
+        anchorTxHash: a3.txHash,
+        transactionJson: builtSp.transactionJson,
+        allowPrivate: true,
+    });
+    assert.ok(spOut.metadataTxHash);
+    assert.equal(node.state.metadata[ANCHOR_KEY], a3.txHash);
+});
+
+test('validateAndSponsorSetMetadata enforces accountCredentials unconditionally and idle fast path invalidates on cleared "" witness', async () => {
+    const dir = makeTempDir();
+    const ownerSigner = await makeRealSigner(OWNER_A);
+    const witnessSigner = await makeRealSigner(WITNESS_1);
+
+    // 1. Unconditional verifySignature: missing accountCredentials rejects even with valid node mock
+    const bareNode = createWitnessMockNode({
+        owner: OWNER_A,
+        accountVerifyKeys: new Map(), // intentionally empty -> no accountCredentials/accountThreshold!
+    });
+    const tipEpochSec = Math.floor(bareNode.timeForHeight(bareNode.state.tipHeight) / 1000);
+    const bareAcc = await bareNode.getNextAccountNonce(ownerSigner.sender);
+    const built = await buildSignedSponsoredSetMetadata({
+        tokenId: TOKEN_ID,
+        key: ANCHOR_KEY,
+        valueUtf8: txHashFor('anchor-bare'),
+        who: ownerSigner,
+        sponsorAddress: WITNESS_1,
+        expectedNonce: BigInt(bareAcc.nonce.value),
+        expiryEpochSeconds: tipEpochSec + 300,
+        nodeClient: bareNode,
+    });
+    await assert.rejects(
+        () =>
+            validateAndSponsorSetMetadata({
+                transactionJson: built.transactionJson,
+                expectedOwner: OWNER_A,
+                expectedSponsor: WITNESS_1,
+                expectedTokenId: TOKEN_ID,
+                expectedKey: ANCHOR_KEY,
+                expectedValueUtf8: txHashFor('anchor-bare'),
+                sponsorSigner: witnessSigner,
+                nodeClient: bareNode,
+            }),
+        /missing credential keys/i,
+    );
+
+    // 2. Idle fast path invalidation across WITNESS_1 -> cleared "" -> cached -> WITNESS_2
+    let historyScans = 0;
+    const node = createWitnessMockNode({
+        owner: OWNER_A,
+        accountVerifyKeys: new Map([
+            [OWNER_A, ownerSigner.verifyKey],
+            [WITNESS_1, witnessSigner.verifyKey],
+        ]),
+    });
+    node.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: WITNESS_1 });
+    const baseGetEvents = node.getBlockTransactionEvents.bind(node);
+    node.getBlockTransactionEvents = async function* (bh) {
+        historyScans += 1;
+        yield* baseGetEvents(bh);
+    };
+
+    const srv = await startWitnessServer({
+        host: '127.0.0.1',
+        port: 0,
+        priceMicroCcd: '0',
+        signer: witnessSigner,
+        ledgerPath: path.join(dir, 'idle-ledger.json'),
+        nodeClient: node,
+        fetchCard: async () => node.card.bytes,
+        log: () => {},
+    });
+    cleanups.push(() => srv.close());
+
+    const { header, records } = makeTrailFixtures(1);
+    const trailPath = path.join(dir, 'idle.jsonl');
+    const statePath = path.join(dir, 'idle.state.json');
+    writeTrail(trailPath, header, records);
+
+    const worker = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath,
+        statePath,
+        everyRecords: 100, // won't trigger after seq 1 anchors with --once=false style; use once:true on tick 1
+        once: true,
+        nodeClient: node,
+        signer: ownerSigner,
+        witnessUrl: srv.url,
+        allowPrivateWitness: true,
+        source: () => [],
+        log: () => {},
+    });
+    // Anchor seq 1 while WITNESS_1 active
+    worker.everyRecords = 1;
+    await worker.tick();
+    worker.everyRecords = 100;
+    const scansAfterFirst = historyScans;
+
+    // Idle poll -> hits fast path (0 additional history scans)
+    await worker.tick();
+    assert.equal(historyScans, scansAfterFirst, 'idle poll should use cached _verifiedTip');
+
+    // Clear witness on-chain to "" -> idle fast path MUST invalidate and rescan history!
+    node.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: '' });
+    worker.witnessUrl = null;
+    await worker.tick();
+    assert.ok(historyScans > scansAfterFirst, 'clearing witness to "" must invalidate idle fast path cache');
+    const scansAfterClear = historyScans;
+
+    // Subsequent idle poll while cleared "" -> caches cleared witness and skips history scans again
+    await worker.tick();
+    assert.equal(historyScans, scansAfterClear, 'cleared witness "" should be safely cached on subsequent idle poll');
+
+    // Externally setting WITNESS_2 invalidates idle fast path cache even when witnessUrl is null!
+    node.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: WITNESS_2 });
+    await worker.tick();
+    assert.ok(historyScans > scansAfterClear, 'external witness activation must invalidate idle fast path even when witnessUrl is null');
 });

@@ -899,10 +899,13 @@ test('AnchorWorker aborts cleanly on concurrent pointer move, trail drift, alias
         let getMetaCalls = 0;
         const node = createMutableMockNode({
             onInvokeContract: (ctx) => {
-                if (ctx.method.value === 'CIS-8004.getMetadata') {
+                if (
+                    ctx.method.value === 'CIS-8004.getMetadata' &&
+                    Buffer.from(ctx.parameter.buffer).includes(Buffer.from('countersign.anchor'))
+                ) {
                     getMetaCalls += 1;
-                    // Calls 1=uuid, 2=anchor(tip), 3=latestBeforeAnchor
-                    if (getMetaCalls === 3) {
+                    // Calls on ANCHOR_KEY: 1=anchor(tip), 2=latestBeforeAnchor
+                    if (getMetaCalls === 2) {
                         return {
                             tag: 'success',
                             usedEnergy: { value: 1000n },
@@ -939,10 +942,13 @@ test('AnchorWorker aborts cleanly on concurrent pointer move, trail drift, alias
         let getMetaCalls = 0;
         const node = createMutableMockNode({
             onInvokeContract: (ctx) => {
-                if (ctx.method.value === 'CIS-8004.getMetadata') {
+                if (
+                    ctx.method.value === 'CIS-8004.getMetadata' &&
+                    Buffer.from(ctx.parameter.buffer).includes(Buffer.from('countersign.anchor'))
+                ) {
                     getMetaCalls += 1;
-                    // Calls 1=uuid, 2=anchor(tip), 3=latestBeforeAnchor, 4=latestBeforeSet
-                    if (getMetaCalls === 4) {
+                    // Calls on ANCHOR_KEY: 1=anchor(tip), 2=latestBeforeAnchor, 3=latestBeforeSet
+                    if (getMetaCalls === 3) {
                         return {
                             tag: 'success',
                             usedEnergy: { value: 1000n },

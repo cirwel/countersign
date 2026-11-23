@@ -583,7 +583,7 @@ export function isDisallowedIp(rawIp) {
 /**
  * Performs an SSRF-hardened HTTP(S) request without redirects, enforcing pre-connect public-IP DNS/literal guards,
  * streaming compressed and decompressed byte caps, and wall-clock timeout.
- * Plaintext http:// is refused unless allowPrivate === true.
+ * Plaintext http:// is refused unless both allowHttp === true and allowPrivate === true.
  */
 export async function safeHttpsRequest(
     uri,
@@ -594,6 +594,7 @@ export async function safeHttpsRequest(
         timeoutMs = 15000,
         maxBytes = 1048576,
         allowPrivate = false,
+        allowHttp = false,
         acceptStatus = (status) => status >= 200 && status < 300,
         lookupFn = dns.lookup,
         requestFn,
@@ -608,7 +609,7 @@ export async function safeHttpsRequest(
     } catch {
         throw new Error(`invalid ${urlLabel}: ${uri}`);
     }
-    const protocolAllowed = url.protocol === 'https:' || (allowPrivate && url.protocol === 'http:');
+    const protocolAllowed = url.protocol === 'https:' || (allowHttp && allowPrivate && url.protocol === 'http:');
     if (!protocolAllowed) {
         throw new Error(`refusing non-HTTPS ${urlLabel} protocol ${url.protocol}`);
     }
@@ -800,6 +801,7 @@ export async function safeJsonFetch(
         timeoutMs = 15000,
         maxBytes = 65536,
         allowPrivate = false,
+        allowHttp = false,
         acceptStatus = (status) => status >= 200 && status < 300,
         lookupFn = dns.lookup,
         requestFn,
@@ -823,6 +825,7 @@ export async function safeJsonFetch(
         timeoutMs,
         maxBytes,
         allowPrivate,
+        allowHttp,
         acceptStatus,
         lookupFn,
         requestFn,
@@ -860,6 +863,7 @@ export async function fetchAgentCard(
         timeoutMs,
         maxBytes,
         allowPrivate,
+        allowHttp: false,
         lookupFn,
         requestFn,
         ca,

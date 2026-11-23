@@ -96,7 +96,7 @@ node src/cli.mjs witness --witness-keyfile /path/to/witness-key.json --ledger /p
 
 ## What this proves, and what it does not
 
-- A passing check proves that the trail file is byte-for-byte the record that was committed at each anchor's block time, by the account that owns the registry entry.
+- A passing check proves that the trail file is byte-for-byte the record that was committed at each anchor's block time, by the account that owns the registry entry or its active `countersign.witness` at that point in the entry's metadata timeline.
 - It does not prove the record was true or complete before it was first anchored. I operate both the UNITARES server and the registry entry. The first anchor here was written after the fact, over records going back to 2 November.
 - The badge check proves registration, active status and card integrity (`SHA-256` and `concordium-badge/v1` binding). It is not an endorsement of the agent and involves no review of its behaviour.
 - The account that owns this entry was created with the testnet identity provider's placeholder identity. Nothing here links the agent to a real, identified owner.

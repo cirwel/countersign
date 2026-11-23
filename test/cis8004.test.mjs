@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
+import http from 'node:http';
 import https from 'node:https';
 import { test } from 'node:test';
 import zlib from 'node:zlib';
@@ -727,6 +728,27 @@ test('fetchAgentCard decodes gzip/br/deflate via real node:https and rejects zip
             () => fetchAgentCard(`${base}/zstd`, { allowPrivate: true, ca: cert }),
             /unsupported Content-Encoding: zstd/,
         );
+    } finally {
+        server.closeAllConnections?.();
+        await new Promise((resolve) => server.close(resolve));
+    }
+});
+
+test('fetchAgentCard rejects plain http:// URLs even when allowPrivate: true', async () => {
+    let hit = false;
+    const server = http.createServer((_req, res) => {
+        hit = true;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{}');
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address();
+    try {
+        await assert.rejects(
+            () => fetchAgentCard(`http://127.0.0.1:${port}/card.json`, { allowPrivate: true }),
+            /non-HTTPS/i,
+        );
+        assert.equal(hit, false, 'plain HTTP server must never be dialed by fetchAgentCard');
     } finally {
         server.closeAllConnections?.();
         await new Promise((resolve) => server.close(resolve));

@@ -277,6 +277,25 @@ export class PaymentLedger {
         return this.payments.get(paymentId) ?? null;
     }
 
+    assertNoEquivocation(binding, currentPaymentId = null) {
+        const normBinding = normalizeBinding(binding);
+        for (const e of this.payments.values()) {
+            if (currentPaymentId !== null && e.paymentId === currentPaymentId) continue;
+            if (e.status !== 'settled' && e.status !== 'broadcasted' && e.status !== 'committed') continue;
+            if (!isPlainObject(e.binding)) continue;
+            if (
+                String(e.binding.tokenId) === normBinding.tokenId &&
+                (e.binding.prevAnchorTx ?? null) === normBinding.prevAnchorTx
+            ) {
+                if (e.binding.toSeq !== normBinding.toSeq || e.binding.commitment !== normBinding.commitment) {
+                    throw conflictError(
+                        `equivocating anchor request for token ${normBinding.tokenId} at prevAnchorTx ${normBinding.prevAnchorTx ?? 'genesis'} (conflicts with ${e.status} ${e.paymentId})`,
+                    );
+                }
+            }
+        }
+    }
+
     claim(paymentId, binding) {
         if (typeof paymentId !== 'string' || paymentId.trim().length === 0) {
             throw new Error('paymentId must be a non-empty string');
@@ -293,11 +312,13 @@ export class PaymentLedger {
             }
             throw conflictError(`payment ${paymentId} is already ${existing.status}`);
         }
+        this.assertNoEquivocation(normBinding, paymentId);
         const now = new Date().toISOString();
         const entry = {
             paymentId,
             status: 'claimed',
             binding: normBinding,
+            settled: null,
             txHash: null,
             expiryEpochSeconds: null,
             result: null,
@@ -309,15 +330,30 @@ export class PaymentLedger {
         return { action: 'proceed', entry };
     }
 
+    markSettled(paymentId, settledInfo = {}) {
+        const entry = this.payments.get(paymentId);
+        if (!entry) throw new Error(`unknown paymentId ${paymentId} in markSettled`);
+        if (entry.status !== 'claimed' && entry.status !== 'settled') {
+            throw new Error(`cannot mark payment ${paymentId} settled from status ${entry.status}`);
+        }
+        this.assertNoEquivocation(entry.binding, paymentId);
+        entry.status = 'settled';
+        entry.settled = settledInfo ?? {};
+        entry.updatedAt = new Date().toISOString();
+        this._persist();
+        return entry;
+    }
+
     markBroadcast(paymentId, { txHash, expiryEpochSeconds = null } = {}) {
         const entry = this.payments.get(paymentId);
         if (!entry) throw new Error(`unknown paymentId ${paymentId} in markBroadcast`);
-        if (entry.status !== 'claimed') {
+        if (entry.status !== 'claimed' && entry.status !== 'settled') {
             throw new Error(`cannot mark payment ${paymentId} broadcast from status ${entry.status}`);
         }
         if (typeof txHash !== 'string' || !TX_RE.test(txHash)) {
             throw new Error(`invalid txHash in markBroadcast: ${txHash}`);
         }
+        this.assertNoEquivocation(entry.binding, paymentId);
         entry.status = 'broadcasted';
         entry.txHash = txHash;
         entry.expiryEpochSeconds = expiryEpochSeconds ?? null;
@@ -326,10 +362,21 @@ export class PaymentLedger {
         return entry;
     }
 
+    releaseBroadcastKeepSettled(paymentId) {
+        const entry = this.payments.get(paymentId);
+        if (!entry || entry.status !== 'broadcasted') return false;
+        entry.status = 'settled';
+        entry.txHash = null;
+        entry.expiryEpochSeconds = null;
+        entry.updatedAt = new Date().toISOString();
+        this._persist();
+        return true;
+    }
+
     commit(paymentId, result) {
         const entry = this.payments.get(paymentId);
         if (!entry) throw new Error(`unknown paymentId ${paymentId} in commit`);
-        if (entry.status !== 'claimed' && entry.status !== 'broadcasted') {
+        if (entry.status !== 'claimed' && entry.status !== 'settled' && entry.status !== 'broadcasted') {
             throw new Error(`cannot commit payment ${paymentId} from status ${entry.status}`);
         }
         if (!isPlainObject(result) || typeof result.txHash !== 'string' || !TX_RE.test(result.txHash)) {
@@ -461,18 +508,31 @@ export function createConcordiumTransferVerifier({ nodeClient, payTo, minAmountM
     const minAmount = BigInt(minAmountMicroCcd);
     if (minAmount < 0n) throw new Error(`minAmountMicroCcd must be non-negative, got ${minAmountMicroCcd}`);
 
+    const decodeAndValidateEnvelope = (header) => {
+        const decoded = typeof header === 'string' ? decodeX402Header(header, 'PAYMENT-SIGNATURE') : header;
+        if (!isPlainObject(decoded)) {
+            throw new Error('PAYMENT-SIGNATURE must decode to a JSON object');
+        }
+        if (decoded.x402Version !== X402_VERSION) {
+            throw new Error(`unsupported x402Version ${decoded.x402Version}; expected ${X402_VERSION}`);
+        }
+        const txHash = decoded.payload?.txHash;
+        if (typeof txHash !== 'string' || !TX_RE.test(txHash)) {
+            throw new Error('PAYMENT-SIGNATURE payload.txHash must be a 64-hex transaction hash');
+        }
+        return { decoded, txHash };
+    };
+
     return {
+        derivePaymentId(header) {
+            const { txHash } = decodeAndValidateEnvelope(header);
+            return `ccd:${txHash}`;
+        },
         async verify({ header, requirements, expectedMemoHex }) {
             if (typeof expectedMemoHex !== 'string' || !TX_RE.test(expectedMemoHex)) {
                 throw new Error('expectedMemoHex must be 64 lowercase hex characters');
             }
-            const decoded = typeof header === 'string' ? decodeX402Header(header, 'PAYMENT-SIGNATURE') : header;
-            if (!isPlainObject(decoded)) {
-                throw new Error('PAYMENT-SIGNATURE must decode to a JSON object');
-            }
-            if (decoded.x402Version !== X402_VERSION) {
-                throw new Error(`unsupported x402Version ${decoded.x402Version}; expected ${X402_VERSION}`);
-            }
+            const { decoded, txHash } = decodeAndValidateEnvelope(header);
             if (decoded.accepted !== undefined) {
                 if (!isPlainObject(decoded.accepted)) {
                     throw new Error('PAYMENT-SIGNATURE accepted field must be an object');
@@ -489,10 +549,6 @@ export function createConcordiumTransferVerifier({ nodeClient, payTo, minAmountM
             }
             if (requirements?.extra?.memoHex && requirements.extra.memoHex !== expectedMemoHex) {
                 throw new Error('requirements memoHex disagrees with expectedMemoHex');
-            }
-            const txHash = decoded.payload?.txHash;
-            if (typeof txHash !== 'string' || !TX_RE.test(txHash)) {
-                throw new Error('PAYMENT-SIGNATURE payload.txHash must be a 64-hex transaction hash');
             }
 
             const c = nodeClient ?? (await client());
@@ -525,7 +581,7 @@ export function createConcordiumTransferVerifier({ nodeClient, payTo, minAmountM
 
 /**
  * Verifies and settles an x402 `PAYMENT-SIGNATURE` via an external facilitator over SSRF-hardened HTTPS,
- * enforcing strict JSON responses, `isValid === true`, and `success === true`.
+ * separating `/verify` from `/settle` so the witness only settles after ledger claim and pre-broadcast checks.
  */
 export function createFacilitatorVerifier({
     facilitatorUrl,
@@ -537,35 +593,50 @@ export function createFacilitatorVerifier({
     ca,
 } = {}) {
     const baseUrl = normalizeBaseUrl(facilitatorUrl, 'facilitatorUrl');
+    const parsePayload = (header, requirements, expectedMemoHex) => {
+        const decoded = typeof header === 'string' ? decodeX402Header(header, 'PAYMENT-SIGNATURE') : header;
+        if (!isPlainObject(decoded)) {
+            throw new Error('PAYMENT-SIGNATURE must decode to a JSON object');
+        }
+        if (decoded.x402Version !== X402_VERSION) {
+            throw new Error(`unsupported x402Version ${decoded.x402Version}; expected ${X402_VERSION}`);
+        }
+        const paymentRequirements = isPlainObject(requirements) && Array.isArray(requirements.accepts)
+            ? requirements.accepts[0]
+            : requirements;
+        if (requirements !== undefined && !isPlainObject(paymentRequirements)) {
+            throw new Error('paymentRequirements object is required for facilitator verification');
+        }
+        if (expectedMemoHex && paymentRequirements?.extra?.memoHex && paymentRequirements.extra.memoHex !== expectedMemoHex) {
+            throw new Error('paymentRequirements memoHex disagrees with expectedMemoHex');
+        }
+        const paymentId = `facilitator:sha256:${crypto.createHash('sha256').update(canonical(decoded), 'utf8').digest('hex')}`;
+        return { decoded, paymentRequirements, paymentId };
+    };
+
     return {
-        async verify({ header, requirements, expectedMemoHex }) {
+        derivePaymentId(header) {
             const decoded = typeof header === 'string' ? decodeX402Header(header, 'PAYMENT-SIGNATURE') : header;
-            if (!isPlainObject(decoded)) {
-                throw new Error('PAYMENT-SIGNATURE must decode to a JSON object');
+            if (!isPlainObject(decoded) || decoded.x402Version !== X402_VERSION) {
+                throw new Error('invalid PAYMENT-SIGNATURE envelope');
             }
-            if (decoded.x402Version !== X402_VERSION) {
-                throw new Error(`unsupported x402Version ${decoded.x402Version}; expected ${X402_VERSION}`);
-            }
-            const paymentRequirements = isPlainObject(requirements) && Array.isArray(requirements.accepts)
-                ? requirements.accepts[0]
-                : requirements;
+            return `facilitator:sha256:${crypto.createHash('sha256').update(canonical(decoded), 'utf8').digest('hex')}`;
+        },
+        async verify({ header, requirements, expectedMemoHex }) {
+            const { decoded, paymentRequirements, paymentId } = parsePayload(header, requirements, expectedMemoHex);
             if (!isPlainObject(paymentRequirements)) {
                 throw new Error('paymentRequirements object is required for facilitator verification');
             }
-            if (expectedMemoHex && paymentRequirements.extra?.memoHex && paymentRequirements.extra.memoHex !== expectedMemoHex) {
-                throw new Error('paymentRequirements memoHex disagrees with expectedMemoHex');
-            }
-
             const reqBody = {
                 x402Version: X402_VERSION,
                 paymentPayload: decoded,
                 paymentRequirements,
             };
-
             const verifyRes = await safeJsonFetch(`${baseUrl}/verify`, {
                 method: 'POST',
                 body: reqBody,
                 allowPrivate,
+                allowHttp: Boolean(allowPrivate),
                 timeoutMs,
                 maxBytes,
                 lookupFn,
@@ -579,11 +650,27 @@ export function createFacilitatorVerifier({
                     `facilitator /verify rejected payment: ${verifyRes.data?.invalidReason ?? 'isValid !== true'}`,
                 );
             }
-
+            return {
+                paymentId,
+                payer: verifyRes.data.payer ?? null,
+                network: CONCORDIUM_TESTNET_CAIP2,
+            };
+        },
+        async settle({ header, requirements, expectedMemoHex }) {
+            const { decoded, paymentRequirements, paymentId } = parsePayload(header, requirements, expectedMemoHex);
+            if (!isPlainObject(paymentRequirements)) {
+                throw new Error('paymentRequirements object is required for facilitator settlement');
+            }
+            const reqBody = {
+                x402Version: X402_VERSION,
+                paymentPayload: decoded,
+                paymentRequirements,
+            };
             const settleRes = await safeJsonFetch(`${baseUrl}/settle`, {
                 method: 'POST',
                 body: reqBody,
                 allowPrivate,
+                allowHttp: Boolean(allowPrivate),
                 timeoutMs,
                 maxBytes,
                 lookupFn,
@@ -597,20 +684,16 @@ export function createFacilitatorVerifier({
                     `facilitator /settle failed: ${settleRes.data?.errorReason ?? 'success !== true'}`,
                 );
             }
-
             const network = typeof settleRes.data.network === 'string' && settleRes.data.network.length > 0
                 ? settleRes.data.network
                 : CONCORDIUM_TESTNET_CAIP2;
             const settledTx = typeof settleRes.data.transaction === 'string' && settleRes.data.transaction.length > 0
                 ? settleRes.data.transaction
                 : null;
-            const paymentId = settledTx
-                ? `facilitator:${network}:${settledTx}`
-                : `facilitator:sha256:${crypto.createHash('sha256').update(canonical(decoded), 'utf8').digest('hex')}`;
-
             return {
                 paymentId,
-                payer: settleRes.data.payer ?? verifyRes.data.payer ?? null,
+                payer: settleRes.data.payer ?? null,
+                transaction: settledTx,
                 txHash: settledTx,
                 network,
             };
@@ -631,6 +714,7 @@ export async function fetchWitnessHealth({
     const res = await safeJsonFetch(`${base}/health`, {
         method: 'GET',
         allowPrivate,
+        allowHttp: Boolean(allowPrivate),
         timeoutMs,
         maxBytes: 65536,
         lookupFn,
@@ -649,11 +733,28 @@ export async function fetchWitnessHealth({
     if (Number(d.registry?.index) !== REGISTRY.index || Number(d.registry?.subindex) !== REGISTRY.subindex) {
         throw new Error(`witness /health registry mismatch: ${JSON.stringify(d.registry)}`);
     }
-    assertCanonicalAccount(d.witnessAccount, 'witnessAccount');
-    return d;
+    const witnessAccount = assertCanonicalAccount(d.witnessAccount, 'witnessAccount');
+    const payTo = d.payTo !== undefined && d.payTo !== null ? assertCanonicalAccount(d.payTo, 'payTo') : witnessAccount;
+    let priceMicroCcd;
+    if (d.priceMicroCcd !== undefined && d.priceMicroCcd !== null) {
+        const ps = String(d.priceMicroCcd);
+        if (!/^(?:0|[1-9][0-9]*)$/.test(ps)) {
+            throw new Error(`witness /health invalid priceMicroCcd: ${d.priceMicroCcd}`);
+        }
+        priceMicroCcd = ps;
+    }
+    return {
+        ...d,
+        witnessAccount,
+        payTo,
+        ...(priceMicroCcd !== undefined ? { priceMicroCcd } : {}),
+    };
 }
 
-function validateAndParsePaymentRequired(rawHeader, { tokenId, toSeq, commitment, prevAnchorTx, expectedMemoHex }) {
+function validateAndParsePaymentRequired(
+    rawHeader,
+    { tokenId, toSeq, commitment, prevAnchorTx, expectedMemoHex, expectedPayTo, maxPriceMicroCcd, expectedWitnessAccount },
+) {
     if (typeof rawHeader !== 'string' || rawHeader.length === 0) {
         throw new Error('402 response missing PAYMENT-REQUIRED header');
     }
@@ -671,11 +772,27 @@ function validateAndParsePaymentRequired(rawHeader, { tokenId, toSeq, commitment
         throw new Error(`witness PAYMENT-REQUIRED offered no exact/${CONCORDIUM_TESTNET_CAIP2} payment option`);
     }
     assertCanonicalAccount(matched.payTo, 'payment requirement payTo');
+    if (expectedPayTo && !isSameAccount(matched.payTo, expectedPayTo)) {
+        throw new Error(`witness PAYMENT-REQUIRED payTo ${matched.payTo} does not match expected ${expectedPayTo}`);
+    }
     if (typeof matched.amount !== 'string' || !/^(?:0|[1-9][0-9]*)$/.test(matched.amount)) {
         throw new Error(`witness PAYMENT-REQUIRED invalid amount: ${matched.amount}`);
     }
+    if (maxPriceMicroCcd !== null && maxPriceMicroCcd !== undefined && BigInt(matched.amount) > BigInt(maxPriceMicroCcd)) {
+        throw new Error(`witness PAYMENT-REQUIRED amount ${matched.amount} exceeds maxPriceMicroCcd ${maxPriceMicroCcd}`);
+    }
     if (!isPlainObject(matched.extra) || matched.extra.memoHex !== expectedMemoHex) {
         throw new Error('witness PAYMENT-REQUIRED memoHex does not match locally computed anchor commitment memo');
+    }
+    if (expectedWitnessAccount) {
+        if (
+            typeof matched.extra.witnessAccount !== 'string' ||
+            !isSameAccount(matched.extra.witnessAccount, expectedWitnessAccount)
+        ) {
+            throw new Error(
+                `witness PAYMENT-REQUIRED extra.witnessAccount (${matched.extra.witnessAccount ?? 'missing'}) does not match expected ${expectedWitnessAccount}`,
+            );
+        }
     }
     if (matched.extra.tokenId !== undefined && String(matched.extra.tokenId) !== String(tokenId)) {
         throw new Error('witness PAYMENT-REQUIRED extra.tokenId mismatch');
@@ -704,8 +821,11 @@ export async function requestWitnessAnchor({
     prevAnchorTx = null,
     paymentSignature,
     payFn,
+    expectedPayTo = null,
+    maxPriceMicroCcd = null,
+    expectedWitnessAccount = null,
     allowPrivate = false,
-    timeoutMs = 30000,
+    timeoutMs = 210000,
     lookupFn,
     requestFn,
     ca,
@@ -721,6 +841,7 @@ export async function requestWitnessAnchor({
             headers: sigHeader ? { [HEADER_PAYMENT_SIGNATURE]: sigHeader } : {},
             body,
             allowPrivate,
+            allowHttp: Boolean(allowPrivate),
             timeoutMs,
             maxBytes: 65536,
             acceptStatus: (s) => (s >= 200 && s < 300) || s === 402 || (s >= 400 && s < 600),
@@ -745,6 +866,9 @@ export async function requestWitnessAnchor({
                 commitment,
                 prevAnchorTx,
                 expectedMemoHex,
+                expectedPayTo,
+                maxPriceMicroCcd,
+                expectedWitnessAccount,
             });
             if (typeof payFn !== 'function') {
                 throw new Error('witness returned 402 Payment Required and no payFn/paymentSignature was provided');
@@ -764,6 +888,9 @@ export async function requestWitnessAnchor({
         throw new Error('witness /v1/anchor response missing valid txHash');
     }
     assertCanonicalAccount(d.witnessAccount, 'witnessAccount');
+    if (expectedWitnessAccount && !isSameAccount(d.witnessAccount, expectedWitnessAccount)) {
+        throw new Error(`witness /v1/anchor response witnessAccount ${d.witnessAccount} does not match ${expectedWitnessAccount}`);
+    }
     if (d.tokenId !== undefined && String(d.tokenId) !== tid) {
         throw new Error('witness /v1/anchor response tokenId mismatch');
     }
@@ -814,6 +941,7 @@ export async function requestSponsoredPointer({
         method: 'POST',
         body: { tokenId: tid, anchorTxHash, transactionJson },
         allowPrivate,
+        allowHttp: Boolean(allowPrivate),
         timeoutMs,
         maxBytes: 65536,
         acceptStatus: (s) => (s >= 200 && s < 300) || (s >= 400 && s < 600),

@@ -45,15 +45,18 @@ import {
     canonicalStatePath,
     canonicalTrailPath,
     legacySidecarPath,
+    preparePointerUpdateAtTip,
     runAnchorWorker,
     tokenLockPath,
     trailFileMode,
     trailLockPath,
+    verifyWitnessAnchorOnChain,
     withFileLock,
     writeFileAtomic,
 } from './worker.mjs';
 import {
     X402_VERSION,
+    encodeX402Header,
     fetchWitnessHealth,
     requestSponsoredPointer,
     requestWitnessAnchor,
@@ -242,6 +245,11 @@ export const commands = {
                                 `pending anchor ${parsedState.pendingAnchor.txHash} exists in ${stateFile}; finish it with "countersign anchor --trail ${trail} --tx ${parsedState.pendingAnchor.txHash}" or "countersign watch --once" before broadcasting a new registerData`,
                             );
                         }
+                        if (parsedState?.pendingPayment) {
+                            throw new Error(
+                                `pending payment ${parsedState.pendingPayment.paymentTxHash} exists in ${stateFile}; finish it with "countersign watch --once" or reuse --payment-signature ${parsedState.pendingPayment.paymentSignature} before paying again`,
+                            );
+                        }
                     }
                 }
 
@@ -253,6 +261,9 @@ export const commands = {
 
                 const agent = await readAgentOf(tokenId, { blockHash: tipBlockHash, nodeClient: c });
                 if (!agent) throw new Error(`registry token ${tokenId} is not registered`);
+                if (agent.status !== undefined && agent.status !== 'Active') {
+                    throw new Error(`registry token ${tokenId} status is ${agent.status}`);
+                }
                 if (who.address !== agent.ownerAccount) {
                     throw new Error(
                         `signer ${who.address} must exactly match registered owner ${agent.ownerAccount} (CIS-8004.setMetadata rejects account aliases)`,
@@ -279,11 +290,28 @@ export const commands = {
                 });
                 if (prev && prev.toSeq >= count) throw new Error(`the latest anchor already covers seq ${prev.toSeq}; nothing new to anchor`);
 
+                const onChainWitness = await readMetadataText(tokenId, WITNESS_KEY, {
+                    blockHash: tipBlockHash,
+                    nodeClient: c,
+                });
+                const witnessState = extractWitnessState(history);
+                if (!witnessMatchesOnChain(witnessState, onChainWitness)) {
+                    throw new Error(
+                        `on-chain ${WITNESS_KEY} (${onChainWitness ?? 'null'}) disagrees with MetadataSet history (${witnessState.currentWitness ?? 'null'})`,
+                    );
+                }
+                const activeWitness = witnessState.currentWitness;
+
                 const acc = await withRpcRetry(() => c.getAccountInfo(who.sender, tipBlockHash));
                 const expectedAnchorNonce = BigInt(acc.accountNonce.value);
 
                 const witnessUrl = opts.witnessUrl ?? opts['witness-url'] ?? null;
                 const sponsorPointerOpt = resolveSponsorPointerOpt(opts, true);
+                const maxPriceMicroCcd = parseOptionalNonNegativeBigIntStr(
+                    opts.maxPriceMicroCcd ?? opts['max-price-micro-ccd'],
+                    '--max-price-micro-ccd',
+                    null,
+                );
                 const paymentSignature = opts.paymentSignature ?? opts['payment-signature'] ?? null;
                 const payerKeyfile =
                     opts.payerKeyfile ?? opts['payer-keyfile'] ?? opts.paymentKeyfile ?? opts['payment-keyfile'] ?? null;
@@ -292,20 +320,16 @@ export const commands = {
                 const reqWitnessAnchorFn = opts.requestWitnessAnchorFn ?? requestWitnessAnchor;
                 const reqSponsoredPointerFn = opts.requestSponsoredPointerFn ?? requestSponsoredPointer;
 
+                if (!tx && activeWitness !== null && !witnessUrl) {
+                    throw new Error(
+                        `token ${tokenId} has active ${WITNESS_KEY} (${activeWitness}); --witness-url is required and owner self-anchoring is disabled`,
+                    );
+                }
+
                 let witnessHealth = null;
                 if (witnessUrl) {
                     witnessHealth = await fetchHealthFn({ witnessUrl, allowPrivate: allowPrivateWitness });
-                    const onChainWitness = await readMetadataText(tokenId, WITNESS_KEY, {
-                        blockHash: tipBlockHash,
-                        nodeClient: c,
-                    });
-                    const witnessState = extractWitnessState(history);
-                    if (!witnessMatchesOnChain(witnessState, onChainWitness)) {
-                        throw new Error(
-                            `on-chain ${WITNESS_KEY} (${onChainWitness ?? 'null'}) disagrees with MetadataSet history (${witnessState.currentWitness ?? 'null'})`,
-                        );
-                    }
-                    if (onChainWitness === null || !isSameAccount(onChainWitness, witnessHealth.witnessAccount)) {
+                    if (activeWitness === null || !isSameAccount(activeWitness, witnessHealth.witnessAccount)) {
                         throw new Error(
                             `on-chain ${WITNESS_KEY} (${onChainWitness ?? 'not set'}) does not match witness ${witnessHealth.witnessAccount}`,
                         );
@@ -320,9 +344,9 @@ export const commands = {
                     if (!TX_RE.test(hash)) throw new Error('--tx must be a transaction hash');
                     const sent = await readRegisterData(hash, c);
                     const d = decodeAnchor(sent.data);
-                    const authorizedSender = witnessHealth?.witnessAccount ?? who.address;
+                    const authorizedSender = activeWitness ?? agent.ownerAccount;
                     const ok =
-                        (isSameAccount(sent.sender, authorizedSender) || isSameAccount(sent.sender, who.address)) &&
+                        isSameAccount(sent.sender, authorizedSender) &&
                         d.tokenId === tokenId &&
                         d.toSeq === count &&
                         d.commitment === last.toString('hex') &&
@@ -334,33 +358,97 @@ export const commands = {
                         throw new Error('countersign.anchor moved concurrently; refusing to overwrite pointer');
                     }
                     if (witnessUrl) {
+                        let finalizedPaymentSig = null;
+                        let finalizedPaymentHash = null;
                         const payFn = paymentSignature
                             ? null
                             : async (requirements) => {
+                                  const amount = BigInt(requirements.amount);
+                                  if (amount > 0n) {
+                                      if (maxPriceMicroCcd === null) {
+                                          throw new Error(
+                                              `refusing to auto-pay ${amount} microCCD without explicit --max-price-micro-ccd`,
+                                          );
+                                      }
+                                      if (amount > BigInt(maxPriceMicroCcd)) {
+                                          throw new Error(
+                                              `witness price ${amount} microCCD exceeds --max-price-micro-ccd ${maxPriceMicroCcd}`,
+                                          );
+                                      }
+                                      if (
+                                          witnessHealth?.priceMicroCcd === undefined ||
+                                          witnessHealth?.priceMicroCcd === null
+                                      ) {
+                                          throw new Error(
+                                              'witness /health did not advertise priceMicroCcd; refusing non-zero auto-payment',
+                                          );
+                                      }
+                                      if (amount > BigInt(witnessHealth.priceMicroCcd)) {
+                                          throw new Error(
+                                              `witness 402 amount ${amount} exceeds /health priceMicroCcd ${witnessHealth.priceMicroCcd}`,
+                                          );
+                                      }
+                                  }
                                   const pWho = opts.payerSigner ?? (payerKeyfile ? loadSignerFromFile(payerKeyfile) : who);
+                                  const nextPayerNonce = await withRpcRetry(() => c.getNextAccountNonce(pWho.sender));
+                                  if (!nextPayerNonce?.allFinal) {
+                                      throw new Error(
+                                          `payer account ${pWho.address} has non-finalized transactions; refusing witness payment`,
+                                      );
+                                  }
                                   const memoBytes = Buffer.from(requirements.extra.memoHex, 'hex');
                                   const payTx = await sendTransferWithMemo({
                                       to: requirements.payTo,
-                                      microCcd: BigInt(requirements.amount),
+                                      microCcd: amount,
                                       memoBytes,
                                       who: pWho,
                                       nodeClient: c,
+                                      expectedNonce: BigInt(nextPayerNonce.nonce.value),
+                                      onSigned: ({ txHash: pHash }) => {
+                                          console.log(`submitting witness payment ${requirements.amount} microCCD: ${EXPLORER_TX(pHash)}`);
+                                      },
                                   });
-                                  return {
+                                  const envelope = {
                                       x402Version: X402_VERSION,
                                       accepted: requirements,
                                       payload: { txHash: payTx.hash },
                                   };
+                                  finalizedPaymentSig = encodeX402Header(envelope);
+                                  finalizedPaymentHash = payTx.hash;
+                                  console.log(`paid witness fee ${requirements.amount} microCCD: ${EXPLORER_TX(payTx.hash)}`);
+                                  return envelope;
                               };
-                        const wRes = await reqWitnessAnchorFn({
-                            witnessUrl,
+                        let wRes;
+                        try {
+                            wRes = await reqWitnessAnchorFn({
+                                witnessUrl,
+                                tokenId,
+                                toSeq: count,
+                                commitment: last.toString('hex'),
+                                prevAnchorTx: prev?.txHash ?? null,
+                                paymentSignature,
+                                payFn,
+                                expectedPayTo: witnessHealth.payTo,
+                                maxPriceMicroCcd,
+                                expectedWitnessAccount: witnessHealth.witnessAccount,
+                                allowPrivate: allowPrivateWitness,
+                            });
+                        } catch (err) {
+                            if (finalizedPaymentSig) {
+                                console.error(
+                                    `witness request failed after payment ${finalizedPaymentHash} finalized; retry with --payment-signature ${finalizedPaymentSig}`,
+                                );
+                            }
+                            throw err;
+                        }
+                        await verifyWitnessAnchorOnChain({
+                            nodeClient: c,
+                            txHash: wRes.txHash,
+                            activeWitness,
                             tokenId,
                             toSeq: count,
-                            commitment: last.toString('hex'),
+                            commitmentHex: last.toString('hex'),
                             prevAnchorTx: prev?.txHash ?? null,
-                            paymentSignature,
-                            payFn,
-                            allowPrivate: allowPrivateWitness,
                         });
                         hash = wRes.txHash;
                         console.log(`witnessed seq 1..${count}: ${EXPLORER_TX(hash)}`);
@@ -371,18 +459,16 @@ export const commands = {
                     }
                 }
 
-                const latestBeforeSet = await readMetadataText(tokenId, ANCHOR_KEY, { nodeClient: c });
-                if (latestBeforeSet !== (prev?.txHash ?? null)) {
-                    throw new Error('countersign.anchor moved concurrently; refusing to overwrite pointer');
-                }
-                let expectedSetNonce;
-                if (witnessUrl) {
-                    const latestCs = await withRpcRetry(() => c.getConsensusStatus());
-                    const latestAcc = await withRpcRetry(() => c.getAccountInfo(who.sender, latestCs.lastFinalizedBlock));
-                    expectedSetNonce = BigInt(latestAcc.accountNonce.value);
-                } else {
-                    expectedSetNonce = tx ? expectedAnchorNonce : expectedAnchorNonce + 1n;
-                }
+                const preparedSet = await preparePointerUpdateAtTip({
+                    nodeClient: c,
+                    tokenId,
+                    signerSender: who.sender,
+                    expectedPrevTx: prev?.txHash ?? null,
+                    expectedOwnerAccount: agent.ownerAccount,
+                    expectedActiveWitness: activeWitness,
+                });
+                const expectedSetNonce =
+                    witnessUrl || tx ? preparedSet.expectedSetNonce : expectedAnchorNonce + 1n;
                 if (witnessUrl && sponsorPointerOpt && witnessHealth?.sponsorPointer) {
                     const built = await buildSignedSponsoredSetMetadata({
                         tokenId,
@@ -488,10 +574,18 @@ export const commands = {
         const allowPrivateFacilitator = Boolean(
             opts.allowPrivateFacilitator ?? opts['allow-private-facilitator'],
         );
+        const publicBaseUrl = opts.publicBaseUrl ?? opts['public-base-url'] ?? null;
+        const maxQueuedPerToken =
+            parseOptionalPositiveInt(
+                opts.maxQueuedPerToken ?? opts['max-queued-per-token'],
+                '--max-queued-per-token',
+            ) ?? 8;
 
         const handle = await startWitnessServer({
             host,
             port,
+            ...(publicBaseUrl ? { publicBaseUrl } : {}),
+            maxQueuedPerToken,
             priceMicroCcd,
             payTo,
             sponsorPointer,
@@ -759,6 +853,11 @@ export const commands = {
         const witnessUrl = opts.witnessUrl ?? opts['witness-url'] ?? null;
         const allowPrivateWitness = Boolean(opts.allowPrivateWitness ?? opts['allow-private-witness']);
         const sponsorPointer = resolveSponsorPointerOpt(opts, true);
+        const maxPriceMicroCcd = parseOptionalNonNegativeBigIntStr(
+            opts.maxPriceMicroCcd ?? opts['max-price-micro-ccd'],
+            '--max-price-micro-ccd',
+            null,
+        );
         const paymentSignature = opts.paymentSignature ?? opts['payment-signature'] ?? null;
         const payerKeyfile =
             opts.payerKeyfile ?? opts['payer-keyfile'] ?? opts.paymentKeyfile ?? opts['payment-keyfile'] ?? null;
@@ -806,6 +905,7 @@ export const commands = {
                 witnessUrl,
                 allowPrivateWitness,
                 sponsorPointer,
+                ...(maxPriceMicroCcd !== null ? { maxPriceMicroCcd } : {}),
                 paymentSignature,
                 payerKeyfile,
                 ...(opts.payFn ? { payFn: opts.payFn } : {}),
@@ -876,7 +976,10 @@ if (isMainEntry()) {
         'host',
         'port',
         'price-micro-ccd',
+        'max-price-micro-ccd',
         'pay-to',
+        'public-base-url',
+        'max-queued-per-token',
         'facilitator-url',
         'payment-signature',
         'payer-keyfile',

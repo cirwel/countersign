@@ -50,6 +50,7 @@ import {
 } from './trail.mjs';
 import {
     X402_VERSION,
+    encodeX402Header,
     fetchWitnessHealth,
     requestSponsoredPointer,
     requestWitnessAnchor,
@@ -203,11 +204,10 @@ function writeLockTempFile(lockPath, lockBody) {
 
 /**
  * Acquires an exclusive lockfile via fsynced temp file + atomic linkSync publish and mutually
- * exclusive stale-PID takeover, running `fn` and releasing in `finally`.
+ * exclusive stale-PID takeover, returning an idempotent async release function.
  */
-export async function withFileLock(
+export async function acquireFileLock(
     lockPath,
-    fn,
     { wallClock = () => new Date(), hostname = os.hostname(), takeoverStaleMs = 10_000 } = {},
 ) {
     fs.mkdirSync(path.dirname(lockPath), { recursive: true });
@@ -334,9 +334,10 @@ export async function withFileLock(
         }
     }
 
-    try {
-        return await fn();
-    } finally {
+    let released = false;
+    return async () => {
+        if (released) return;
+        released = true;
         try {
             if (fs.readFileSync(lockPath, 'utf8') === acquired) {
                 fs.unlinkSync(lockPath);
@@ -344,6 +345,22 @@ export async function withFileLock(
         } catch (err) {
             if (err?.code !== 'ENOENT') throw err;
         }
+    };
+}
+
+/**
+ * Acquires an exclusive lockfile via `acquireFileLock`, running `fn` and releasing in `finally`.
+ */
+export async function withFileLock(
+    lockPath,
+    fn,
+    opts = {},
+) {
+    const release = await acquireFileLock(lockPath, opts);
+    try {
+        return await fn();
+    } finally {
+        await release();
     }
 }
 
@@ -409,6 +426,100 @@ function isTxRefObj(v) {
 }
 
 /**
+ * Verifies a witness-submitted `registerData` transaction directly on-chain before committing
+ * local pendingAnchor state or updating `countersign.anchor`.
+ */
+export async function verifyWitnessAnchorOnChain({
+    nodeClient,
+    txHash,
+    activeWitness,
+    tokenId,
+    toSeq,
+    commitmentHex,
+    prevAnchorTx,
+}) {
+    if (!TX_RE.test(txHash ?? '')) {
+        throw new Error(`witness returned invalid txHash: ${txHash}`);
+    }
+    const rd = await readRegisterData(txHash, nodeClient);
+    if (!isSameAccount(rd.sender, activeWitness)) {
+        throw new Error(
+            `witness registerData tx ${txHash} sender ${rd.sender} does not match active countersign.witness ${activeWitness}`,
+        );
+    }
+    const decoded = decodeAnchor(rd.data);
+    if (
+        decoded.tokenId !== String(tokenId) ||
+        decoded.toSeq !== toSeq ||
+        decoded.commitment !== commitmentHex ||
+        decoded.prevAnchorTx !== prevAnchorTx
+    ) {
+        throw new Error(
+            `witness registerData tx ${txHash} payload (${JSON.stringify(decoded)}) does not match expected anchor (tokenId=${tokenId}, toSeq=${toSeq}, commitment=${commitmentHex}, prevAnchorTx=${prevAnchorTx})`,
+        );
+    }
+    return { rd, decoded };
+}
+
+/**
+ * Pins one finalized block (`setTipHash`), re-verifies token active status, unchanged owner,
+ * `countersign.anchor === expectedPrevTx`, and `countersign.witness` alignment, then derives
+ * `expectedSetNonce` for `signerSender` from that same finalized block.
+ */
+export async function preparePointerUpdateAtTip({
+    nodeClient,
+    tokenId,
+    signerSender,
+    expectedPrevTx,
+    expectedOwnerAccount,
+    expectedActiveWitness = null,
+}) {
+    const cs = await withRpcRetry(() => nodeClient.getConsensusStatus());
+    const setTipHash = cs.lastFinalizedBlock;
+    const setAgent = await readAgentOf(tokenId, { blockHash: setTipHash, nodeClient });
+    if (!setAgent) {
+        throw new Error(`registry token ${tokenId} is not registered`);
+    }
+    if (setAgent.status !== 'Active') {
+        throw new Error(
+            `registry token ${tokenId} status is ${setAgent.status ?? 'unknown'}; refusing pointer update`,
+        );
+    }
+    if (setAgent.ownerAccount !== expectedOwnerAccount) {
+        throw new Error(
+            `registry token ${tokenId} owner changed from ${expectedOwnerAccount} to ${setAgent.ownerAccount}; refusing pointer update`,
+        );
+    }
+    const latestBeforeSet = await readMetadataText(tokenId, ANCHOR_KEY, {
+        blockHash: setTipHash,
+        nodeClient,
+    });
+    if (latestBeforeSet !== expectedPrevTx) {
+        throw new Error('countersign.anchor moved concurrently; refusing to overwrite pointer');
+    }
+    const onChainWitnessAtSet = await readMetadataText(tokenId, WITNESS_KEY, {
+        blockHash: setTipHash,
+        nodeClient,
+    });
+    if (!witnessMatchesOnChain({ currentWitness: expectedActiveWitness }, onChainWitnessAtSet)) {
+        throw new Error(
+            `countersign.witness changed concurrently (expected ${expectedActiveWitness ?? 'none'}, got ${onChainWitnessAtSet ?? 'none'}); refusing pointer update`,
+        );
+    }
+    const accForSet = await withRpcRetry(() => nodeClient.getAccountInfo(signerSender, setTipHash));
+    return {
+        setTipHash,
+        agent: setAgent,
+        onChainWitness: onChainWitnessAtSet,
+        expectedSetNonce: BigInt(accForSet.accountNonce.value),
+    };
+}
+
+function normalizeWitnessBaseUrl(urlStr) {
+    return String(urlStr).trim().replace(/\/+$/, '');
+}
+
+/**
  * Stream-driven worker that incrementally syncs UNITARES checkpoints into a canonical trail file
  * and submits crash-recoverable Concordium testnet anchors when configured thresholds are reached.
  */
@@ -441,6 +552,7 @@ export class AnchorWorker {
             witnessUrl = null,
             allowPrivateWitness = false,
             sponsorPointer,
+            maxPriceMicroCcd = null,
             paymentSignature = null,
             payFn = null,
             payerSigner = null,
@@ -534,6 +646,16 @@ export class AnchorWorker {
             throw new TypeError('sponsorPointer must be a boolean');
         }
         this.sponsorPointer = sponsorPointer === undefined ? true : sponsorPointer;
+        if (maxPriceMicroCcd !== null && maxPriceMicroCcd !== undefined) {
+            const mpStr =
+                typeof maxPriceMicroCcd === 'bigint' ? maxPriceMicroCcd.toString() : String(maxPriceMicroCcd).trim();
+            if (!/^(?:0|[1-9][0-9]*)$/.test(mpStr)) {
+                throw new Error(`maxPriceMicroCcd must be a non-negative integer, got ${maxPriceMicroCcd}`);
+            }
+            this.maxPriceMicroCcd = mpStr;
+        } else {
+            this.maxPriceMicroCcd = null;
+        }
         this.paymentSignature = paymentSignature ?? null;
         this.payFn = payFn ?? null;
         this.payerSigner = payerSigner ?? null;
@@ -646,6 +768,34 @@ export class AnchorWorker {
                 throw new Error(`corrupt pendingAnchor.metadataTx in ${targetStatePath}`);
             }
         }
+        if (parsed.pendingPayment !== undefined && parsed.pendingPayment !== null) {
+            const pp = parsed.pendingPayment;
+            if (
+                typeof pp !== 'object' ||
+                Array.isArray(pp) ||
+                typeof pp.witnessUrl !== 'string' ||
+                pp.witnessUrl.trim().length === 0 ||
+                (pp.tokenId !== undefined && String(pp.tokenId) !== this.tokenId) ||
+                !Number.isSafeInteger(pp.toSeq) ||
+                pp.toSeq <= 0 ||
+                !TX_RE.test(pp.commitment ?? '') ||
+                (pp.prevAnchorTx !== null && !TX_RE.test(pp.prevAnchorTx ?? '')) ||
+                !TX_RE.test(pp.memoHex ?? '') ||
+                !TX_RE.test(pp.paymentTxHash ?? '') ||
+                (pp.expiryEpochSeconds !== undefined &&
+                    pp.expiryEpochSeconds !== null &&
+                    (!Number.isFinite(pp.expiryEpochSeconds) || pp.expiryEpochSeconds < 0)) ||
+                typeof pp.paymentSignature !== 'string' ||
+                pp.paymentSignature.length === 0 ||
+                (pp.payer !== undefined && pp.payer !== null && typeof pp.payer !== 'string') ||
+                (pp.amountMicroCcd !== undefined &&
+                    pp.amountMicroCcd !== null &&
+                    !/^(?:0|[1-9][0-9]*)$/.test(String(pp.amountMicroCcd))) ||
+                (pp.status !== 'signed' && pp.status !== 'finalized')
+            ) {
+                throw new Error(`corrupt pendingPayment in ${targetStatePath}`);
+            }
+        }
         if (parsed.trailAppend !== undefined && parsed.trailAppend !== null) {
             const ta = parsed.trailAppend;
             if (
@@ -673,6 +823,7 @@ export class AnchorWorker {
             lastAnchoredCommitment: null,
             lastAnchoredAt: null,
             pendingAnchor: null,
+            pendingPayment: null,
             trailAppend: null,
             ...current,
             ...patch,
@@ -868,11 +1019,22 @@ export class AnchorWorker {
         }
     }
 
-    _syncTipFromAnchor(anchorRecord, agentOwnerAccount, witnessAccount = null) {
+    _syncTipFromAnchor(anchorRecord, agentOwnerAccount, witnessStateOrAccount = null) {
+        const witnessState =
+            witnessStateOrAccount && typeof witnessStateOrAccount === 'object'
+                ? {
+                      currentWitness: witnessStateOrAccount.currentWitness ?? null,
+                      sawWitnessEvent: Boolean(witnessStateOrAccount.sawWitnessEvent),
+                  }
+                : {
+                      currentWitness: witnessStateOrAccount ?? null,
+                      sawWitnessEvent: witnessStateOrAccount !== null && witnessStateOrAccount !== undefined,
+                  };
         this._verifiedTip = {
             pointer: anchorRecord?.txHash ?? null,
             ownerAccount: agentOwnerAccount,
-            witnessAccount,
+            witnessAccount: witnessState.currentWitness,
+            sawWitnessEvent: witnessState.sawWitnessEvent,
             anchoredSeq: anchorRecord?.toSeq ?? 0,
             anchoredCommitment: anchorRecord?.commitment ?? null,
         };
@@ -881,24 +1043,28 @@ export class AnchorWorker {
         }
     }
 
-    async _verifyWitnessAlignment({ c, tipBlockHash, agent, history }) {
+    async _verifyWitnessAlignment({ c, tipBlockHash, agent, history, onChainWitness }) {
         const health = await this.fetchWitnessHealthFn({
             witnessUrl: this.witnessUrl,
             allowPrivate: this.allowPrivateWitness,
         });
-        const onChainWitness = await readMetadataText(this.tokenId, WITNESS_KEY, {
-            blockHash: tipBlockHash,
-            nodeClient: c,
-        });
+        const actualWitness =
+            onChainWitness !== undefined
+                ? onChainWitness
+                : await readMetadataText(this.tokenId, WITNESS_KEY, {
+                      blockHash: tipBlockHash,
+                      nodeClient: c,
+                  });
         const witnessState = extractWitnessState(history);
-        if (!witnessMatchesOnChain(witnessState, onChainWitness)) {
+        if (!witnessMatchesOnChain(witnessState, actualWitness)) {
             throw new Error(
-                `on-chain ${WITNESS_KEY} (${onChainWitness ?? 'null'}) disagrees with MetadataSet history (${witnessState.currentWitness ?? 'null'})`,
+                `on-chain ${WITNESS_KEY} (${actualWitness ?? 'null'}) disagrees with MetadataSet history (${witnessState.currentWitness ?? 'null'})`,
             );
         }
-        if (onChainWitness === null || !isSameAccount(onChainWitness, health.witnessAccount)) {
+        const activeWitness = witnessState.currentWitness;
+        if (activeWitness === null || !isSameAccount(activeWitness, health.witnessAccount)) {
             throw new Error(
-                `on-chain ${WITNESS_KEY} (${onChainWitness ?? 'not set'}) does not match witness ${health.witnessAccount}`,
+                `on-chain ${WITNESS_KEY} (${actualWitness ?? 'not set'}) does not match witness ${health.witnessAccount}`,
             );
         }
         if (isSameAccount(health.witnessAccount, agent.ownerAccount)) {
@@ -906,25 +1072,96 @@ export class AnchorWorker {
         }
         return {
             health,
-            onChainWitness,
+            onChainWitness: actualWitness,
             witnessState,
+            activeWitness,
             useSponsoredPointer: this.sponsorPointer && Boolean(health.sponsorPointer),
         };
     }
 
-    _buildWitnessPayFn(c, ownerSigner) {
+    _buildWitnessPayFn(c, ownerSigner, witnessCtx, paymentMeta, resolvedPayer = null) {
         if (this.payFn) return this.payFn;
         if (this.paymentSignature) return null;
         return async (requirements) => {
-            const pWho = this.payerSigner ?? (this.payerKeyfile ? loadSignerFromFile(this.payerKeyfile) : ownerSigner);
+            const amount = BigInt(requirements.amount);
+            if (amount > 0n) {
+                if (this.maxPriceMicroCcd === null) {
+                    throw new Error(`refusing to auto-pay ${amount} microCCD without explicit maxPriceMicroCcd`);
+                }
+                if (amount > BigInt(this.maxPriceMicroCcd)) {
+                    throw new Error(
+                        `witness price ${amount} microCCD exceeds maxPriceMicroCcd ${this.maxPriceMicroCcd}`,
+                    );
+                }
+                if (
+                    witnessCtx?.health?.priceMicroCcd === undefined ||
+                    witnessCtx?.health?.priceMicroCcd === null
+                ) {
+                    throw new Error('witness /health did not advertise priceMicroCcd; refusing non-zero auto-payment');
+                }
+                if (amount > BigInt(witnessCtx.health.priceMicroCcd)) {
+                    throw new Error(
+                        `witness 402 amount ${amount} exceeds /health priceMicroCcd ${witnessCtx.health.priceMicroCcd}`,
+                    );
+                }
+            }
+
+            const pWho =
+                resolvedPayer ??
+                this.payerSigner ??
+                (this.payerKeyfile ? loadSignerFromFile(this.payerKeyfile) : ownerSigner);
+            const nextNonce = await withRpcRetry(() => c.getNextAccountNonce(pWho.sender));
+            if (!nextNonce?.allFinal) {
+                throw new Error(`payer account ${pWho.address} has non-finalized transactions; refusing witness payment`);
+            }
+            const expectedPayerNonce = BigInt(nextNonce.nonce.value);
             const memoBytes = Buffer.from(requirements.extra.memoHex, 'hex');
-            const txRes = await sendTransferWithMemo({
-                to: requirements.payTo,
-                microCcd: BigInt(requirements.amount),
-                memoBytes,
-                who: pWho,
-                nodeClient: c,
-            });
+            let savedPendingPayment = null;
+
+            let txRes;
+            try {
+                txRes = await sendTransferWithMemo({
+                    to: requirements.payTo,
+                    microCcd: amount,
+                    memoBytes,
+                    who: pWho,
+                    nodeClient: c,
+                    expectedNonce: expectedPayerNonce,
+                    onSigned: ({ txHash: paymentTxHash, expiryEpochSeconds }) => {
+                        const envelope = {
+                            x402Version: X402_VERSION,
+                            accepted: requirements,
+                            payload: { txHash: paymentTxHash },
+                        };
+                        savedPendingPayment = {
+                            witnessUrl: normalizeWitnessBaseUrl(this.witnessUrl),
+                            tokenId: this.tokenId,
+                            toSeq: paymentMeta.toSeq,
+                            commitment: paymentMeta.commitment,
+                            prevAnchorTx: paymentMeta.prevAnchorTx,
+                            memoHex: requirements.extra.memoHex,
+                            paymentTxHash,
+                            expiryEpochSeconds,
+                            paymentSignature: encodeX402Header(envelope),
+                            payer: pWho.address,
+                            amountMicroCcd: String(requirements.amount),
+                            status: 'signed',
+                        };
+                        this._updateState({ pendingPayment: savedPendingPayment });
+                    },
+                });
+            } catch (err) {
+                if (/was rejected:/.test(err.message)) {
+                    this._updateState({ pendingPayment: null });
+                }
+                throw err;
+            }
+            if (savedPendingPayment) {
+                this._updateState({
+                    pendingPayment: { ...savedPendingPayment, status: 'finalized' },
+                });
+            }
+            this.log(`paid witness fee ${requirements.amount} microCCD: ${EXPLORER_TX(txRes.hash)}`);
             return {
                 x402Version: X402_VERSION,
                 accepted: requirements,
@@ -938,15 +1175,25 @@ export class AnchorWorker {
         signer,
         anchorTxHash,
         expectedPrevTx,
-        expectedSetNonce,
+        expectedOwnerAccount,
+        expectedActiveWitness,
+        expectedSetNonce = null,
         witnessCtx,
         getPending,
         setPending,
     }) {
-        const latestBeforeSet = await readMetadataText(this.tokenId, ANCHOR_KEY, { nodeClient: c });
-        if (latestBeforeSet !== expectedPrevTx) {
-            throw new Error('countersign.anchor moved concurrently; refusing to overwrite pointer');
-        }
+        const prepared = await preparePointerUpdateAtTip({
+            nodeClient: c,
+            tokenId: this.tokenId,
+            signerSender: signer.sender,
+            expectedPrevTx,
+            expectedOwnerAccount,
+            expectedActiveWitness,
+        });
+        const resolvedSetNonce =
+            expectedSetNonce !== null && expectedSetNonce !== undefined
+                ? expectedSetNonce
+                : prepared.expectedSetNonce;
 
         if (witnessCtx?.useSponsoredPointer) {
             const built = await this.buildSponsoredSetMetadataFn({
@@ -955,7 +1202,7 @@ export class AnchorWorker {
                 valueUtf8: anchorTxHash,
                 who: signer,
                 sponsorAddress: witnessCtx.health.witnessAccount,
-                expectedNonce: expectedSetNonce,
+                expectedNonce: resolvedSetNonce,
                 nodeClient: c,
             });
             const preSponsorPending = {
@@ -1006,7 +1253,7 @@ export class AnchorWorker {
         };
         const res = await this.setMetadata(this.tokenId, ANCHOR_KEY, anchorTxHash, signer, c, {
             onSigned: onMetadataSigned,
-            expectedNonce: expectedSetNonce,
+            expectedNonce: resolvedSetNonce,
         });
         return { hash: res?.hash ?? null, sponsored: false };
     }
@@ -1036,6 +1283,7 @@ export class AnchorWorker {
             if (freshCurrent !== null && !TX_RE.test(freshCurrent)) {
                 throw new Error(`metadata ${ANCHOR_KEY} is not a transaction hash`);
             }
+            const freshWitness = await readMetadataText(this.tokenId, WITNESS_KEY, { blockHash: freshBh, nodeClient: c });
             const freshHistory = await readRegistryHistory(this.tokenId, {
                 tipBlockHash: freshBh,
                 tipBlockHeight: freshHeight,
@@ -1043,6 +1291,12 @@ export class AnchorWorker {
                 hintAnchorTxHashes: freshCurrent ? [freshCurrent] : [],
                 nodeClient: c,
             });
+            const freshWitnessState = extractWitnessState(freshHistory);
+            if (!witnessMatchesOnChain(freshWitnessState, freshWitness)) {
+                throw new Error(
+                    `on-chain ${WITNESS_KEY} (${freshWitness ?? 'null'}) disagrees with MetadataSet history (${freshWitnessState.currentWitness ?? 'null'})`,
+                );
+            }
             const freshExisting = await loadAnchorsFromHistory(freshHistory, c, freshHeight);
             const freshPrev = verifyExistingAnchors(freshExisting, {
                 tokenId: this.tokenId,
@@ -1055,6 +1309,8 @@ export class AnchorWorker {
                 tipBlockHeight: freshHeight,
                 agent: freshAgent,
                 current: freshCurrent,
+                onChainWitness: freshWitness,
+                witnessState: freshWitnessState,
                 history: freshHistory,
                 existing: freshExisting,
                 prev: freshPrev,
@@ -1085,22 +1341,26 @@ export class AnchorWorker {
         const localSeq = this.trail.lastSeq;
         const noThresholds = this.everyRecords === null && this.everySeconds === null;
 
-        // Idle-poll fast path: verify cached pointer, owner, witness (if configured), commitment, and !due before skipping history scans.
+        // Idle-poll fast path: verify cached pointer, owner, witness (always), commitment, and !due before skipping history scans.
         if (
             this._verifiedTip !== null &&
             !state?.pendingAnchor &&
+            !state?.pendingPayment &&
             current === this._verifiedTip.pointer &&
             agent.ownerAccount === this._verifiedTip.ownerAccount &&
             localSeq >= this._verifiedTip.anchoredSeq
         ) {
-            let idleWitnessMatches = true;
-            if (this.witnessUrl) {
-                const currentWitness = await readMetadataText(this.tokenId, WITNESS_KEY, {
-                    blockHash: tipBlockHash,
-                    nodeClient: c,
-                });
-                idleWitnessMatches = currentWitness === this._verifiedTip.witnessAccount;
-            }
+            const currentWitness = await readMetadataText(this.tokenId, WITNESS_KEY, {
+                blockHash: tipBlockHash,
+                nodeClient: c,
+            });
+            const idleWitnessMatches = witnessMatchesOnChain(
+                {
+                    currentWitness: this._verifiedTip.witnessAccount,
+                    sawWitnessEvent: this._verifiedTip.sawWitnessEvent,
+                },
+                currentWitness,
+            );
             const cachedAnchoredSeq = this._verifiedTip.anchoredSeq;
             const cachedCommitmentMatches =
                 cachedAnchoredSeq === 0
@@ -1129,6 +1389,10 @@ export class AnchorWorker {
             }
         }
 
+        let onChainWitness = await readMetadataText(this.tokenId, WITNESS_KEY, {
+            blockHash: tipBlockHash,
+            nodeClient: c,
+        });
         let history = await readRegistryHistory(this.tokenId, {
             tipBlockHash,
             tipBlockHeight,
@@ -1136,6 +1400,12 @@ export class AnchorWorker {
             hintAnchorTxHashes: current ? [current] : [],
             nodeClient: c,
         });
+        let witnessStateAtTip = extractWitnessState(history);
+        if (!witnessMatchesOnChain(witnessStateAtTip, onChainWitness)) {
+            throw new Error(
+                `on-chain ${WITNESS_KEY} (${onChainWitness ?? 'null'}) disagrees with MetadataSet history (${witnessStateAtTip.currentWitness ?? 'null'})`,
+            );
+        }
         let existing = await loadAnchorsFromHistory(history, c, tipBlockHeight);
         let prev = verifyExistingAnchors(existing, {
             tokenId: this.tokenId,
@@ -1147,8 +1417,7 @@ export class AnchorWorker {
             this._seedLastAnchorMs(prev.blockTime);
             this._lastSeenAnchorTxHash = prev.txHash;
         }
-        let witnessStateAtTip = extractWitnessState(history);
-        this._syncTipFromAnchor(prev, agent.ownerAccount, witnessStateAtTip.currentWitness);
+        this._syncTipFromAnchor(prev, agent.ownerAccount, witnessStateAtTip);
 
         let remainingOwnerBudget = history.maxOwnerTxs - history.ownerNonceSpan;
         let resumedPendingOnThisTick = false;
@@ -1159,6 +1428,8 @@ export class AnchorWorker {
             tipBlockHeight = snap.tipBlockHeight;
             agent = snap.agent;
             current = snap.current;
+            onChainWitness = snap.onChainWitness;
+            witnessStateAtTip = snap.witnessState;
             history = snap.history;
             existing = snap.existing;
             prev = snap.prev;
@@ -1171,8 +1442,7 @@ export class AnchorWorker {
                     this._lastSeenAnchorTxHash = prev.txHash;
                 }
             }
-            witnessStateAtTip = extractWitnessState(history);
-            this._syncTipFromAnchor(prev, agent.ownerAccount, witnessStateAtTip.currentWitness);
+            this._syncTipFromAnchor(prev, agent.ownerAccount, witnessStateAtTip);
         };
 
         if (state?.pendingAnchor) {
@@ -1425,7 +1695,7 @@ export class AnchorWorker {
                         const d = decodeAnchor(rd.data);
                         const expectedPrevTx = prev?.txHash ?? null;
                         const expectedCommitment = this.trail.commitmentsBySeq.get(d.toSeq)?.toString('hex');
-                        const activeWitness = extractWitnessState(history).currentWitness;
+                        const activeWitness = witnessStateAtTip.currentWitness;
                         const expectedAnchorSender = activeWitness ?? agent.ownerAccount;
                         const integrityOk =
                             d.tokenId === this.tokenId &&
@@ -1493,20 +1763,23 @@ export class AnchorWorker {
                             }
 
                             const witnessCtx = this.witnessUrl
-                                ? await this._verifyWitnessAlignment({ c, tipBlockHash, agent, history })
+                                ? await this._verifyWitnessAlignment({
+                                      c,
+                                      tipBlockHash,
+                                      agent,
+                                      history,
+                                      onChainWitness,
+                                  })
                                 : null;
-                            const setNonceBlockHash = this.witnessUrl
-                                ? (await withRpcRetry(() => c.getConsensusStatus())).lastFinalizedBlock
-                                : tipBlockHash;
-                            const accForSet = await withRpcRetry(() => c.getAccountInfo(signer.sender, setNonceBlockHash));
-                            const expectedSetNonce = BigInt(accForSet.accountNonce.value);
 
                             await this._submitPointerUpdate({
                                 c,
                                 signer,
                                 anchorTxHash: pending.txHash,
                                 expectedPrevTx,
-                                expectedSetNonce,
+                                expectedOwnerAccount: agent.ownerAccount,
+                                expectedActiveWitness: activeWitness,
+                                expectedSetNonce: null,
                                 witnessCtx,
                                 getPending: () => pending,
                                 setPending: (nextP) => {
@@ -1530,6 +1803,214 @@ export class AnchorWorker {
             }
         }
 
+        let pendingPayment = this._readState()?.pendingPayment ?? null;
+        let resumedWitnessPaymentTxHash = null;
+        if (pendingPayment) {
+            const currentPrevTx = prev?.txHash ?? null;
+            const currentAnchoredSeq = prev?.toSeq ?? 0;
+            if (currentPrevTx !== pendingPayment.prevAnchorTx || currentAnchoredSeq >= pendingPayment.toSeq) {
+                this.log(
+                    `orphaned pending payment ${pendingPayment.paymentTxHash} (seq 1..${pendingPayment.toSeq}) superseded by chain pointer ${currentPrevTx ?? 'none'} (seq ${currentAnchoredSeq}); clearing pendingPayment`,
+                );
+                if (!this.dryRun) this._updateState({ pendingPayment: null });
+                pendingPayment = null;
+            } else {
+                const expectedPayCommitment = this.trail.commitmentsBySeq.get(pendingPayment.toSeq)?.toString('hex');
+                if (pendingPayment.toSeq > localSeq || expectedPayCommitment !== pendingPayment.commitment) {
+                    throw new Error(
+                        `pending payment ${pendingPayment.paymentTxHash} disagrees with current trail state; refusing to resume`,
+                    );
+                }
+                let ppStatus = await getTransactionState(pendingPayment.paymentTxHash, c);
+                if (ppStatus.state === 'absent') {
+                    const tipBlock = await withRpcRetry(() => c.getBlockInfo(tipBlockHash));
+                    const finalizedChainEpochSec = Math.floor(tipBlock.blockSlotTime.getTime() / 1000);
+                    if (finalizedChainEpochSec <= (pendingPayment.expiryEpochSeconds ?? Infinity)) {
+                        throw new Error(
+                            `pending payment tx ${pendingPayment.paymentTxHash} in-flight/ambiguous until finalized chain time passes expiry ${pendingPayment.expiryEpochSeconds ?? 'unknown'} (chain=${finalizedChainEpochSec})`,
+                        );
+                    }
+                    ppStatus = await getTransactionState(pendingPayment.paymentTxHash, c);
+                    if (ppStatus.state === 'absent') {
+                        this.log(
+                            `pending payment tx ${pendingPayment.paymentTxHash} expired at chain time ${finalizedChainEpochSec}; clearing pendingPayment`,
+                        );
+                        if (!this.dryRun) this._updateState({ pendingPayment: null });
+                        pendingPayment = null;
+                    }
+                }
+                if (pendingPayment && (ppStatus.state === 'pending' || ppStatus.state === 'committed')) {
+                    if (this.dryRun) {
+                        const plan = {
+                            action: 'wait_payment_finalization',
+                            tokenId: this.tokenId,
+                            paymentTxHash: pendingPayment.paymentTxHash,
+                            toSeq: pendingPayment.toSeq,
+                        };
+                        this.log(`[dry-run] pending payment recovery plan ${JSON.stringify(plan)}`);
+                        return {
+                            synced: syncResult.added,
+                            localSeq,
+                            anchoredSeq: prev?.toSeq ?? 0,
+                            anchored: false,
+                            dryRun: true,
+                            plan,
+                        };
+                    }
+                    try {
+                        await waitForFinalizedPolling(c, pendingPayment.paymentTxHash);
+                        pendingPayment = { ...pendingPayment, status: 'finalized' };
+                        this._updateState({ pendingPayment });
+                    } catch (waitErr) {
+                        if (/was rejected:/.test(waitErr.message)) {
+                            this.log(`pending payment tx ${pendingPayment.paymentTxHash} rejected; clearing pendingPayment`);
+                            this._updateState({ pendingPayment: null });
+                            pendingPayment = null;
+                        } else {
+                            throw waitErr;
+                        }
+                    }
+                } else if (pendingPayment && ppStatus.state === 'finalized') {
+                    const failed =
+                        ppStatus.summary?.transactionType === 'failed' || Boolean(ppStatus.summary?.rejectReason);
+                    if (failed) {
+                        this.log(`pending payment tx ${pendingPayment.paymentTxHash} failed on chain; clearing pendingPayment`);
+                        if (!this.dryRun) this._updateState({ pendingPayment: null });
+                        pendingPayment = null;
+                    } else if (pendingPayment.status !== 'finalized' && !this.dryRun) {
+                        pendingPayment = { ...pendingPayment, status: 'finalized' };
+                        this._updateState({ pendingPayment });
+                    }
+                }
+            }
+
+            if (pendingPayment) {
+                if (!this.witnessUrl) {
+                    throw new Error(
+                        `pending payment ${pendingPayment.paymentTxHash} targets witness ${pendingPayment.witnessUrl}; --witness-url is required to resume`,
+                    );
+                }
+                if (normalizeWitnessBaseUrl(this.witnessUrl) !== normalizeWitnessBaseUrl(pendingPayment.witnessUrl)) {
+                    throw new Error(
+                        `pending payment ${pendingPayment.paymentTxHash} targets witness ${pendingPayment.witnessUrl}, not ${this.witnessUrl}`,
+                    );
+                }
+                if (this.dryRun) {
+                    const plan = {
+                        action: 'resume_witness_payment',
+                        tokenId: this.tokenId,
+                        paymentTxHash: pendingPayment.paymentTxHash,
+                        toSeq: pendingPayment.toSeq,
+                        commitment: pendingPayment.commitment,
+                        prevAnchorTx: pendingPayment.prevAnchorTx,
+                    };
+                    this.log(`[dry-run] pending payment recovery plan ${JSON.stringify(plan)}`);
+                    return {
+                        synced: syncResult.added,
+                        localSeq,
+                        anchoredSeq: prev?.toSeq ?? 0,
+                        anchored: false,
+                        dryRun: true,
+                        plan,
+                    };
+                }
+                const signer = this._resolveSigner();
+                if (signer.address !== agent.ownerAccount) {
+                    throw new Error(
+                        `signer ${signer.address} must exactly match registered owner ${agent.ownerAccount} (CIS-8004.setMetadata rejects account aliases)`,
+                    );
+                }
+                if (remainingOwnerBudget < 1) {
+                    throw new Error(
+                        `owner nonce span ${history.ownerNonceSpan} + 1 exceeds maxOwnerTxs=${history.maxOwnerTxs}; refusing to resume pending witness payment`,
+                    );
+                }
+                const witnessCtx = await this._verifyWitnessAlignment({
+                    c,
+                    tipBlockHash,
+                    agent,
+                    history,
+                    onChainWitness,
+                });
+                const latestBeforeAnchor = await readMetadataText(this.tokenId, ANCHOR_KEY, { nodeClient: c });
+                if (latestBeforeAnchor !== pendingPayment.prevAnchorTx) {
+                    throw new Error('countersign.anchor moved concurrently; refusing to resume pending witness payment');
+                }
+                const witnessRes = await this.requestWitnessAnchorFn({
+                    witnessUrl: this.witnessUrl,
+                    tokenId: this.tokenId,
+                    toSeq: pendingPayment.toSeq,
+                    commitment: pendingPayment.commitment,
+                    prevAnchorTx: pendingPayment.prevAnchorTx,
+                    paymentSignature: pendingPayment.paymentSignature,
+                    payFn: null,
+                    expectedPayTo: witnessCtx.health.payTo,
+                    maxPriceMicroCcd: this.maxPriceMicroCcd,
+                    expectedWitnessAccount: witnessCtx.health.witnessAccount,
+                    allowPrivate: this.allowPrivateWitness,
+                });
+                const { rd } = await verifyWitnessAnchorOnChain({
+                    nodeClient: c,
+                    txHash: witnessRes.txHash,
+                    activeWitness: witnessCtx.activeWitness,
+                    tokenId: this.tokenId,
+                    toSeq: pendingPayment.toSeq,
+                    commitmentHex: pendingPayment.commitment,
+                    prevAnchorTx: pendingPayment.prevAnchorTx,
+                });
+                let currentPending = {
+                    txHash: witnessRes.txHash,
+                    status: 'finalized',
+                    expiryEpochSeconds: null,
+                    tokenId: this.tokenId,
+                    toSeq: pendingPayment.toSeq,
+                    commitment: pendingPayment.commitment,
+                    prevAnchorTx: pendingPayment.prevAnchorTx,
+                    sender: rd.sender,
+                    submittedAt: this.wallClock().toISOString(),
+                    metadataTx: null,
+                };
+                this._updateState({
+                    lastAnchoredSeq: prev?.toSeq ?? 0,
+                    lastAnchoredTxHash: pendingPayment.prevAnchorTx,
+                    lastAnchoredCommitment: prev?.commitment ?? null,
+                    lastAnchoredAt: prev?.blockTime ?? null,
+                    pendingPayment: null,
+                    pendingAnchor: currentPending,
+                });
+                pendingPayment = null;
+                this.log(`anchored seq 1..${currentPending.toSeq}: ${EXPLORER_TX(witnessRes.txHash)}`);
+                await this._submitPointerUpdate({
+                    c,
+                    signer,
+                    anchorTxHash: witnessRes.txHash,
+                    expectedPrevTx: currentPending.prevAnchorTx,
+                    expectedOwnerAccount: agent.ownerAccount,
+                    expectedActiveWitness: witnessCtx.activeWitness,
+                    expectedSetNonce: null,
+                    witnessCtx,
+                    getPending: () => currentPending,
+                    setPending: (nextP) => {
+                        currentPending = nextP;
+                    },
+                });
+                const anchoredAt = this.wallClock().toISOString();
+                this._updateState({
+                    lastAnchoredSeq: currentPending.toSeq,
+                    lastAnchoredTxHash: witnessRes.txHash,
+                    lastAnchoredCommitment: currentPending.commitment,
+                    lastAnchoredAt: anchoredAt,
+                    pendingAnchor: null,
+                    pendingPayment: null,
+                });
+                this.lastAnchorMs = this.now();
+                this.log(`registry entry now points at seq 1..${currentPending.toSeq}: ${EXPLORER_TX(witnessRes.txHash)}`);
+                resumedWitnessPaymentTxHash = witnessRes.txHash;
+                resumedPendingOnThisTick = true;
+                await applyRefreshedSnapshot({ preserveTimerForTxHash: witnessRes.txHash });
+            }
+        }
+
         const anchoredSeq = prev?.toSeq ?? 0;
         const due =
             shouldAnchor({
@@ -1547,7 +2028,8 @@ export class AnchorWorker {
                 synced: syncResult.added,
                 localSeq,
                 anchoredSeq,
-                anchored: false,
+                anchored: resumedWitnessPaymentTxHash !== null,
+                ...(resumedWitnessPaymentTxHash ? { txHash: resumedWitnessPaymentTxHash } : {}),
                 dryRun: this.dryRun,
             };
         }
@@ -1562,6 +2044,13 @@ export class AnchorWorker {
             commitment: commitmentBuf,
             prevAnchorTx,
         });
+
+        const useWitnessAnchor = Boolean(this.witnessUrl && !this.hasCustomSubmitAnchor);
+        if (!this.witnessUrl && !this.hasCustomSubmitAnchor && witnessStateAtTip.currentWitness !== null) {
+            throw new Error(
+                `token ${this.tokenId} has active ${WITNESS_KEY} (${witnessStateAtTip.currentWitness}); --witness-url is required and self-anchoring is disabled`,
+            );
+        }
 
         if (this.dryRun) {
             const plan = {
@@ -1584,14 +2073,6 @@ export class AnchorWorker {
             };
         }
 
-        const useWitnessAnchor = Boolean(this.witnessUrl && !this.hasCustomSubmitAnchor);
-        const requiredOwnerTxs = useWitnessAnchor ? 1 : 2;
-        if (remainingOwnerBudget < requiredOwnerTxs) {
-            throw new Error(
-                `owner nonce span ${history.ownerNonceSpan} + ${requiredOwnerTxs} exceeds maxOwnerTxs=${history.maxOwnerTxs}; refusing to submit anchor`,
-            );
-        }
-
         const signer = this._resolveSigner();
         if (signer.address !== agent.ownerAccount) {
             throw new Error(
@@ -1599,8 +2080,26 @@ export class AnchorWorker {
             );
         }
 
+        const payerSigner =
+            useWitnessAnchor && !this.paymentSignature && !this.payFn
+                ? (this.payerSigner ?? (this.payerKeyfile ? loadSignerFromFile(this.payerKeyfile) : signer))
+                : null;
+        const ownerPaysTransfer = Boolean(
+            useWitnessAnchor &&
+                !this.paymentSignature &&
+                !this.payFn &&
+                payerSigner &&
+                isSameAccount(payerSigner.address, agent.ownerAccount),
+        );
+        const requiredOwnerTxs = useWitnessAnchor ? (ownerPaysTransfer ? 2 : 1) : 2;
+        if (remainingOwnerBudget < requiredOwnerTxs) {
+            throw new Error(
+                `owner nonce span ${history.ownerNonceSpan} + ${requiredOwnerTxs} exceeds maxOwnerTxs=${history.maxOwnerTxs}; refusing to submit anchor`,
+            );
+        }
+
         const witnessCtx = this.witnessUrl
-            ? await this._verifyWitnessAlignment({ c, tipBlockHash, agent, history })
+            ? await this._verifyWitnessAlignment({ c, tipBlockHash, agent, history, onChainWitness })
             : null;
 
         const latestBeforeAnchor = await readMetadataText(this.tokenId, ANCHOR_KEY, { nodeClient: c });
@@ -1608,11 +2107,14 @@ export class AnchorWorker {
             throw new Error('countersign.anchor moved concurrently; refusing to overwrite pointer');
         }
 
-        const anchorNonceBlockHash = resumedPendingOnThisTick
-            ? (await withRpcRetry(() => c.getConsensusStatus())).lastFinalizedBlock
-            : tipBlockHash;
-        const accForAnchor = await withRpcRetry(() => c.getAccountInfo(signer.sender, anchorNonceBlockHash));
-        const expectedAnchorNonce = BigInt(accForAnchor.accountNonce.value);
+        let expectedAnchorNonce = null;
+        if (!useWitnessAnchor) {
+            const anchorNonceBlockHash = resumedPendingOnThisTick
+                ? (await withRpcRetry(() => c.getConsensusStatus())).lastFinalizedBlock
+                : tipBlockHash;
+            const accForAnchor = await withRpcRetry(() => c.getAccountInfo(signer.sender, anchorNonceBlockHash));
+            expectedAnchorNonce = BigInt(accForAnchor.accountNonce.value);
+        }
 
         let signedAnchorMeta = null;
         let currentPending = null;
@@ -1649,11 +2151,29 @@ export class AnchorWorker {
                 commitment: commitmentHex,
                 prevAnchorTx,
                 paymentSignature: this.paymentSignature,
-                payFn: this._buildWitnessPayFn(c, signer),
+                payFn: this._buildWitnessPayFn(
+                    c,
+                    signer,
+                    witnessCtx,
+                    { toSeq, commitment: commitmentHex, prevAnchorTx },
+                    payerSigner,
+                ),
+                expectedPayTo: witnessCtx.health.payTo,
+                maxPriceMicroCcd: this.maxPriceMicroCcd,
+                expectedWitnessAccount: witnessCtx.health.witnessAccount,
                 allowPrivate: this.allowPrivateWitness,
             });
+            const { rd } = await verifyWitnessAnchorOnChain({
+                nodeClient: c,
+                txHash: witnessRes.txHash,
+                activeWitness: witnessCtx.activeWitness,
+                tokenId: this.tokenId,
+                toSeq,
+                commitmentHex,
+                prevAnchorTx,
+            });
             txHash = witnessRes.txHash;
-            sender = witnessRes.witnessAccount;
+            sender = rd.sender;
         } else {
             const submitted = await this.submitAnchor({
                 tokenId: this.tokenId,
@@ -1690,25 +2210,19 @@ export class AnchorWorker {
             lastAnchoredTxHash: prevAnchorTx,
             lastAnchoredCommitment: prev?.commitment ?? null,
             lastAnchoredAt: prev?.blockTime ?? null,
+            pendingPayment: null,
             pendingAnchor: currentPending,
         });
         this.log(`anchored seq 1..${toSeq}: ${EXPLORER_TX(txHash)}`);
-
-        let expectedSetNonce;
-        if (useWitnessAnchor) {
-            const latestCs = await withRpcRetry(() => c.getConsensusStatus());
-            const latestAcc = await withRpcRetry(() => c.getAccountInfo(signer.sender, latestCs.lastFinalizedBlock));
-            expectedSetNonce = BigInt(latestAcc.accountNonce.value);
-        } else {
-            expectedSetNonce = expectedAnchorNonce + 1n;
-        }
 
         await this._submitPointerUpdate({
             c,
             signer,
             anchorTxHash: txHash,
             expectedPrevTx: prevAnchorTx,
-            expectedSetNonce,
+            expectedOwnerAccount: agent.ownerAccount,
+            expectedActiveWitness: witnessCtx?.activeWitness ?? witnessStateAtTip.currentWitness,
+            expectedSetNonce: useWitnessAnchor ? null : expectedAnchorNonce + 1n,
             witnessCtx,
             getPending: () => currentPending,
             setPending: (nextP) => {
@@ -1722,6 +2236,7 @@ export class AnchorWorker {
             lastAnchoredCommitment: commitmentHex,
             lastAnchoredAt: anchoredAt,
             pendingAnchor: null,
+            pendingPayment: null,
         });
         this.lastAnchorMs = this.now();
         this._syncTipFromAnchor(
@@ -1731,7 +2246,7 @@ export class AnchorWorker {
                 commitment: commitmentHex,
             },
             agent.ownerAccount,
-            witnessCtx?.onChainWitness ?? witnessStateAtTip.currentWitness,
+            witnessCtx?.witnessState ?? witnessStateAtTip,
         );
         this.log(`registry entry now points at seq 1..${toSeq}: ${EXPLORER_TX(txHash)}`);
 

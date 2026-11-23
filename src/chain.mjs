@@ -8,7 +8,6 @@ import {
     AccountAddress,
     AccountTransactionType,
     CcdAmount,
-    ConcordiumGRPCClient,
     ConcordiumHdWallet,
     ContractAddress,
     ContractEvent,
@@ -751,12 +750,26 @@ export function encodeSimpleTransferParams({ to, microCcd, memoBytes } = {}) {
 }
 
 /** Sends a native CCD transfer (with memo when memoBytes is given) and waits for finalization on testnet. */
-export function sendTransferWithMemo({ to, microCcd, memoBytes, who = loadSigner(), nodeClient, pollOpts } = {}) {
+export function sendTransferWithMemo({
+    to,
+    microCcd,
+    memoBytes,
+    who = loadSigner(),
+    nodeClient,
+    pollOpts,
+    onSigned,
+    expectedNonce,
+} = {}) {
     const params = encodeSimpleTransferParams({ to, microCcd, memoBytes });
     const builder = params.memo
         ? Transaction.transfer({ toAddress: params.toAddress, amount: params.amount }, params.memo)
         : Transaction.transfer({ toAddress: params.toAddress, amount: params.amount });
-    return signSendWait(builder, who, nodeClient, pollOpts);
+    const mergedPollOpts = {
+        ...(pollOpts ?? {}),
+        ...(onSigned !== undefined ? { onSigned } : {}),
+        ...(expectedNonce !== undefined ? { expectedNonce } : {}),
+    };
+    return signSendWait(builder, who, nodeClient, mergedPollOpts);
 }
 
 function validateSenderSignaturesShape(senderSigs, declaredNumSignatures) {
@@ -1009,19 +1022,12 @@ export async function validateAndSponsorSetMetadata({
     }
 
     const ownerAccountInfo = await withRpcRetry(() => c.getAccountInfo(parsed.header.sender, tipBlockHash));
-    if (!ownerAccountInfo) {
-        throw new Error(`owner account ${expectedOwner} not found on chain`);
+    if (!ownerAccountInfo || !ownerAccountInfo.accountCredentials || typeof ownerAccountInfo.accountThreshold !== 'number') {
+        throw new Error(`owner account ${expectedOwner} missing credential keys for signature verification`);
     }
-    const isRealGrpc = c instanceof ConcordiumGRPCClient;
-    const hasCredentials = ownerAccountInfo.accountCredentials !== undefined || ownerAccountInfo.accountThreshold !== undefined;
-    if (isRealGrpc || hasCredentials) {
-        if (!ownerAccountInfo.accountCredentials || typeof ownerAccountInfo.accountThreshold !== 'number') {
-            throw new Error(`owner account ${expectedOwner} missing credential keys for signature verification`);
-        }
-        const sigValid = await Transaction.verifySignature(parsed, parsed.signatures.sender, ownerAccountInfo);
-        if (!sigValid) {
-            throw new Error('invalid owner signature on sponsored setMetadata transaction');
-        }
+    const sigValid = await Transaction.verifySignature(parsed, parsed.signatures.sender, ownerAccountInfo);
+    if (!sigValid) {
+        throw new Error('invalid owner signature on sponsored setMetadata transaction');
     }
 
     const dryRun = await withRpcRetry(() =>
@@ -1633,13 +1639,13 @@ export function extractWitnessState(history) {
  * `MetadataSet` timeline (accounting for CIS-8004 storing cleared metadata as `""` rather than deleting the key).
  */
 export function witnessMatchesOnChain(witnessState, onChainWitness) {
-    if (!witnessState.sawWitnessEvent) {
+    if (witnessState.currentWitness !== null && witnessState.currentWitness !== undefined) {
+        return onChainWitness === witnessState.currentWitness;
+    }
+    if (witnessState.sawWitnessEvent === false) {
         return onChainWitness === null;
     }
-    if (witnessState.currentWitness === null) {
-        return onChainWitness === null || onChainWitness === '';
-    }
-    return onChainWitness === witnessState.currentWitness;
+    return onChainWitness === null || onChainWitness === '';
 }
 
 /** Loads and decodes every register-data anchor transaction referenced in MetadataSet history. */
