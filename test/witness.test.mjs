@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
@@ -3570,46 +3571,55 @@ test('unsigned 402 equivocation 409, facilitator settlement-tx & legacy dedup, w
     });
     const pipeSockClosed = new Promise((r) => pipeSock.once('close', r));
 
+    const withTimeout = async (promise, ms, label) => {
+        let timerId;
+        try {
+            return await Promise.race([
+                promise,
+                new Promise((_, reject) => {
+                    timerId = setTimeout(() => reject(new Error(`timed out waiting for ${label} after ${ms}ms`)), ms);
+                }),
+            ]);
+        } finally {
+            clearTimeout(timerId);
+        }
+    };
+
     const bodyPipe1 = JSON.stringify({ tokenId: TOKEN_ID, toSeq: 1, commitment: commitA, prevAnchorTx: null });
     const sigPipe1 = encodeX402Header({ x402Version: 2, payload: { pipe: 1 } });
-    pipeSock.write(
-        `POST /v1/anchor HTTP/1.1\r\n` +
-            `Host: 127.0.0.1:${pipeSrv.port}\r\n` +
-            `Content-Type: application/json\r\n` +
-            `${HEADER_PAYMENT_SIGNATURE}: ${sigPipe1}\r\n` +
-            `Content-Length: ${Buffer.byteLength(bodyPipe1)}\r\n\r\n` +
-            bodyPipe1 +
-            `POST /v1/anchor HTTP/1.1\r\n` +
-            `Host: 127.0.0.1:${pipeSrv.port}\r\n` +
-            `Content-Type: application/json\r\n` +
-            `Content-Length: 120\r\n\r\n` +
-            `{"tokenId":`,
-    );
-
-    await enteredPipeReq1;
-    await req2Seen;
-    await new Promise((r) => setTimeout(r, 20));
-
     let pipeCloseSettled = false;
-    const pipeCloseP = pipeSrv.close().then(() => {
-        pipeCloseSettled = true;
-    });
-    await new Promise((r) => setTimeout(r, 20));
-    assert.equal(pipeCloseSettled, false, 'close() must still wait for pipelined Req 1 to finish committing');
-
-    releasePipeReq1();
-    let pipeHangTimer;
     try {
-        await Promise.race([
-            pipeCloseP,
-            new Promise((_, reject) => {
-                pipeHangTimer = setTimeout(() => reject(new Error('close() hung on pipelined partial upload')), 1500);
-            }),
-        ]);
+        pipeSock.write(
+            `POST /v1/anchor HTTP/1.1\r\n` +
+                `Host: 127.0.0.1:${pipeSrv.port}\r\n` +
+                `Content-Type: application/json\r\n` +
+                `${HEADER_PAYMENT_SIGNATURE}: ${sigPipe1}\r\n` +
+                `Content-Length: ${Buffer.byteLength(bodyPipe1)}\r\n\r\n` +
+                bodyPipe1 +
+                `POST /v1/anchor HTTP/1.1\r\n` +
+                `Host: 127.0.0.1:${pipeSrv.port}\r\n` +
+                `Content-Type: application/json\r\n` +
+                `Content-Length: 120\r\n\r\n` +
+                `{"tokenId":`,
+        );
+
+        await withTimeout(enteredPipeReq1, 1500, 'enteredPipeReq1');
+        await withTimeout(req2Seen, 1500, 'req2Seen');
+        await new Promise((r) => setTimeout(r, 20));
+
+        const pipeCloseP = pipeSrv.close().then(() => {
+            pipeCloseSettled = true;
+        });
+        await new Promise((r) => setTimeout(r, 20));
+        assert.equal(pipeCloseSettled, false, 'close() must still wait for pipelined Req 1 to finish committing');
+
+        releasePipeReq1();
+        await withTimeout(pipeCloseP, 1500, 'pipeSrv.close');
+        await withTimeout(pipeSockClosed, 1500, 'pipeSockClosed');
     } finally {
-        clearTimeout(pipeHangTimer);
+        releasePipeReq1();
+        pipeSock.destroy();
     }
-    await pipeSockClosed;
 
     const pipeLedgerEntry = JSON.parse(fs.readFileSync(pipeLedgerPath, 'utf8')).payments['pipe-pay-1'];
     assert.equal(pipeLedgerEntry?.status, 'committed');
@@ -3645,7 +3655,7 @@ test('unsigned 402 equivocation 409, facilitator settlement-tx & legacy dedup, w
     assert.equal(unitLedger.resolvePaymentId('pay-alias-fail'), 'pay-canon');
     assert.equal(JSON.parse(fs.readFileSync(aliasUnitPath, 'utf8')).paymentAliases['pay-alias-fail'], 'pay-canon');
 
-    // 9. Pipelined two-complete-request shutdown unblocks promptly when peer destroys socket mid-drain
+    // 9. Queued async Req 2 entering finally flush-wait during close() unblocks promptly on socket close (real TCP + Node 22/24 detached-socket simulation)
     const basePipe2Node = createWitnessMockNode({
         owner: OWNER_A,
         accountVerifyKeys: new Map([
@@ -3662,7 +3672,24 @@ test('unsigned 402 equivocation 409, facilitator settlement-tx & legacy dedup, w
     const holdPipe2Req1 = new Promise((r) => {
         releasePipe2Req1 = r;
     });
+    let enterPipe2Req2;
+    const enteredPipe2Req2 = new Promise((r) => {
+        enterPipe2Req2 = r;
+    });
+    let releasePipe2Req2;
+    const holdPipe2Req2 = new Promise((r) => {
+        releasePipe2Req2 = r;
+    });
     const pipe2Node = Object.assign(Object.create(basePipe2Node), {
+        async invokeContract(ctx, bh) {
+            const p = Buffer.from(ctx.parameter.buffer);
+            const reqTid = p.length >= 9 ? p.readBigUInt64LE(1).toString() : null;
+            if (reqTid === '9999') {
+                enterPipe2Req2();
+                await holdPipe2Req2;
+            }
+            return basePipe2Node.invokeContract(ctx, bh);
+        },
         async sendTransaction(finalized) {
             if (finalized.payload.type === AccountTransactionType.RegisterData) {
                 enterPipe2Req1();
@@ -3685,45 +3712,41 @@ test('unsigned 402 equivocation 409, facilitator settlement-tx & legacy dedup, w
     });
     cleanups.push(() => pipe2Srv.close());
 
-    let pipe2ReqCount = 0;
-    let markPipe2Req2;
-    const pipe2Req2Seen = new Promise((r) => {
-        markPipe2Req2 = r;
+    const pipe2Req2Body = JSON.stringify({
+        tokenId: '9999',
+        anchorTxHash: txHashFor('pipe2-req2'),
+        transactionJson: '{}',
     });
-    pipe2Srv.server.on('request', () => {
-        pipe2ReqCount += 1;
-        if (pipe2ReqCount >= 2) markPipe2Req2();
-    });
-
     const pipe2Sock = net.connect(pipe2Srv.port, '127.0.0.1');
     cleanups.push(() => pipe2Sock.destroy());
-    pipe2Sock.write(
-        `POST /v1/anchor HTTP/1.1\r\n` +
-            `Host: 127.0.0.1:${pipe2Srv.port}\r\n` +
-            `Content-Type: application/json\r\n` +
-            `${HEADER_PAYMENT_SIGNATURE}: ${encodeX402Header({ x402Version: 2, payload: { pipe2: 1 } })}\r\n` +
-            `Content-Length: ${Buffer.byteLength(bodyPipe1)}\r\n\r\n` +
-            bodyPipe1 +
-            `GET /health HTTP/1.1\r\nHost: 127.0.0.1:${pipe2Srv.port}\r\n\r\n`,
-    );
-
-    await enteredPipe2Req1;
-    await pipe2Req2Seen;
-    await new Promise((r) => setTimeout(r, 20));
-    const close2P = pipe2Srv.close();
-    pipe2Sock.destroy();
-    await new Promise((r) => setTimeout(r, 20));
-    releasePipe2Req1();
-    let pipe2Timer;
     try {
-        await Promise.race([
-            close2P,
-            new Promise((_, reject) => {
-                pipe2Timer = setTimeout(() => reject(new Error('close() hung after pipelined socket disconnect')), 1500);
-            }),
-        ]);
+        pipe2Sock.write(
+            `POST /v1/anchor HTTP/1.1\r\n` +
+                `Host: 127.0.0.1:${pipe2Srv.port}\r\n` +
+                `Content-Type: application/json\r\n` +
+                `${HEADER_PAYMENT_SIGNATURE}: ${encodeX402Header({ x402Version: 2, payload: { pipe2: 1 } })}\r\n` +
+                `Content-Length: ${Buffer.byteLength(bodyPipe1)}\r\n\r\n` +
+                bodyPipe1 +
+                `POST /v1/sponsor-pointer HTTP/1.1\r\n` +
+                `Host: 127.0.0.1:${pipe2Srv.port}\r\n` +
+                `Content-Type: application/json\r\n` +
+                `Content-Length: ${Buffer.byteLength(pipe2Req2Body)}\r\n\r\n` +
+                pipe2Req2Body,
+        );
+
+        await withTimeout(enteredPipe2Req1, 1500, 'enteredPipe2Req1');
+        await withTimeout(enteredPipe2Req2, 1500, 'enteredPipe2Req2');
+        const close2P = pipe2Srv.close();
+        releasePipe2Req2();
+        await new Promise((r) => setTimeout(r, 20));
+        pipe2Sock.destroy();
+        await new Promise((r) => setTimeout(r, 20));
+        releasePipe2Req1();
+        await withTimeout(close2P, 1500, 'pipe2Srv.close');
     } finally {
-        clearTimeout(pipe2Timer);
+        releasePipe2Req2();
+        releasePipe2Req1();
+        pipe2Sock.destroy();
     }
 
     const pipe2Reopen = await startWitnessServer({
@@ -3738,4 +3761,97 @@ test('unsigned 402 equivocation 409, facilitator settlement-tx & legacy dedup, w
     });
     cleanups.push(() => pipe2Reopen.close());
     await pipe2Reopen.close();
+
+    // Detached-socket simulation (Node 22/24 behavior where queued res lacks socket & never emits finish/close)
+    const detachedLedgerPath = path.join(dir, 'detached-ledger.json');
+    let enterDetached;
+    const enteredDetached = new Promise((r) => {
+        enterDetached = r;
+    });
+    let rejectDetached;
+    const holdDetached = new Promise((_, reject) => {
+        rejectDetached = reject;
+    });
+    holdDetached.catch(() => {});
+    const detachedSrv = await createWitnessServer({
+        host: '127.0.0.1',
+        port: 0,
+        priceMicroCcd: '0',
+        signer: witnessSigner,
+        ledgerPath: detachedLedgerPath,
+        nodeClient: basePipe2Node,
+        fetchCard: async () => {
+            enterDetached();
+            await holdDetached;
+            return basePipe2Node.card.bytes;
+        },
+        log: () => {},
+    });
+    cleanups.push(() => detachedSrv.close());
+
+    const fakeSock = Object.assign(new EventEmitter(), {
+        destroyed: false,
+        closed: false,
+        destroy() {
+            this.destroyed = true;
+        },
+    });
+    const fakeReq = Object.assign(new EventEmitter(), {
+        method: 'POST',
+        url: '/v1/anchor',
+        headers: { 'content-type': 'application/json' },
+        complete: true,
+        socket: fakeSock,
+        destroy() {},
+    });
+    const fakeRes = Object.assign(new EventEmitter(), {
+        headersSent: false,
+        writableEnded: false,
+        writableFinished: false,
+        destroyed: false,
+        socket: null,
+        writeHead() {
+            this.headersSent = true;
+        },
+        end() {
+            this.writableEnded = true;
+        },
+    });
+
+    let dCloseSettled = false;
+    try {
+        detachedSrv.server.emit('request', fakeReq, fakeRes);
+        fakeReq.emit('data', Buffer.from(bodyPipe1, 'utf8'));
+        fakeReq.emit('end');
+        await withTimeout(enteredDetached, 1500, 'enteredDetached');
+        const dCloseP = detachedSrv.close().then(() => {
+            dCloseSettled = true;
+        });
+        rejectDetached(new Error('card fetch failed during close'));
+        await new Promise((r) => setTimeout(r, 20));
+        assert.equal(dCloseSettled, false, 'detached response should still be awaited while original socket is open');
+        fakeSock.destroyed = true;
+        fakeSock.closed = true;
+        fakeSock.emit('close');
+        await withTimeout(dCloseP, 1000, 'detachedSrv.close');
+        assert.equal(dCloseSettled, true);
+    } finally {
+        rejectDetached(new Error('cleanup'));
+        fakeSock.destroyed = true;
+        fakeSock.closed = true;
+        fakeSock.emit('close');
+    }
+
+    const detachedReopen = await startWitnessServer({
+        host: '127.0.0.1',
+        port: 0,
+        priceMicroCcd: '0',
+        signer: witnessSigner,
+        ledgerPath: detachedLedgerPath,
+        nodeClient: basePipe2Node,
+        fetchCard: async () => basePipe2Node.card.bytes,
+        log: () => {},
+    });
+    cleanups.push(() => detachedReopen.close());
+    await detachedReopen.close();
 });
