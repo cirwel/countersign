@@ -23,6 +23,7 @@ import {
     readMetadataText,
     readRegisterData,
     readRegistryHistory,
+    readTransactionBlockIndex,
     sendRegisterData,
     sendSetMetadata,
     sendTransferWithMemo,
@@ -365,33 +366,55 @@ export async function withFileLock(
 }
 
 /**
- * Returns true if `sender` was authorized at some block in `[max(regHeight, prevBlockHeight), rdBlockHeight]`,
- * preventing later witness appointments from validating earlier transactions while still recognizing in-flight
- * transactions finalized shortly after revocation.
+ * Returns true if `sender` was authorized at some point from `[predecessor pointer (or mint), rd]`,
+ * excluding later witness appointments in the same or subsequent blocks while recognizing in-flight
+ * transactions finalized before or shortly after revocation.
  */
 function wasSignerAuthorizedInWindow({
     sender,
     rdBlockHeight,
+    rdTxIndex = null,
     ownerAccount,
-    regHeight,
+    minBlockHeight,
+    minTxIndex = null,
+    minEventIndex = -1,
+    initialActiveWitness = null,
     transitions = [],
 }) {
+    if (minBlockHeight === null || minBlockHeight === undefined) return false;
     const rdH = BigInt(rdBlockHeight);
-    const minH = BigInt(regHeight);
+    const minH = BigInt(minBlockHeight);
     if (rdH < minH) return false;
-    let active = null;
-    for (const t of transitions) {
-        if (BigInt(t.blockHeight) <= minH) {
-            active = t.witness;
-        }
+    if (
+        rdH === minH &&
+        !(
+            minTxIndex !== null &&
+            minTxIndex !== undefined &&
+            rdTxIndex !== null &&
+            rdTxIndex !== undefined &&
+            rdTxIndex > minTxIndex
+        )
+    ) {
+        return false;
     }
-    const authorized = [active ?? ownerAccount];
+    const authorized = [initialActiveWitness ?? ownerAccount];
     for (const t of transitions) {
+        if (t.eventIndex !== undefined && t.eventIndex <= minEventIndex) continue;
         const th = BigInt(t.blockHeight);
-        if (th > minH && th <= rdH) {
-            active = t.witness;
-            authorized.push(active ?? ownerAccount);
+        if (th > rdH) continue;
+        if (
+            th === rdH &&
+            !(
+                rdTxIndex !== null &&
+                rdTxIndex !== undefined &&
+                t.txIndex !== null &&
+                t.txIndex !== undefined &&
+                t.txIndex < rdTxIndex
+            )
+        ) {
+            continue;
         }
+        authorized.push(t.witness ?? ownerAccount);
     }
     return authorized.some((acct) => isSameAccount(sender, acct));
 }
@@ -1730,11 +1753,40 @@ export class AnchorWorker {
                         const activeWitness = witnessStateAtTip.currentWitness;
                         const expectedAnchorSender = activeWitness ?? agent.ownerAccount;
                         const senderAuthorizedNow = isSameAccount(rd.sender, expectedAnchorSender);
+                        const predecessor = d.prevAnchorTx
+                            ? existing.find((a) => a.txHash === d.prevAnchorTx) ?? null
+                            : null;
+                        const minBlockHeight = d.prevAnchorTx
+                            ? (predecessor ? (predecessor.pointerBlockHeight ?? predecessor.blockHeight) : null)
+                            : history.regHeight;
+                        const minTxIndex = d.prevAnchorTx
+                            ? (predecessor?.pointerTxIndex ?? null)
+                            : (history.mintTxIndex ?? null);
+                        const minEventIndex = d.prevAnchorTx
+                            ? (predecessor?.pointerEventIndex ?? -1)
+                            : -1;
+                        const initialActiveWitness = d.prevAnchorTx
+                            ? (predecessor?.authorizedWitness ?? null)
+                            : null;
+                        let rdTxIndex = rd.txIndex ?? null;
+                        if (minBlockHeight !== null && rdTxIndex === null && rd.blockHash) {
+                            const rdH = BigInt(rd.blockHeight);
+                            const needsSameBlockOrder =
+                                rdH === BigInt(minBlockHeight) ||
+                                witnessStateAtTip.transitions.some((t) => BigInt(t.blockHeight) === rdH);
+                            if (needsSameBlockOrder) {
+                                rdTxIndex = await readTransactionBlockIndex(rd.blockHash, pending.txHash, c);
+                            }
+                        }
                         const wasHistoricallyAuthorizedSigner = wasSignerAuthorizedInWindow({
                             sender: rd.sender,
                             rdBlockHeight: rd.blockHeight,
+                            rdTxIndex,
                             ownerAccount: agent.ownerAccount,
-                            regHeight: history.regHeight,
+                            minBlockHeight,
+                            minTxIndex,
+                            minEventIndex,
+                            initialActiveWitness,
                             transitions: witnessStateAtTip.transitions,
                         });
                         const integrityOk =

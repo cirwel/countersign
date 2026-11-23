@@ -602,6 +602,11 @@ export const commands = {
                     throw new Error(`trail ${trail} belongs to token ${header.token_id}, not ${tokenStr}`);
                 }
                 return withFileLock(tokenLockPath(tokenStr, { tokenLockDir: opts.tokenLockDir }), async () => {
+                    if (explicitState !== null && !fs.existsSync(resolvedStatePath)) {
+                        throw new Error(
+                            `state file ${explicitState} does not exist; pass --force if rotating without local trail/state`,
+                        );
+                    }
                     assertNoPendingStateFiles(stateCandidates, {
                         legacyStatePath,
                         resolvedStatePath,

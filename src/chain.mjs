@@ -656,7 +656,48 @@ export async function readRegisterData(txHash, nodeClient) {
         data,
         blockTime: block.blockSlotTime.toISOString(),
         blockHeight: Number(block.blockHeight),
+        blockHash: status.outcome.blockHash,
+        txIndex: s.index !== undefined && s.index !== null ? Number(s.index) : null,
     };
+}
+
+/**
+ * Resolves the 0-based transaction index of `txHash` within a finalized `blockHash` by streaming
+ * `getBlockTransactionEvents` under a bounded timeout. Used as a same-block tie-breaker when
+ * `getBlockItemStatus` omits `summary.index`.
+ */
+export async function readTransactionBlockIndex(blockHash, txHash, nodeClient, { streamTimeoutMs = 15_000 } = {}) {
+    if (!blockHash || typeof txHash !== 'string') return null;
+    const c = nodeClient ?? (await client());
+    await assertTestnet(c);
+    return withRpcRetry(async () => {
+        const ac = new AbortController();
+        let timedOut = false;
+        const timeoutErr = Object.assign(
+            new Error(`gRPC stream timed out after ${streamTimeoutMs}ms`),
+            { code: 'DEADLINE_EXCEEDED' },
+        );
+        const timer = setTimeout(() => {
+            timedOut = true;
+            ac.abort(timeoutErr);
+        }, streamTimeoutMs);
+        try {
+            let txIdx = 0;
+            for await (const s of c.getBlockTransactionEvents(blockHash, ac.signal)) {
+                if (ac.signal.aborted) throw ac.signal.reason;
+                if (s?.hash?.toString() === txHash) {
+                    return s.index !== undefined && s.index !== null ? Number(s.index) : txIdx;
+                }
+                txIdx += 1;
+            }
+            return null;
+        } catch (err) {
+            if (timedOut) throw timeoutErr;
+            throw err;
+        } finally {
+            clearTimeout(timer);
+        }
+    });
 }
 
 /** Reads a finalized plain CCD transfer (or transferWithMemo) directly from a Concordium testnet node. */
@@ -1288,6 +1329,7 @@ export async function readRegistryHistory(
                             height: h,
                             summaries,
                             txIdx,
+                            txIndex: summary.index !== undefined && summary.index !== null ? Number(summary.index) : txIdx,
                             traceIdx,
                             logIdx,
                             txHash: summary.hash.toString(),
@@ -1537,7 +1579,8 @@ export async function readRegistryHistory(
                             if (summary.type !== 'accountTransaction' || !isSameAccount(txSender, owner)) {
                                 throw new Error(`MetadataSet for token ${targetTokenId} at block ${h} was submitted by ${txSender || 'non-account'}, not owner ${owner}`);
                             }
-                            collected.push({ ...meta, sender: txSender, txHash, blockHeight: Number(h) });
+                            const txIndex = summary.index !== undefined && summary.index !== null ? Number(summary.index) : txIdx;
+                            collected.push({ ...meta, sender: txSender, txHash, blockHeight: Number(h), txIndex });
                         }
                     }
                 }
@@ -1559,6 +1602,7 @@ export async function readRegistryHistory(
         regHeight: Number(regHeight),
         regBlockHash: regBlockHash.toString(),
         mintTxHash: mintHit.txHash,
+        mintTxIndex: mintHit.txIndex,
         owner,
         scannedBlocks: discoveredHeights.length,
         ownerNonceSpan,
@@ -1597,7 +1641,8 @@ function walkWitnessTimeline(history) {
     let lastWitnessEvent = null;
     const transitions = [];
     const anchorSpecs = [];
-    for (const e of history.events) {
+    for (let eventIdx = 0; eventIdx < history.events.length; eventIdx++) {
+        const e = history.events[eventIdx];
         if (e.key === WITNESS_KEY) {
             sawWitnessEvent = true;
             activeWitness = parseWitnessEventValue(e, history.owner);
@@ -1607,11 +1652,14 @@ function walkWitnessTimeline(history) {
                 blockHeight: e.blockHeight,
                 timestampMs: e.timestampMs,
                 sender: e.sender,
+                txIndex: e.txIndex ?? null,
+                eventIndex: eventIdx,
             };
             transitions.push(lastWitnessEvent);
         } else if (e.key === ANCHOR_KEY) {
             anchorSpecs.push({
                 event: e,
+                eventIndex: eventIdx,
                 authorizedWitness: activeWitness,
                 witnessEvent: lastWitnessEvent,
             });
@@ -1652,7 +1700,7 @@ export function witnessMatchesOnChain(witnessState, onChainWitness) {
 export async function loadAnchorsFromHistory(history, nodeClient, tipBlockHeight) {
     const { anchorSpecs } = walkWitnessTimeline(history);
     const pool = createRpcPool(5);
-    return pool.map(anchorSpecs, async ({ event: p, authorizedWitness, witnessEvent }) => {
+    return pool.map(anchorSpecs, async ({ event: p, eventIndex, authorizedWitness, witnessEvent }) => {
         const txHash = utf8Fatal.decode(p.value);
         if (!TX_RE.test(txHash)) {
             throw new Error(`the pointer was once set to a value that is not a transaction hash (in ${p.txHash})`);
@@ -1667,6 +1715,9 @@ export async function loadAnchorsFromHistory(history, nodeClient, tipBlockHeight
             sender: tx.sender,
             blockTime: tx.blockTime,
             blockHeight: tx.blockHeight,
+            pointerBlockHeight: p.blockHeight,
+            pointerTxIndex: p.txIndex ?? null,
+            pointerEventIndex: eventIndex,
             authorizedWitness,
             witnessEvent,
         };
