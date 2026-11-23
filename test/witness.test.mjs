@@ -3717,6 +3717,21 @@ test('unsigned 402 equivocation 409, facilitator settlement-tx & legacy dedup, w
         anchorTxHash: txHashFor('pipe2-req2'),
         transactionJson: '{}',
     });
+    let markReq2FlushWait;
+    const req2FlushWaitInstalled = new Promise((r) => {
+        markReq2FlushWait = r;
+    });
+    let pipe2Req2Res = null;
+    pipe2Srv.server.on('request', (req, res) => {
+        if (req.url === '/v1/sponsor-pointer') {
+            pipe2Req2Res = res;
+            res.on('newListener', (eventName) => {
+                if (eventName === 'finish' && res.headersSent && !res.writableFinished) {
+                    markReq2FlushWait();
+                }
+            });
+        }
+    });
     const pipe2Sock = net.connect(pipe2Srv.port, '127.0.0.1');
     cleanups.push(() => pipe2Sock.destroy());
     try {
@@ -3738,7 +3753,9 @@ test('unsigned 402 equivocation 409, facilitator settlement-tx & legacy dedup, w
         await withTimeout(enteredPipe2Req2, 1500, 'enteredPipe2Req2');
         const close2P = pipe2Srv.close();
         releasePipe2Req2();
-        await new Promise((r) => setTimeout(r, 20));
+        await withTimeout(req2FlushWaitInstalled, 1500, 'req2FlushWaitInstalled');
+        assert.equal(pipe2Req2Res?.headersSent, true);
+        assert.equal(pipe2Req2Res?.writableFinished, false);
         pipe2Sock.destroy();
         await new Promise((r) => setTimeout(r, 20));
         releasePipe2Req1();
