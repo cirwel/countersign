@@ -1037,7 +1037,10 @@ test('anchor command covers happy path, concurrent pointer moves, --tx resume, d
             anchorHeights: [1050n],
             anchorToSeqs: [2],
             onInvokeContract: (ctx) => {
-                if (ctx.method.value === 'CIS-8004.getMetadata') {
+                if (
+                    ctx.method.value === 'CIS-8004.getMetadata' &&
+                    Buffer.from(ctx.parameter.buffer).includes(Buffer.from('countersign.anchor'))
+                ) {
                     getMetaCount1 += 1;
                     if (getMetaCount1 === 2) {
                         return { tag: 'success', usedEnergy: { value: 1000n }, returnValue: ReturnValue.fromBuffer(encodeGetMetadataReturn(txHashFor('other'))) };
@@ -1059,7 +1062,10 @@ test('anchor command covers happy path, concurrent pointer moves, --tx resume, d
             anchorHeights: [1050n],
             anchorToSeqs: [2],
             onInvokeContract: (ctx) => {
-                if (ctx.method.value === 'CIS-8004.getMetadata') {
+                if (
+                    ctx.method.value === 'CIS-8004.getMetadata' &&
+                    Buffer.from(ctx.parameter.buffer).includes(Buffer.from('countersign.anchor'))
+                ) {
                     getMetaCount2 += 1;
                     if (getMetaCount2 === 3) {
                         return { tag: 'success', usedEnergy: { value: 1000n }, returnValue: ReturnValue.fromBuffer(encodeGetMetadataReturn(txHashFor('other-2'))) };

@@ -58,6 +58,22 @@ A Concordium register-data transaction whose data is exactly 85 bytes:
 
 After each anchor, the registry entry's metadata key `countersign.anchor` is set to the hash of that anchor transaction, written as 64 lowercase hexadecimal characters of UTF-8 text (the registry rejects metadata values that are not valid text). The entry's metadata key `unitares.agent_uuid` holds the agent UUID as UTF-8 text.
 
+Optionally, the entry owner may authorize a separate witness account via metadata key `countersign.witness`:
+
+- `countersign.witness` holds a canonical Base58Check Concordium account address that is not an alias of `owner_account`, or the empty string `""` to clear the witness authorization and return anchoring authority to `owner_account`.
+- Setting or clearing `countersign.witness` MUST occur via a `CIS-8004.setMetadata` transaction (`MetadataSet` event `0xf3`) emitted by `owner_account`. Any `countersign.witness` value injected via registration `initial_metadata` without a `MetadataSet` event, any malformed or non-canonical Base58Check address, or any value equal (canonically) to `owner_account` fails closed.
+
+## Witnessing & Protocol 10 Fee-Sponsored Pointer Updates
+
+When a separate witness service is active:
+
+1. **x402 v2 payment binding:** Before writing an anchor, the witness verifies the agent's active status, Agent Card integrity, unbroken `MetadataSet` history, `countersign.witness` authorization, and monotonic `(prevAnchorTx, toSeq)` alignment. It responds `402 Payment Required` with a `PAYMENT-REQUIRED` header (`x402Version: 2`, `scheme: "exact"`, CAIP-2 network `ccd:4221332d34e1694168c2a0c0b3fd0f27`) binding the payment memo to:
+   ```
+   memo = SHA-256("countersign.x402.v1\n" || tokenId || "\n" || toSeq || "\n" || commitment || "\n" || (prevAnchorTx ?? "genesis"))
+   ```
+2. **Witness-signed anchor:** After verifying payment (direct finalized Concordium `transferWithMemo` or SSRF-hardened x402 facilitator `/verify` + `/settle`) and atomically claiming the payment ID in `PaymentLedger` (`claimed -> broadcasted -> committed`, never releasing `broadcasted` or `committed` entries), the witness submits the 85-byte `CSGN` `registerData` transaction signed by the witness account.
+3. **Protocol 10 fee-sponsored `CIS-8004.setMetadata`:** Because `CIS-8004.setMetadata` requires `owner_account` as the contract invoker (`ctx.sender()`), the owner signs a Protocol 10 V1 sponsorable transaction (`version: 1`, `header.sponsor = witnessAccount`, zero attached CCD, target `<12802,0>`, entrypoint `CIS-8004.setMetadata`, exact parameter bytes for `(tokenId, "countersign.anchor", anchorTxHash)`, bounded execution energy and expiry) and submits it to `/v1/sponsor-pointer`. The witness verifies all transaction invariants, verifies the owner's Ed25519 signature against on-chain `AccountInfo` credentials, dry-runs `invokeContract`, co-signs as sponsor, finalizes, and submits the V1 transaction so the owner account needs zero CCD for transaction fees.
+
 ## Verification
 
 Given a badge (a CIS-2 Base58Check token address) and a trail file, a verifier must connect directly to a Concordium testnet node (making zero calls to any hosted registry API or indexer) and:
@@ -71,10 +87,11 @@ Given a badge (a CIS-2 Base58Check token address) and a trail file, a verifier m
    - confirm the contract's `sourceModule.moduleRef` at both registration and `tipBlockHash` equals the pinned module reference `0e57473715d1c2a364fa626b8783688db32b7fac9d0e2fc97043da91e1a7d3eb`, and confirm `CIS-8004.getAdmin` is consistent (either `None` at both heights or the same account at both heights);
    - confirm zero pre-existing CIS-2 operators for `owner_account` at the registration block via contract state lookup (`0500000000000000 || owner_account_bytes`);
    - confirm neither `owner_account` nor the registry admin exceeds `maxOwnerTxs` / `maxAdminTxs` (`2000`), exhaustively locate every block in `(regHeight, tipBlockHeight]` where either `owner_account`'s or the admin's `accountNonce` increased, stream `getBlockTransactionEvents` in ascending height order (plus any post-`Mint` events in `regHeight` and any `Upgraded` event in `regHeight`), fail closed on any `Upgraded`, `AdminTransferred`, `Transfer`, `Burn`, `UpdateOperator(Add)`, non-owner `MetadataSet` sender, or unknown `<12802,0>` contract event tag, and collect every `MetadataSet` (`0xf3`) event targeting `token_id`;
-6. list every value `countersign.anchor` has held from the collected `MetadataSet` events and confirm the last one equals the current value at `tipBlockHash`;
-7. confirm every listed anchor transaction is finalized at `blockHeight <= tipBlockHeight`, was sent by the entry's current owner account (canonically including account aliases), and names the same token id;
-8. confirm the anchors form one chain: the first has no previous anchor, each later one names the anchor listed immediately before it, and the last sequence number covered strictly increases;
-9. recompute `h` from the trail file and confirm it equals the anchored value at every anchor's sequence number.
+6. replay `countersign.witness` events chronologically from the collected `MetadataSet` events (validating canonical non-owner Base58Check or `""` to clear) and confirm the resulting active witness matches on-chain `CIS-8004.getMetadata(token_id, "countersign.witness")` at `tipBlockHash` (where a cleared key reads as `""`);
+7. list every `countersign.anchor` pointer update chronologically alongside the `activeWitness` that held authority at the time of that `MetadataSet` event (`authorizedWitness`), and confirm the last pointer equals the current value at `tipBlockHash`;
+8. confirm every listed anchor transaction is finalized at `blockHeight <= tipBlockHeight`, was sent by `authorizedWitness ?? owner_account` (canonically including account aliases), and names the same token id (and if `--require-witness` or `--witness <account>` is specified, confirm an active witness is set and countersigned the latest anchor);
+9. confirm the anchors form one chain: the first has no previous anchor, each later one names the anchor listed immediately before it, and the last sequence number covered strictly increases;
+10. recompute `h` from the trail file and confirm it equals the anchored value at every anchor's sequence number.
 
 Records after the latest anchor's sequence number are outside the commitment.
 

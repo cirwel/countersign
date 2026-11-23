@@ -1,10 +1,12 @@
 // Concordium testnet access. Reading needs no keys; signing reads a key file that lives outside the repo.
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import {
     AccountAddress,
+    AccountTransactionType,
     CcdAmount,
     ConcordiumHdWallet,
     ContractAddress,
@@ -16,6 +18,7 @@ import {
     ReturnValue,
     SequenceNumber,
     Transaction,
+    TransactionExpiry,
     TransactionHash,
     buildBasicAccountSigner,
 } from '@concordium/web-sdk';
@@ -37,6 +40,7 @@ export { TESTNET_GENESIS };
 export const EXPLORER_TX = (hash) => `https://ccdexplorer.io/testnet/transaction/${hash}`;
 export const UUID_KEY = 'unitares.agent_uuid';
 export const ANCHOR_KEY = 'countersign.anchor';
+export const WITNESS_KEY = 'countersign.witness';
 export const TX_RE = /^[0-9a-f]{64}$/;
 const utf8Fatal = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 const DEFAULT_NODE_HOST = 'grpc.testnet.concordium.com';
@@ -345,13 +349,45 @@ function keyfilePath() {
     return path.join(os.homedir(), '.config/countersign/testnet-account.json');
 }
 
+/**
+ * Loads a Concordium account signer from an explicit file path (or optional env var), enforcing chmod 0600 permissions
+ * and canonical Base58Check accountAddress without falling back to the agent owner's default keyfile.
+ */
+export function loadSignerFromFile(filePath, { envVar } = {}) {
+    const rawPath = filePath ?? (envVar ? process.env[envVar] : undefined);
+    if (typeof rawPath !== 'string' || rawPath.trim().length === 0) {
+        const hint = envVar ? ` (set ${envVar} or pass explicit keyfile path)` : '';
+        throw new Error(`signer keyfile path is required${hint}`);
+    }
+    const file = rawPath.trim().replace(/^~(?=$|\/)/, os.homedir());
+    if ((fs.statSync(file).mode & 0o077) !== 0) {
+        throw new Error('key file must not be readable by group or others (chmod 600)');
+    }
+    const k = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!k || typeof k !== 'object' || Array.isArray(k)) {
+        throw new Error(`invalid keyfile ${file}: expected JSON object`);
+    }
+    if (typeof k.accountAddress !== 'string' || k.accountAddress.length === 0) {
+        throw new Error(`invalid keyfile ${file}: missing accountAddress`);
+    }
+    const sender = AccountAddress.fromBase58(k.accountAddress);
+    if (sender.address !== k.accountAddress) {
+        throw new Error(`invalid keyfile ${file}: accountAddress is not in canonical Base58Check form`);
+    }
+    let signKey;
+    if (typeof k.signKey === 'string' && k.signKey.length > 0) {
+        signKey = k.signKey;
+    } else if (typeof k.seedPhrase === 'string' && k.seedPhrase.length > 0) {
+        signKey = ConcordiumHdWallet.fromSeedPhrase(k.seedPhrase, 'Testnet').getAccountSigningKey(0, 0, 0).toString('hex');
+    } else {
+        throw new Error(`invalid keyfile ${file}: missing signKey or seedPhrase`);
+    }
+    return { address: sender.address, sender, signer: buildBasicAccountSigner(signKey) };
+}
+
 /** Key file: { accountAddress, seedPhrase } (identity 0, credential 0 on identity provider 0) or { accountAddress, signKey }. */
 export function loadSigner() {
-    const file = keyfilePath();
-    if ((fs.statSync(file).mode & 0o077) !== 0) throw new Error('key file must not be readable by group or others (chmod 600)');
-    const k = JSON.parse(fs.readFileSync(file, 'utf8'));
-    const signKey = k.signKey ?? ConcordiumHdWallet.fromSeedPhrase(k.seedPhrase, 'Testnet').getAccountSigningKey(0, 0, 0).toString('hex');
-    return { address: k.accountAddress, sender: AccountAddress.fromBase58(k.accountAddress), signer: buildBasicAccountSigner(signKey) };
+    return loadSignerFromFile(keyfilePath(), { envVar: 'COUNTERSIGN_KEYFILE' });
 }
 
 export async function waitForFinalizedPolling(c, hash, { timeoutMs = 180000, pollIntervalMs = 2000, now = () => performance.now() } = {}) {
@@ -447,6 +483,48 @@ async function signSendWait(builder, who, nodeClient, pollOpts = {}) {
 }
 
 export const bigintSafe = (_k, v) => (typeof v === 'bigint' ? v.toString() : v);
+
+/** Atomically writes bytes or UTF-8 string via same-directory temp file + fsync + chmod + rename. */
+export function writeFileAtomic(filePath, content, { mode = 0o600 } = {}) {
+    const dir = path.dirname(filePath);
+    fs.mkdirSync(dir, { recursive: true });
+    const tmpPath = path.join(dir, `.${path.basename(filePath)}.tmp.${process.pid}.${crypto.randomUUID()}`);
+    const fd = fs.openSync(tmpPath, 'w', mode);
+    try {
+        const buf = typeof content === 'string' ? Buffer.from(content, 'utf8') : Buffer.from(content);
+        let offset = 0;
+        while (offset < buf.length) {
+            offset += fs.writeSync(fd, buf, offset, buf.length - offset);
+        }
+        fs.fchmodSync(fd, mode);
+        fs.fsyncSync(fd);
+    } catch (err) {
+        try {
+            fs.closeSync(fd);
+        } catch {}
+        try {
+            fs.unlinkSync(tmpPath);
+        } catch {}
+        throw err;
+    }
+    fs.closeSync(fd);
+    try {
+        fs.renameSync(tmpPath, filePath);
+    } catch (err) {
+        try {
+            fs.unlinkSync(tmpPath);
+        } catch {}
+        throw err;
+    }
+    try {
+        const dirFd = fs.openSync(dir, 'r');
+        try {
+            fs.fsyncSync(dirFd);
+        } finally {
+            fs.closeSync(dirFd);
+        }
+    } catch {}
+}
 
 export function sendRegisterData(bytes, who = loadSigner(), nodeClient, pollOpts) {
     return signSendWait(Transaction.registerData({ data: new DataBlob(Buffer.from(bytes)) }), who, nodeClient, pollOpts);
@@ -578,7 +656,418 @@ export async function readRegisterData(txHash, nodeClient) {
         data,
         blockTime: block.blockSlotTime.toISOString(),
         blockHeight: Number(block.blockHeight),
+        txIndex: s.index !== undefined && s.index !== null ? Number(s.index) : null,
     };
+}
+
+/** Reads a finalized plain CCD transfer (or transferWithMemo) directly from a Concordium testnet node. */
+export async function readAccountTransfer(txHash, nodeClient) {
+    if (typeof txHash !== 'string' || !TX_RE.test(txHash)) {
+        throw new Error(`invalid transaction hash: ${txHash}`);
+    }
+    const c = nodeClient ?? (await client());
+    await assertTestnet(c);
+    const status = await withRpcRetry(() => c.getBlockItemStatus(TransactionHash.fromHexString(txHash)));
+    if (!status || status.status !== 'finalized') {
+        throw new Error(`transaction ${txHash} is not finalized (${status?.status ?? 'absent'})`);
+    }
+    const s = status.outcome?.summary;
+    if (!s) throw new Error(`transaction ${txHash} finalized without outcome summary`);
+    if (s.transactionType === 'failed' || s.rejectReason) {
+        throw new Error(`transaction ${txHash} failed on chain`);
+    }
+    if (s.transactionType !== 'transfer' && s.transactionType !== 'transferWithMemo') {
+        throw new Error(`transaction ${txHash} is ${s.transactionType}, not transfer or transferWithMemo`);
+    }
+    const rawAmt = s.transfer?.amount?.microCcdAmount ?? s.transfer?.amount;
+    if (rawAmt === undefined || rawAmt === null) {
+        throw new Error(`transfer ${txHash} missing amount`);
+    }
+    const amountMicroCcd = BigInt(rawAmt);
+    const to = addressToString(s.transfer?.to);
+    const sender = addressToString(s.sender);
+    if (!to || !sender) {
+        throw new Error(`transfer ${txHash} missing sender or recipient`);
+    }
+    let memoHex = null;
+    if (s.transactionType === 'transferWithMemo') {
+        const rawMemo = s.memo?.memo ?? s.memo;
+        if (typeof rawMemo === 'string') {
+            memoHex = rawMemo.toLowerCase();
+        } else if (Buffer.isBuffer(rawMemo) || rawMemo instanceof Uint8Array) {
+            memoHex = Buffer.from(rawMemo).toString('hex');
+        } else {
+            throw new Error(`transferWithMemo ${txHash} missing memo bytes`);
+        }
+        if (!/^(?:[0-9a-f]{2})*$/.test(memoHex)) {
+            throw new Error(`transferWithMemo ${txHash} has invalid hex memo`);
+        }
+    }
+    const block = await withRpcRetry(() => c.getBlockInfo(status.outcome.blockHash));
+    return {
+        txHash,
+        sender,
+        to,
+        amountMicroCcd,
+        memoHex,
+        blockHeight: Number(block.blockHeight),
+        blockTime: block.blockSlotTime.toISOString(),
+    };
+}
+
+/** Encodes parameters for a native CCD transfer (with optional <=256-byte DataBlob memo). */
+export function encodeSimpleTransferParams({ to, microCcd, memoBytes } = {}) {
+    let toAddress;
+    if (typeof to === 'string') {
+        toAddress = AccountAddress.fromBase58(to);
+        if (toAddress.address !== to) {
+            throw new Error(`recipient address ${to} is not in canonical Base58Check form`);
+        }
+    } else if (to && typeof to.address === 'string') {
+        toAddress = to;
+    } else {
+        throw new Error('transfer recipient address is required');
+    }
+    const amt = BigInt(microCcd);
+    if (amt < 0n) throw new Error('transfer microCcd must be non-negative');
+    const amount = CcdAmount.fromMicroCcd(amt);
+
+    let memo;
+    if (memoBytes !== undefined && memoBytes !== null) {
+        let buf;
+        if (Buffer.isBuffer(memoBytes)) buf = memoBytes;
+        else if (memoBytes instanceof Uint8Array) buf = Buffer.from(memoBytes);
+        else if (typeof memoBytes === 'string') {
+            if (!/^(?:[0-9a-f]{2})*$/i.test(memoBytes)) {
+                throw new Error('memoBytes hex string must be even-length hexadecimal');
+            }
+            buf = Buffer.from(memoBytes, 'hex');
+        } else {
+            throw new TypeError('memoBytes must be a Buffer, Uint8Array, or hex string');
+        }
+        memo = new DataBlob(buf);
+    }
+    return memo !== undefined ? { toAddress, amount, memo } : { toAddress, amount };
+}
+
+/** Sends a native CCD transfer (with memo when memoBytes is given) and waits for finalization on testnet. */
+export function sendTransferWithMemo({
+    to,
+    microCcd,
+    memoBytes,
+    who = loadSigner(),
+    nodeClient,
+    pollOpts,
+    onSigned,
+    expectedNonce,
+} = {}) {
+    const params = encodeSimpleTransferParams({ to, microCcd, memoBytes });
+    const builder = params.memo
+        ? Transaction.transfer({ toAddress: params.toAddress, amount: params.amount }, params.memo)
+        : Transaction.transfer({ toAddress: params.toAddress, amount: params.amount });
+    const mergedPollOpts = {
+        ...(pollOpts ?? {}),
+        ...(onSigned !== undefined ? { onSigned } : {}),
+        ...(expectedNonce !== undefined ? { expectedNonce } : {}),
+    };
+    return signSendWait(builder, who, nodeClient, mergedPollOpts);
+}
+
+function validateSenderSignaturesShape(senderSigs, declaredNumSignatures) {
+    if (!senderSigs || typeof senderSigs !== 'object' || Array.isArray(senderSigs)) {
+        throw new Error('sponsored transaction missing sender signatures');
+    }
+    let total = 0;
+    for (const [credIdx, credSigs] of Object.entries(senderSigs)) {
+        if (!/^(?:0|[1-9][0-9]*)$/.test(credIdx) || !credSigs || typeof credSigs !== 'object' || Array.isArray(credSigs)) {
+            throw new Error('malformed credential signature map in sponsored transaction');
+        }
+        for (const [keyIdx, sigHex] of Object.entries(credSigs)) {
+            if (!/^(?:0|[1-9][0-9]*)$/.test(keyIdx) || typeof sigHex !== 'string' || !/^[0-9a-f]{128}$/i.test(sigHex)) {
+                throw new Error('malformed Ed25519 signature in sponsored transaction');
+            }
+            total += 1;
+        }
+    }
+    if (total === 0 || BigInt(total) > declaredNumSignatures) {
+        throw new Error(`sender signature count (${total}) invalid for declared numSignatures=${declaredNumSignatures}`);
+    }
+}
+
+/**
+ * Builds and owner-signs a Concordium Protocol 10 fee-sponsored V1 `CIS-8004.setMetadata` transaction
+ * ready for transport to the witness sponsor via `Transaction.toJSONString`.
+ */
+export async function buildSignedSponsoredSetMetadata({
+    tokenId,
+    key = ANCHOR_KEY,
+    valueUtf8,
+    who = loadSigner(),
+    sponsorAddress,
+    expectedNonce,
+    expiryEpochSeconds,
+    nodeClient,
+} = {}) {
+    if (!who || typeof who.address !== 'string' || !who.sender || !who.signer) {
+        throw new Error('valid owner signer { address, sender, signer } is required');
+    }
+    if (typeof sponsorAddress !== 'string' || sponsorAddress.length === 0) {
+        throw new Error('sponsorAddress is required');
+    }
+    const sponsorAddr = AccountAddress.fromBase58(sponsorAddress);
+    if (sponsorAddr.address !== sponsorAddress) {
+        throw new Error(`sponsorAddress ${sponsorAddress} is not in canonical Base58Check form`);
+    }
+    if (isSameAccount(sponsorAddr.address, who.address)) {
+        throw new Error('sponsor account cannot be the same as owner account');
+    }
+
+    const c = nodeClient ?? (await client());
+    await assertTestnet(c);
+
+    const cs = await withRpcRetry(() => c.getConsensusStatus());
+    const tipBlockHash = cs.lastFinalizedBlock;
+    const paramBuf = encodeSetMetadataParam(tokenId, key, valueUtf8);
+    const contract = registryContractAddress();
+    const receiveName = ReceiveName.fromString('CIS-8004.setMetadata');
+
+    const dryRun = await withRpcRetry(() =>
+        c.invokeContract(
+            {
+                invoker: who.sender,
+                contract,
+                method: receiveName,
+                parameter: Parameter.fromBuffer(paramBuf),
+            },
+            tipBlockHash,
+        ),
+    );
+    if (dryRun.tag !== 'success') {
+        throw new Error(`dry-run CIS-8004.setMetadata failed: ${JSON.stringify(dryRun.reason ?? dryRun, bigintSafe)}`);
+    }
+    const used = Number(dryRun.usedEnergy?.value ?? dryRun.usedEnergy);
+    const energy = Math.max(used + 500, Math.ceil(used * 1.25));
+    if (!(energy > 0 && energy <= MAX_REGISTRY_ENERGY)) {
+        throw new Error(`CIS-8004.setMetadata estimated ${energy} energy (cap ${MAX_REGISTRY_ENERGY}); refusing to sign`);
+    }
+
+    const next = await withRpcRetry(() => c.getNextAccountNonce(who.sender));
+    let exp = BigInt(next.nonce?.value ?? next.nonce);
+    if (expectedNonce !== undefined && expectedNonce !== null) {
+        const wanted = BigInt(expectedNonce);
+        if (next.allFinal !== true || exp !== wanted) {
+            throw new Error(
+                `owner nonce CAS failed for ${who.address}: expected finalized nonce ${wanted}, got ${exp} (allFinal=${next.allFinal})`,
+            );
+        }
+        exp = wanted;
+    }
+
+    let resolvedExpiry;
+    if (expiryEpochSeconds !== undefined && expiryEpochSeconds !== null) {
+        resolvedExpiry = BigInt(expiryEpochSeconds);
+        if (resolvedExpiry <= 0n) throw new Error(`invalid expiryEpochSeconds: ${expiryEpochSeconds}`);
+    } else {
+        const tipBlock = await withRpcRetry(() => c.getBlockInfo(tipBlockHash));
+        resolvedExpiry = BigInt(Math.floor(tipBlock.blockSlotTime.getTime() / 1000) + 300);
+    }
+
+    const payload = {
+        amount: CcdAmount.zero(),
+        address: contract,
+        receiveName,
+        message: Parameter.fromBuffer(paramBuf),
+    };
+    const signable = Transaction.updateContract(payload, Energy.create(energy))
+        .addMetadata({
+            sender: who.sender,
+            nonce: SequenceNumber.create(exp),
+            expiry: TransactionExpiry.fromEpochSeconds(resolvedExpiry),
+        })
+        .addSponsor(sponsorAddr)
+        .build();
+
+    const withSender = await Transaction.sign(signable, who.signer);
+    return {
+        transactionJson: Transaction.toJSONString(withSender),
+        nonce: Number(exp),
+        expiryEpochSeconds: Number(resolvedExpiry),
+        energy,
+    };
+}
+
+/**
+ * Strictly validates an owner-signed Protocol 10 sponsored `CIS-8004.setMetadata` transaction against all
+ * fail-closed invariants, co-signs as sponsor, submits to Concordium testnet, and polls for finalization.
+ */
+export async function validateAndSponsorSetMetadata({
+    transactionJson,
+    expectedOwner,
+    expectedSponsor,
+    expectedTokenId,
+    expectedKey = ANCHOR_KEY,
+    expectedValueUtf8,
+    maxEnergy = MAX_REGISTRY_ENERGY,
+    maxExpiryLeadSeconds = 3600,
+    sponsorSigner,
+    nodeClient,
+    pollOpts,
+} = {}) {
+    if (typeof transactionJson !== 'string' || transactionJson.trim().length === 0) {
+        throw new Error('transactionJson must be a non-empty JSON string');
+    }
+    if (typeof expectedOwner !== 'string' || AccountAddress.fromBase58(expectedOwner).address !== expectedOwner) {
+        throw new Error('expectedOwner must be a canonical Base58Check account address');
+    }
+    if (typeof expectedSponsor !== 'string' || AccountAddress.fromBase58(expectedSponsor).address !== expectedSponsor) {
+        throw new Error('expectedSponsor must be a canonical Base58Check account address');
+    }
+    if (isSameAccount(expectedOwner, expectedSponsor)) {
+        throw new Error('sponsor account cannot be the same as owner account');
+    }
+    const signerObj = sponsorSigner?.signer ?? sponsorSigner;
+    if (!signerObj || typeof signerObj.sign !== 'function') {
+        throw new Error('sponsorSigner with sign() is required');
+    }
+    if (sponsorSigner?.address !== undefined && sponsorSigner.address !== expectedSponsor) {
+        throw new Error(`sponsorSigner ${sponsorSigner.address} does not match expectedSponsor ${expectedSponsor}`);
+    }
+
+    const c = nodeClient ?? (await client());
+    await assertTestnet(c);
+
+    let rawJson;
+    try {
+        rawJson = JSON.parse(transactionJson);
+    } catch (err) {
+        throw new Error(`invalid transactionJson JSON: ${err.message}`);
+    }
+    if (!rawJson || typeof rawJson !== 'object' || Array.isArray(rawJson)) {
+        throw new Error('transactionJson must decode to a JSON object');
+    }
+
+    let parsed;
+    try {
+        // Note: @concordium/web-sdk@12.0.3 Transaction.fromJSONString throws `fromJSON is not a function`; signableFromJSON is required.
+        parsed = Transaction.signableFromJSON(rawJson);
+    } catch (err) {
+        throw new Error(`invalid signable transaction payload: ${err.message}`);
+    }
+
+    if (parsed.version !== 1 || !Transaction.isSignable(parsed) || !Transaction.isSponsorable(parsed)) {
+        throw new Error('transaction must be a v1 signable sponsorable transaction');
+    }
+    const rawSponsorSig = parsed.signatures?.sponsor;
+    const hasSponsorSig =
+        rawSponsorSig !== undefined &&
+        (typeof rawSponsorSig !== 'object' ||
+            rawSponsorSig === null ||
+            Array.isArray(rawSponsorSig) ||
+            Object.keys(rawSponsorSig).length > 0);
+    if (hasSponsorSig) {
+        throw new Error('transaction already contains a sponsor signature');
+    }
+    if (parsed.payload?.type !== AccountTransactionType.Update) {
+        throw new Error(`unexpected transaction payload type ${parsed.payload?.type}; expected Update`);
+    }
+    const attachedMicroCcd = BigInt(parsed.payload.amount?.microCcdAmount ?? parsed.payload.amount ?? 0n);
+    if (attachedMicroCcd !== 0n) {
+        throw new Error(`refusing non-zero CCD amount ${attachedMicroCcd} on sponsored setMetadata`);
+    }
+    if (!isRegistryAddress(parsed.payload.address)) {
+        throw new Error('sponsored transaction does not target pinned registry <12802,0>');
+    }
+    if (parsed.payload.receiveName?.value !== 'CIS-8004.setMetadata') {
+        throw new Error(`sponsored transaction calls ${parsed.payload.receiveName?.value}, expected CIS-8004.setMetadata`);
+    }
+
+    const expectedParam = encodeSetMetadataParam(expectedTokenId, expectedKey, expectedValueUtf8);
+    const actualParam = Buffer.from(Parameter.toBuffer(parsed.payload.message));
+    if (!actualParam.equals(expectedParam)) {
+        throw new Error('sponsored transaction parameter bytes do not match expected CIS-8004.setMetadata arguments');
+    }
+    if (parsed.header?.sender?.address !== expectedOwner) {
+        throw new Error(`sponsored transaction sender ${parsed.header?.sender?.address} must exactly match owner ${expectedOwner}`);
+    }
+    if (parsed.header?.sponsor?.account?.address !== expectedSponsor) {
+        throw new Error(
+            `sponsored transaction sponsor ${parsed.header?.sponsor?.account?.address} does not match expected sponsor ${expectedSponsor}`,
+        );
+    }
+    if (parsed.header?.sponsor?.numSignatures !== 1n) {
+        throw new Error(`sponsored transaction sponsor.numSignatures must be 1, got ${parsed.header?.sponsor?.numSignatures}`);
+    }
+    const numSigs = parsed.header?.numSignatures;
+    if (typeof numSigs !== 'bigint' || numSigs < 1n || numSigs > 10n) {
+        throw new Error(`sponsored transaction numSignatures ${numSigs} outside allowed [1, 10]`);
+    }
+    const execEnergy = parsed.header?.executionEnergyAmount?.value;
+    if (typeof execEnergy !== 'bigint' || execEnergy <= 0n || execEnergy > BigInt(maxEnergy)) {
+        throw new Error(`sponsored transaction executionEnergyAmount ${execEnergy} exceeds allowed cap ${maxEnergy}`);
+    }
+    validateSenderSignaturesShape(parsed.signatures?.sender, numSigs);
+
+    const cs = await withRpcRetry(() => c.getConsensusStatus());
+    const tipBlockHash = cs.lastFinalizedBlock;
+    const tipBlock = await withRpcRetry(() => c.getBlockInfo(tipBlockHash));
+    const finalizedChainEpochSec = BigInt(Math.floor(tipBlock.blockSlotTime.getTime() / 1000));
+    const txExpiry = parsed.header?.expiry?.expiryEpochSeconds;
+    if (
+        typeof txExpiry !== 'bigint' ||
+        txExpiry <= finalizedChainEpochSec ||
+        txExpiry > finalizedChainEpochSec + BigInt(maxExpiryLeadSeconds)
+    ) {
+        throw new Error(
+            `sponsored transaction expiry ${txExpiry} outside valid window (${finalizedChainEpochSec}, ${finalizedChainEpochSec + BigInt(maxExpiryLeadSeconds)}]`,
+        );
+    }
+
+    const ownerAccountInfo = await withRpcRetry(() => c.getAccountInfo(parsed.header.sender, tipBlockHash));
+    if (!ownerAccountInfo || !ownerAccountInfo.accountCredentials || typeof ownerAccountInfo.accountThreshold !== 'number') {
+        throw new Error(`owner account ${expectedOwner} missing credential keys for signature verification`);
+    }
+    const sigValid = await Transaction.verifySignature(parsed, parsed.signatures.sender, ownerAccountInfo);
+    if (!sigValid) {
+        throw new Error('invalid owner signature on sponsored setMetadata transaction');
+    }
+
+    const dryRun = await withRpcRetry(() =>
+        c.invokeContract(
+            {
+                invoker: parsed.header.sender,
+                contract: registryContractAddress(),
+                method: ReceiveName.fromString('CIS-8004.setMetadata'),
+                parameter: parsed.payload.message,
+            },
+            tipBlockHash,
+        ),
+    );
+    if (dryRun.tag !== 'success') {
+        throw new Error(`dry-run CIS-8004.setMetadata failed: ${JSON.stringify(dryRun.reason ?? dryRun, bigintSafe)}`);
+    }
+    const usedEnergy = BigInt(dryRun.usedEnergy?.value ?? dryRun.usedEnergy ?? 0n);
+    if (usedEnergy > execEnergy) {
+        throw new Error(`dry-run usedEnergy (${usedEnergy}) exceeds transaction executionEnergyAmount (${execEnergy})`);
+    }
+
+    // Clone signatures before Transaction.sponsor because it mutates signatures in place.
+    const cleanSignable = {
+        version: 1,
+        header: parsed.header,
+        payload: parsed.payload,
+        signatures: { sender: structuredClone(parsed.signatures.sender) },
+    };
+    const sponsored = await Transaction.sponsor(cleanSignable, signerObj);
+    const finalized = Transaction.finalize(sponsored);
+    const txHash = Buffer.from(Transaction.getAccountTransactionHash(finalized)).toString('hex');
+
+    const { onSigned, ...waitOpts } = pollOpts ?? {};
+    if (onSigned) {
+        await onSigned({ txHash, expiryEpochSeconds: Number(txExpiry), finalized });
+    }
+    const sentHash = await c.sendTransaction(finalized);
+    const finalizedRes = await waitForFinalizedPolling(c, sentHash ?? txHash, waitOpts);
+    return { hash: finalizedRes.hash, summary: finalizedRes.summary, txHash };
 }
 
 /**
@@ -800,6 +1289,7 @@ export async function readRegistryHistory(
                             height: h,
                             summaries,
                             txIdx,
+                            txIndex: summary.index !== undefined && summary.index !== null ? Number(summary.index) : txIdx,
                             traceIdx,
                             logIdx,
                             txHash: summary.hash.toString(),
@@ -1049,7 +1539,8 @@ export async function readRegistryHistory(
                             if (summary.type !== 'accountTransaction' || !isSameAccount(txSender, owner)) {
                                 throw new Error(`MetadataSet for token ${targetTokenId} at block ${h} was submitted by ${txSender || 'non-account'}, not owner ${owner}`);
                             }
-                            collected.push({ ...meta, sender: txSender, txHash, blockHeight: Number(h) });
+                            const txIndex = summary.index !== undefined && summary.index !== null ? Number(summary.index) : txIdx;
+                            collected.push({ ...meta, sender: txSender, txHash, blockHeight: Number(h), txIndex });
                         }
                     }
                 }
@@ -1071,6 +1562,7 @@ export async function readRegistryHistory(
         regHeight: Number(regHeight),
         regBlockHash: regBlockHash.toString(),
         mintTxHash: mintHit.txHash,
+        mintTxIndex: mintHit.txIndex,
         owner,
         scannedBlocks: discoveredHeights.length,
         ownerNonceSpan,
@@ -1082,11 +1574,93 @@ export async function readRegistryHistory(
 export const chainIsUnbroken = (anchors) => anchors.every((a, i) => a.prevAnchorTx === (i === 0 ? null : anchors[i - 1].txHash));
 export const coverageGrows = (anchors) => anchors.every((a, i) => a.toSeq > (i === 0 ? 0 : anchors[i - 1].toSeq));
 
+function parseWitnessEventValue(event, owner) {
+    const val = utf8Fatal.decode(event.value);
+    if (val === '') return null;
+    let parsed;
+    try {
+        parsed = AccountAddress.fromBase58(val);
+    } catch (err) {
+        throw new Error(`countersign.witness value in tx ${event.txHash} is invalid Base58Check: ${err.message}`);
+    }
+    if (parsed.address !== val) {
+        throw new Error(`countersign.witness value in tx ${event.txHash} is not in canonical Base58Check form`);
+    }
+    if (owner && isSameAccount(val, owner)) {
+        throw new Error(`countersign.witness in tx ${event.txHash} cannot equal owner account ${owner}`);
+    }
+    return val;
+}
+
+function walkWitnessTimeline(history) {
+    if (!history || !Array.isArray(history.events)) {
+        throw new Error('history with events array is required');
+    }
+    let activeWitness = null;
+    let sawWitnessEvent = false;
+    let lastWitnessEvent = null;
+    const transitions = [];
+    const anchorSpecs = [];
+    for (let eventIdx = 0; eventIdx < history.events.length; eventIdx++) {
+        const e = history.events[eventIdx];
+        if (e.key === WITNESS_KEY) {
+            sawWitnessEvent = true;
+            activeWitness = parseWitnessEventValue(e, history.owner);
+            lastWitnessEvent = {
+                witness: activeWitness,
+                txHash: e.txHash,
+                blockHeight: e.blockHeight,
+                timestampMs: e.timestampMs,
+                sender: e.sender,
+                txIndex: e.txIndex ?? null,
+                eventIndex: eventIdx,
+            };
+            transitions.push(lastWitnessEvent);
+        } else if (e.key === ANCHOR_KEY) {
+            anchorSpecs.push({
+                event: e,
+                eventIndex: eventIdx,
+                authorizedWitness: activeWitness,
+                witnessEvent: lastWitnessEvent,
+            });
+        }
+    }
+    return {
+        currentWitness: activeWitness,
+        sawWitnessEvent,
+        transitions,
+        anchorSpecs,
+    };
+}
+
+/**
+ * Chronologically replays `countersign.witness` MetadataSet events in `history.events`, enforcing canonical non-owner
+ * Base58Check values (or empty string to clear). Performs zero RPCs.
+ */
+export function extractWitnessState(history) {
+    const { currentWitness, sawWitnessEvent, transitions } = walkWitnessTimeline(history);
+    return { currentWitness, sawWitnessEvent, transitions };
+}
+
+/**
+ * Confirms on-chain `CIS-8004.getMetadata(tokenId, 'countersign.witness')` agrees with the reconstructed
+ * `MetadataSet` timeline (accounting for CIS-8004 storing cleared metadata as `""` rather than deleting the key).
+ */
+export function witnessMatchesOnChain(witnessState, onChainWitness) {
+    if (witnessState.currentWitness !== null && witnessState.currentWitness !== undefined) {
+        return onChainWitness === witnessState.currentWitness;
+    }
+    if (witnessState.sawWitnessEvent === false) {
+        return onChainWitness === null;
+    }
+    return onChainWitness === null || onChainWitness === '';
+}
+
 /** Loads and decodes every register-data anchor transaction referenced in MetadataSet history. */
 export async function loadAnchorsFromHistory(history, nodeClient, tipBlockHeight) {
-    const pointers = history.events.filter((e) => e.key === ANCHOR_KEY);
+    const { anchorSpecs } = walkWitnessTimeline(history);
     const pool = createRpcPool(5);
-    return pool.map(pointers, async (p) => {
+    return pool.map(anchorSpecs, async ({ event: p, eventIndex, authorizedWitness, witnessEvent }) => {
         const txHash = utf8Fatal.decode(p.value);
         if (!TX_RE.test(txHash)) {
             throw new Error(`the pointer was once set to a value that is not a transaction hash (in ${p.txHash})`);
@@ -1101,19 +1675,26 @@ export async function loadAnchorsFromHistory(history, nodeClient, tipBlockHeight
             sender: tx.sender,
             blockTime: tx.blockTime,
             blockHeight: tx.blockHeight,
+            pointerBlockHeight: p.blockHeight,
+            pointerTxIndex: p.txIndex ?? null,
+            pointerEventIndex: eventIndex,
+            authorizedWitness,
+            witnessEvent,
         };
     });
 }
 
-/** Verifies chain continuity, ownership, trail commitments, and current pointer alignment across existing anchors. */
+/** Verifies chain continuity, authorized signer, trail commitments, and current pointer alignment across existing anchors. */
 export function verifyExistingAnchors(existing, { tokenId, ownerAccount, commitmentAt, currentPointer }) {
     if (!chainIsUnbroken(existing) || !coverageGrows(existing)) {
         throw new Error('the existing anchors do not form one chain; refusing to add to it');
     }
     const getCommitment = typeof commitmentAt === 'function' ? commitmentAt : (seq) => commitmentAt.get(seq);
     for (const a of existing) {
-        if (!isSameAccount(a.sender, ownerAccount) || a.tokenId !== tokenId) {
-            throw new Error(`existing anchor ${a.txHash} does not belong to owner ${ownerAccount} / token ${tokenId}`);
+        const expectedSender = a.authorizedWitness ?? ownerAccount;
+        if (!isSameAccount(a.sender, expectedSender) || a.tokenId !== tokenId) {
+            const role = a.authorizedWitness ? 'witness' : 'owner';
+            throw new Error(`existing anchor ${a.txHash} does not belong to authorized ${role} ${expectedSender} / token ${tokenId}`);
         }
         const got = getCommitment(a.toSeq);
         const gotHex = Buffer.isBuffer(got) ? got.toString('hex') : got;
