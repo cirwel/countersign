@@ -656,48 +656,8 @@ export async function readRegisterData(txHash, nodeClient) {
         data,
         blockTime: block.blockSlotTime.toISOString(),
         blockHeight: Number(block.blockHeight),
-        blockHash: status.outcome.blockHash,
         txIndex: s.index !== undefined && s.index !== null ? Number(s.index) : null,
     };
-}
-
-/**
- * Resolves the 0-based transaction index of `txHash` within a finalized `blockHash` by streaming
- * `getBlockTransactionEvents` under a bounded timeout. Used as a same-block tie-breaker when
- * `getBlockItemStatus` omits `summary.index`.
- */
-export async function readTransactionBlockIndex(blockHash, txHash, nodeClient, { streamTimeoutMs = 15_000 } = {}) {
-    if (!blockHash || typeof txHash !== 'string') return null;
-    const c = nodeClient ?? (await client());
-    await assertTestnet(c);
-    return withRpcRetry(async () => {
-        const ac = new AbortController();
-        let timedOut = false;
-        const timeoutErr = Object.assign(
-            new Error(`gRPC stream timed out after ${streamTimeoutMs}ms`),
-            { code: 'DEADLINE_EXCEEDED' },
-        );
-        const timer = setTimeout(() => {
-            timedOut = true;
-            ac.abort(timeoutErr);
-        }, streamTimeoutMs);
-        try {
-            let txIdx = 0;
-            for await (const s of c.getBlockTransactionEvents(blockHash, ac.signal)) {
-                if (ac.signal.aborted) throw ac.signal.reason;
-                if (s?.hash?.toString() === txHash) {
-                    return s.index !== undefined && s.index !== null ? Number(s.index) : txIdx;
-                }
-                txIdx += 1;
-            }
-            return null;
-        } catch (err) {
-            if (timedOut) throw timeoutErr;
-            throw err;
-        } finally {
-            clearTimeout(timer);
-        }
-    });
 }
 
 /** Reads a finalized plain CCD transfer (or transferWithMemo) directly from a Concordium testnet node. */

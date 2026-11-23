@@ -34,6 +34,7 @@ import {
     loadAnchorsFromHistory,
     loadSignerFromFile,
     readAccountTransfer,
+    readRegisterData,
     readRegistryHistory,
     sendRegisterData,
     sendTransferWithMemo,
@@ -322,7 +323,9 @@ function createWitnessMockNode({
     const addTx = (tx) => {
         const h = BigInt(tx.height);
         if (!state.txsByHeight.has(h)) state.txsByHeight.set(h, []);
-        state.txsByHeight.get(h).push(tx);
+        const list = state.txsByHeight.get(h);
+        tx.index = BigInt(list.length);
+        list.push(tx);
         if (tx.sender) state.nonceChanges.push({ sender: tx.sender, height: h });
         if (tx.registerData) state.registerDataByHash.set(tx.hash, tx);
         if (tx.transfer) state.transferByHash.set(tx.hash, tx);
@@ -442,6 +445,7 @@ function createWitnessMockNode({
                     yield {
                         type: 'accountTransaction',
                         transactionType: 'registerData',
+                        index: tx.index,
                         hash: { toString: () => tx.hash },
                         sender: { address: tx.sender },
                         dataRegistered: { data: tx.registerData.toString('hex') },
@@ -450,6 +454,7 @@ function createWitnessMockNode({
                     yield {
                         type: 'accountTransaction',
                         transactionType: tx.transfer.memoHex !== null ? 'transferWithMemo' : 'transfer',
+                        index: tx.index,
                         hash: { toString: () => tx.hash },
                         sender: { address: tx.sender },
                     };
@@ -457,6 +462,7 @@ function createWitnessMockNode({
                     yield {
                         type: 'accountTransaction',
                         transactionType: 'update',
+                        index: tx.index,
                         hash: { toString: () => tx.hash },
                         sender: { address: tx.sender },
                         rejectReason: tx.rejectReason ?? undefined,
@@ -489,6 +495,7 @@ function createWitnessMockNode({
                         summary: {
                             type: 'accountTransaction',
                             transactionType: 'registerData',
+                            index: rd.index ?? 0n,
                             sender: { address: rd.sender },
                             dataRegistered: { data: rd.registerData.toString('hex') },
                         },
@@ -505,6 +512,7 @@ function createWitnessMockNode({
                             summary: {
                                 type: 'accountTransaction',
                                 transactionType: 'failed',
+                                index: xfer.index ?? 0n,
                                 sender: { address: xfer.sender },
                                 rejectReason: xfer.rejectReason,
                             },
@@ -518,6 +526,7 @@ function createWitnessMockNode({
                         summary: {
                             type: 'accountTransaction',
                             transactionType: xfer.transfer.memoHex !== null ? 'transferWithMemo' : 'transfer',
+                            index: xfer.index ?? 0n,
                             sender: { address: xfer.sender },
                             transfer: {
                                 tag: 'Transferred',
@@ -542,12 +551,14 @@ function createWitnessMockNode({
                                 ? {
                                       type: 'accountTransaction',
                                       transactionType: 'failed',
+                                      index: found.index ?? 0n,
                                       sender: { address: found.sender },
                                       rejectReason: found.rejectReason,
                                   }
                                 : {
                                       type: 'accountTransaction',
                                       transactionType: 'update',
+                                      index: found.index ?? 0n,
                                       sender: { address: found.sender },
                                       events: found.contractEvents ?? [],
                                   },
@@ -4411,6 +4422,8 @@ test('pendingAnchor recovery bounds window at predecessor & enforces same-block 
         const sOk = path.join(dir, 'same-block-ok.state.json');
         writeTrail(tOk, header, records.slice(0, 1));
 
+        assert.equal((await readRegisterData(earlyRd.txHash, nodeFail)).txIndex, 0);
+
         const sameOkH = nodeOk.state.tipHeight + 1n;
         nodeOk.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: WITNESS_1, height: sameOkH });
         const okRd = nodeOk.addRegisterData({
@@ -4418,6 +4431,7 @@ test('pendingAnchor recovery bounds window at predecessor & enforces same-block 
             height: sameOkH,
             data: encodeAnchor({ tokenId: TOKEN_ID, toSeq: 1, commitment: c1, prevAnchorTx: null }),
         });
+        assert.equal((await readRegisterData(okRd.txHash, nodeOk)).txIndex, 1);
 
         fs.writeFileSync(
             sOk,
@@ -4459,5 +4473,65 @@ test('pendingAnchor recovery bounds window at predecessor & enforces same-block 
         assert.equal(resOk.anchoredSeq, 1);
         assert.equal(nodeOk.state.metadata[ANCHOR_KEY], okRd.txHash);
         assert.equal(JSON.parse(fs.readFileSync(sOk, 'utf8')).pendingAnchor, null);
+
+        // Index-less summary in a same-block tie fails closed without falling back to getBlockTransactionEvents
+        const nodeNoIdx = createWitnessMockNode({
+            owner: OWNER_A,
+            accountVerifyKeys: new Map([[OWNER_A, ownerSigner.verifyKey]]),
+        });
+        const tNoIdx = path.join(dir, 'same-block-noidx.jsonl');
+        const sNoIdx = path.join(dir, 'same-block-noidx.state.json');
+        writeTrail(tNoIdx, header, records.slice(0, 1));
+        const sameNoIdxH = nodeNoIdx.state.tipHeight + 1n;
+        nodeNoIdx.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: WITNESS_2, height: sameNoIdxH });
+        const noIdxAnchorData = encodeAnchor({ tokenId: TOKEN_ID, toSeq: 1, commitment: c1, prevAnchorTx: null });
+        const noIdxRd = nodeNoIdx.addRegisterData({ sender: WITNESS_2, height: sameNoIdxH, data: noIdxAnchorData });
+        nodeNoIdx.state.statusByHash.set(noIdxRd.txHash, {
+            status: 'finalized',
+            outcome: {
+                blockHash: `block-${sameNoIdxH}`,
+                summary: {
+                    type: 'accountTransaction',
+                    transactionType: 'registerData',
+                    sender: { address: WITNESS_2 },
+                    dataRegistered: { data: noIdxAnchorData.toString('hex') },
+                },
+            },
+        });
+        assert.equal((await readRegisterData(noIdxRd.txHash, nodeNoIdx)).txIndex, null);
+        fs.writeFileSync(
+            sNoIdx,
+            JSON.stringify({
+                version: 1,
+                tokenId: TOKEN_ID,
+                agentUuid: AGENT_UUID,
+                lastAnchoredSeq: 0,
+                pendingAnchor: {
+                    txHash: noIdxRd.txHash,
+                    toSeq: 1,
+                    commitment: c1.toString('hex'),
+                    prevAnchorTx: null,
+                    sender: WITNESS_2,
+                    expiryEpochSeconds: Math.floor(Date.now() / 1000) + 300,
+                },
+                pendingPayment: null,
+            }) + '\n',
+            { mode: 0o600 },
+        );
+        const workerNoIdx = new AnchorWorker({
+            uuid: AGENT_UUID,
+            tokenId: TOKEN_ID,
+            trailPath: tNoIdx,
+            statePath: sNoIdx,
+            tokenLockDir,
+            everyRecords: 1,
+            once: true,
+            nodeClient: nodeNoIdx,
+            signer: ownerSigner,
+            source: () => [],
+            log: () => {},
+        });
+        await assert.rejects(() => workerNoIdx.tick(), /disagrees with current trail\/owner state/);
+        assert.equal(nodeNoIdx.state.metadata[ANCHOR_KEY], undefined);
     }
 });

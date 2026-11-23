@@ -23,7 +23,6 @@ import {
     readMetadataText,
     readRegisterData,
     readRegistryHistory,
-    readTransactionBlockIndex,
     sendRegisterData,
     sendSetMetadata,
     sendTransferWithMemo,
@@ -1768,20 +1767,10 @@ export class AnchorWorker {
                         const initialActiveWitness = d.prevAnchorTx
                             ? (predecessor?.authorizedWitness ?? null)
                             : null;
-                        let rdTxIndex = rd.txIndex ?? null;
-                        if (minBlockHeight !== null && rdTxIndex === null && rd.blockHash) {
-                            const rdH = BigInt(rd.blockHeight);
-                            const needsSameBlockOrder =
-                                rdH === BigInt(minBlockHeight) ||
-                                witnessStateAtTip.transitions.some((t) => BigInt(t.blockHeight) === rdH);
-                            if (needsSameBlockOrder) {
-                                rdTxIndex = await readTransactionBlockIndex(rd.blockHash, pending.txHash, c);
-                            }
-                        }
                         const wasHistoricallyAuthorizedSigner = wasSignerAuthorizedInWindow({
                             sender: rd.sender,
                             rdBlockHeight: rd.blockHeight,
-                            rdTxIndex,
+                            rdTxIndex: rd.txIndex,
                             ownerAccount: agent.ownerAccount,
                             minBlockHeight,
                             minTxIndex,
