@@ -247,7 +247,7 @@ export const commands = {
                         }
                         if (parsedState?.pendingPayment) {
                             throw new Error(
-                                `pending payment ${parsedState.pendingPayment.paymentTxHash} exists in ${stateFile}; finish it with "countersign watch --once" or reuse --payment-signature ${parsedState.pendingPayment.paymentSignature} before paying again`,
+                                `pending payment ${parsedState.pendingPayment.paymentTxHash} exists in ${stateFile}; finish it with "countersign watch --once --witness-url ${parsedState.pendingPayment.witnessUrl ?? '<witness-url>'}" before running "countersign anchor"`,
                             );
                         }
                     }
@@ -433,6 +433,15 @@ export const commands = {
                                 expectedWitnessAccount: witnessHealth.witnessAccount,
                                 allowPrivate: allowPrivateWitness,
                             });
+                            await verifyWitnessAnchorOnChain({
+                                nodeClient: c,
+                                txHash: wRes.txHash,
+                                activeWitness,
+                                tokenId,
+                                toSeq: count,
+                                commitmentHex: last.toString('hex'),
+                                prevAnchorTx: prev?.txHash ?? null,
+                            });
                         } catch (err) {
                             if (finalizedPaymentSig) {
                                 console.error(
@@ -441,15 +450,6 @@ export const commands = {
                             }
                             throw err;
                         }
-                        await verifyWitnessAnchorOnChain({
-                            nodeClient: c,
-                            txHash: wRes.txHash,
-                            activeWitness,
-                            tokenId,
-                            toSeq: count,
-                            commitmentHex: last.toString('hex'),
-                            prevAnchorTx: prev?.txHash ?? null,
-                        });
                         hash = wRes.txHash;
                         console.log(`witnessed seq 1..${count}: ${EXPLORER_TX(hash)}`);
                     } else {

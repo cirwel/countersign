@@ -250,9 +250,10 @@ export async function createWitnessServer(opts = {}) {
     const c = nodeClient ?? (await client());
     await assertTestnet(c);
 
-    const resolvedLedgerPath =
-        ledgerPath ?? path.join(os.homedir(), '.config', 'countersign', 'witness-ledger.json');
-    const ledgerLockPath = !injectedLedger ? `${canonicalTrailPath(resolvedLedgerPath)}.lock` : null;
+    const resolvedLedgerPath = canonicalTrailPath(
+        ledgerPath ?? path.join(os.homedir(), '.config', 'countersign', 'witness-ledger.json'),
+    );
+    const ledgerLockPath = !injectedLedger ? `${resolvedLedgerPath}.lock` : null;
     const releaseLedgerLock = ledgerLockPath ? await acquireFileLock(ledgerLockPath) : null;
 
     let ledger;
@@ -446,7 +447,7 @@ export async function createWitnessServer(opts = {}) {
 
         await withTokenLock(tokenId, async () => {
             if (isDisconnected()) return;
-            const { tipBlockHash, currentAnchor, prev } = await loadVerifiedTokenState(tokenId, { checkCard: true });
+            const { tipBlockHash, agent, currentAnchor, prev } = await loadVerifiedTokenState(tokenId, { checkCard: true });
             if (prevAnchorTx !== (prev?.txHash ?? null) || currentAnchor !== (prev?.txHash ?? null)) {
                 throw new HttpError(
                     409,
@@ -475,10 +476,12 @@ export async function createWitnessServer(opts = {}) {
 
             const rawPaymentSig = req.headers[HEADER_PAYMENT_SIGNATURE];
             if (rawPaymentSig === undefined) {
+                ledger.assertNoEquivocation(binding, null);
                 sendJson(res, 402, paymentRequired, { [HEADER_PAYMENT_REQUIRED]: encodedPr });
                 return;
             }
             if (Array.isArray(rawPaymentSig) || typeof rawPaymentSig !== 'string') {
+                ledger.assertNoEquivocation(binding, null);
                 sendJson(
                     res,
                     402,
@@ -590,6 +593,7 @@ export async function createWitnessServer(opts = {}) {
                 try {
                     paymentId = verifier.derivePaymentId(rawPaymentSig);
                 } catch (err) {
+                    ledger.assertNoEquivocation(binding, null);
                     sendJson(
                         res,
                         402,
@@ -636,10 +640,29 @@ export async function createWitnessServer(opts = {}) {
             }
 
             let broadcastStarted = false;
+            let claimedPaymentId = null;
             try {
+                if (!alreadySettled) {
+                    const preSettledAlias = paymentResult?.transaction
+                        ? ledger.findBySettlementTx({
+                              network: paymentResult?.network ?? CONCORDIUM_TESTNET_CAIP2,
+                              transaction: paymentResult.transaction,
+                          })
+                        : null;
+                    if (preSettledAlias && preSettledAlias.paymentId !== paymentId) {
+                        paymentId = preSettledAlias.paymentId;
+                        reconciled = await reconcileExistingEntry(paymentId);
+                        if (reconciled?.handled) return;
+                        if (reconciled?.alreadySettled) {
+                            alreadySettled = true;
+                            paymentResult = { paymentId, ...(reconciled.settledInfo ?? {}) };
+                        }
+                    }
+                }
                 if (!alreadySettled) {
                     ledger.assertNoEquivocation(binding, paymentId);
                     ledger.claim(paymentId, binding);
+                    claimedPaymentId = paymentId;
                     const latestAnchor = await readMetadataText(tokenId, ANCHOR_KEY, { nodeClient: c });
                     if (latestAnchor !== (prev?.txHash ?? null)) {
                         throw new HttpError(409, 'countersign.anchor moved concurrently; refusing to anchor');
@@ -653,27 +676,68 @@ export async function createWitnessServer(opts = {}) {
                             requirements: paymentRequired.accepts[0],
                             expectedMemoHex,
                         });
-                        paymentResult = {
-                            ...paymentResult,
-                            payer: settled?.payer ?? paymentResult?.payer ?? null,
-                            transaction: settled?.transaction ?? null,
-                            network: settled?.network ?? CONCORDIUM_TESTNET_CAIP2,
-                        };
+                        const settledNet = settled?.network ?? CONCORDIUM_TESTNET_CAIP2;
+                        const settledTx = settled?.transaction ?? null;
+                        const settledAlias = settledTx
+                            ? ledger.findBySettlementTx({ network: settledNet, transaction: settledTx })
+                            : null;
+                        if (settledAlias && settledAlias.paymentId !== paymentId) {
+                            ledger.releasePreBroadcast(paymentId);
+                            claimedPaymentId = null;
+                            paymentId = settledAlias.paymentId;
+                            reconciled = await reconcileExistingEntry(paymentId);
+                            if (reconciled?.handled) return;
+                            if (reconciled?.alreadySettled) {
+                                alreadySettled = true;
+                                paymentResult = { paymentId, ...(reconciled.settledInfo ?? {}) };
+                            } else {
+                                ledger.claim(paymentId, binding);
+                                claimedPaymentId = paymentId;
+                            }
+                        }
+                        if (!alreadySettled) {
+                            paymentResult = {
+                                ...paymentResult,
+                                payer: settled?.payer ?? paymentResult?.payer ?? null,
+                                transaction: settledTx,
+                                network: settledNet,
+                            };
+                        }
                     }
-                    ledger.markSettled(paymentId, {
-                        payer: paymentResult?.payer ?? null,
-                        transaction: paymentResult?.transaction ?? paymentResult?.paymentTxHash ?? null,
-                        network: paymentResult?.network ?? CONCORDIUM_TESTNET_CAIP2,
-                    });
-                } else {
-                    ledger.assertNoEquivocation(binding, paymentId);
+                    if (!alreadySettled) {
+                        ledger.markSettled(paymentId, {
+                            payer: paymentResult?.payer ?? null,
+                            transaction: paymentResult?.transaction ?? paymentResult?.paymentTxHash ?? null,
+                            network: paymentResult?.network ?? CONCORDIUM_TESTNET_CAIP2,
+                        });
+                        claimedPaymentId = null;
+                    }
                 }
+                ledger.assertNoEquivocation(binding, paymentId);
 
                 const anchorRes = await withSignerLock(async () => {
                     if (isDisconnected()) {
                         throw new HttpError(499, 'client disconnected before witness broadcast');
                     }
-                    const latestAnchor = await readMetadataText(tokenId, ANCHOR_KEY, { nodeClient: c });
+                    const bcastCs = await withRpcRetry(() => c.getConsensusStatus());
+                    const bcastTip = bcastCs.lastFinalizedBlock;
+                    const bcastAgent = await readAgentOf(tokenId, { blockHash: bcastTip, nodeClient: c });
+                    if (
+                        !bcastAgent ||
+                        bcastAgent.status !== 'Active' ||
+                        !isSameAccount(bcastAgent.ownerAccount, agent.ownerAccount) ||
+                        isSameAccount(signer.address, bcastAgent.ownerAccount)
+                    ) {
+                        throw new HttpError(409, `token ${tokenId} state or ownership changed before witness broadcast`);
+                    }
+                    const bcastWitness = await readMetadataText(tokenId, WITNESS_KEY, { blockHash: bcastTip, nodeClient: c });
+                    if (bcastWitness === null || !isSameAccount(bcastWitness, signer.address)) {
+                        throw new HttpError(
+                            409,
+                            `witness authorization changed (${bcastWitness ?? 'cleared'}) before broadcast`,
+                        );
+                    }
+                    const latestAnchor = await readMetadataText(tokenId, ANCHOR_KEY, { blockHash: bcastTip, nodeClient: c });
                     if (latestAnchor !== (prev?.txHash ?? null)) {
                         throw new HttpError(409, 'countersign.anchor moved concurrently; refusing to anchor');
                     }
@@ -716,9 +780,9 @@ export async function createWitnessServer(opts = {}) {
                     buildRespHeaders(result.txHash, paymentResult?.payer ?? null, false),
                 );
             } catch (err) {
-                if (!broadcastStarted) {
-                    // Deletes only status === 'claimed'; 'settled' stays persisted for idempotent retry.
-                    ledger.releasePreBroadcast(paymentId);
+                if (!broadcastStarted && claimedPaymentId) {
+                    // Deletes only status === 'claimed' claimed by this request; 'settled' stays persisted for idempotent retry.
+                    ledger.releasePreBroadcast(claimedPaymentId);
                 }
                 throw err;
             }
@@ -849,61 +913,78 @@ export async function createWitnessServer(opts = {}) {
         });
     };
 
-    server = http.createServer(async (req, res) => {
-        let clientDisconnected = false;
-        const markDisconnected = () => {
-            if (!res.writableFinished) clientDisconnected = true;
-        };
-        req.on('aborted', markDisconnected);
-        res.on('close', markDisconnected);
-        const isDisconnected = () =>
-            Boolean(clientDisconnected || res.destroyed || res.writableEnded || res.socket?.destroyed);
+    const inFlightRequests = new Set();
+    let closing = false;
+    server = http.createServer((req, res) => {
+        let task = null;
+        let done = false;
+        const p = (async () => {
+            try {
+                if (closing) {
+                    sendJson(res, 503, { error: 'witness server is shutting down' });
+                    return;
+                }
+                let clientDisconnected = false;
+                const markDisconnected = () => {
+                    if (!res.writableFinished) clientDisconnected = true;
+                };
+                req.on('aborted', markDisconnected);
+                res.on('close', markDisconnected);
+                const isDisconnected = () =>
+                    Boolean(closing || clientDisconnected || res.destroyed || res.writableEnded || res.socket?.destroyed);
 
-        try {
-            const reqUrl = new URL(req.url ?? '/', 'http://localhost');
-            if (req.method === 'GET' && reqUrl.pathname === '/health') {
-                sendJson(res, 200, {
-                    ok: true,
-                    network: 'testnet',
-                    genesis: TESTNET_GENESIS,
-                    registry: { ...REGISTRY },
-                    witnessAccount: signer.address,
-                    payTo: resolvedPayTo,
-                    priceMicroCcd: priceStr,
-                    paymentScheme: 'exact',
-                    sponsorPointer: Boolean(sponsorPointer),
-                });
-                return;
-            }
-            if (reqUrl.pathname === '/v1/anchor') {
-                if (req.method !== 'POST') {
-                    sendJson(res, 405, { error: 'method not allowed' });
-                    return;
+                try {
+                    const reqUrl = new URL(req.url ?? '/', 'http://localhost');
+                    if (req.method === 'GET' && reqUrl.pathname === '/health') {
+                        sendJson(res, 200, {
+                            ok: true,
+                            network: 'testnet',
+                            genesis: TESTNET_GENESIS,
+                            registry: { ...REGISTRY },
+                            witnessAccount: signer.address,
+                            payTo: resolvedPayTo,
+                            priceMicroCcd: priceStr,
+                            paymentScheme: 'exact',
+                            sponsorPointer: Boolean(sponsorPointer),
+                        });
+                        return;
+                    }
+                    if (reqUrl.pathname === '/v1/anchor') {
+                        if (req.method !== 'POST') {
+                            sendJson(res, 405, { error: 'method not allowed' });
+                            return;
+                        }
+                        await handleAnchor(req, res, reqUrl, isDisconnected);
+                        return;
+                    }
+                    if (reqUrl.pathname === '/v1/sponsor-pointer') {
+                        if (req.method !== 'POST') {
+                            sendJson(res, 405, { error: 'method not allowed' });
+                            return;
+                        }
+                        await handleSponsorPointer(req, res, isDisconnected);
+                        return;
+                    }
+                    sendJson(res, 404, { error: 'not found' });
+                } catch (err) {
+                    const status = Number.isInteger(err?.statusCode) ? err.statusCode : 500;
+                    if (status >= 500) {
+                        log?.(`witness error: ${err.message}`);
+                    }
+                    sendJson(
+                        res,
+                        status,
+                        { error: err.message, ...(err.bodyExtra ?? {}) },
+                        err.extraHeaders ?? {},
+                    );
                 }
-                await handleAnchor(req, res, reqUrl, isDisconnected);
-                return;
+            } finally {
+                done = true;
+                if (task) inFlightRequests.delete(task);
             }
-            if (reqUrl.pathname === '/v1/sponsor-pointer') {
-                if (req.method !== 'POST') {
-                    sendJson(res, 405, { error: 'method not allowed' });
-                    return;
-                }
-                await handleSponsorPointer(req, res, isDisconnected);
-                return;
-            }
-            sendJson(res, 404, { error: 'not found' });
-        } catch (err) {
-            const status = Number.isInteger(err?.statusCode) ? err.statusCode : 500;
-            if (status >= 500) {
-                log?.(`witness error: ${err.message}`);
-            }
-            sendJson(
-                res,
-                status,
-                { error: err.message, ...(err.bodyExtra ?? {}) },
-                err.extraHeaders ?? {},
-            );
-        }
+        })();
+        task = p;
+        if (!done) inFlightRequests.add(task);
     });
     server.requestTimeout = requestTimeoutMs;
 
@@ -911,11 +992,22 @@ export async function createWitnessServer(opts = {}) {
     const close = async () => {
         if (closed) return;
         closed = true;
+        closing = true;
         try {
-            if (server.listening) {
-                server.closeAllConnections?.();
-                await new Promise((resolve) => server.close(() => resolve()));
+            const wasListening = server.listening;
+            const closePromise = wasListening
+                ? new Promise((resolve) => server.close(() => resolve()))
+                : Promise.resolve();
+            if (wasListening) {
+                server.closeIdleConnections?.();
             }
+            while (inFlightRequests.size > 0) {
+                await Promise.allSettled([...inFlightRequests]);
+            }
+            if (wasListening) {
+                server.closeAllConnections?.();
+            }
+            await closePromise;
         } finally {
             await releaseLedgerLock?.();
         }

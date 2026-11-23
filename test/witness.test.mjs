@@ -2306,7 +2306,7 @@ test('client maxPriceMicroCcd, payTo/witness pinning, 210s default timeout, pend
                 allowPrivateWitness: true,
                 maxPriceMicroCcd: '1000000',
             }),
-        /pending payment/,
+        (err) => /pending payment/.test(err.message) && /countersign watch --once --witness-url/.test(err.message),
     );
 
     // Append seq 3 before restart: AnchorWorker MUST resume pendingPayment for toSeq=2 without paying again, then anchor seq 3 cleanly
@@ -2569,6 +2569,109 @@ test('witness ledger file lock, cross-token signer nonce mutex, maxQueuedPerToke
     ]);
     const statuses = qReqs.map((r) => r.status).sort((a, b) => a - b);
     assert.deepEqual(statuses, [200, 200, 429]);
+
+    // Symlinked --ledger canonicalizes lock path, stays a symlink, and close() drains in-flight handlers before releasing lock
+    const closeDrainLedger = path.join(dir, 'drain-ledger.json');
+    const symDrainLedger = path.join(dir, 'drain-ledger-link.json');
+    fs.writeFileSync(closeDrainLedger, JSON.stringify({ version: 1, payments: {}, sponsorPointers: {} }) + '\n', { mode: 0o600 });
+    fs.symlinkSync(closeDrainLedger, symDrainLedger);
+
+    let enterSlowSend;
+    const enteredSlowSend = new Promise((r) => {
+        enterSlowSend = r;
+    });
+    let releaseSlowSend;
+    const holdSlowSend = new Promise((r) => {
+        releaseSlowSend = r;
+    });
+    const slowDrainNode = Object.assign(Object.create(multiNode), {
+        async sendTransaction(finalized) {
+            if (finalized.payload.type === AccountTransactionType.RegisterData) {
+                enterSlowSend();
+                await holdSlowSend;
+            }
+            return multiNode.sendTransaction(finalized);
+        },
+    });
+    const drainSrv = await startWitnessServer({
+        host: '127.0.0.1',
+        port: 0,
+        priceMicroCcd: '0',
+        signer: witnessSigner,
+        ledgerPath: symDrainLedger,
+        nodeClient: slowDrainNode,
+        verifier: { async verify() { return { paymentId: 'drain-pay-1', payer: PAYER_3 }; } },
+        fetchCard: async () => baseNode.card.bytes,
+        log: () => {},
+    });
+    cleanups.push(() => drainSrv.close());
+    // Second server pointing at the canonical target of symDrainLedger MUST be blocked while drainSrv holds lock
+    await assert.rejects(
+        () =>
+            startWitnessServer({
+                host: '127.0.0.1',
+                port: 0,
+                priceMicroCcd: '0',
+                signer: witnessSigner,
+                ledgerPath: closeDrainLedger,
+                nodeClient: slowDrainNode,
+                log: () => {},
+            }),
+        /already held/,
+    );
+
+    const drainCommit = '4'.repeat(64);
+    const drainReqPromise = fetch(`${drainSrv.url}/v1/anchor`, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            [HEADER_PAYMENT_SIGNATURE]: encodeX402Header({ x402Version: 2, payload: { drain: 1 } }),
+        },
+        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 3, commitment: drainCommit, prevAnchorTx: bodyT1.txHash }),
+    });
+    await enteredSlowSend;
+
+    let closeSettled = false;
+    const closeP = drainSrv.close().then(() => {
+        closeSettled = true;
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(closeSettled, false, 'close() must wait for in-flight witness request to finish');
+    await assert.rejects(
+        () =>
+            startWitnessServer({
+                host: '127.0.0.1',
+                port: 0,
+                priceMicroCcd: '0',
+                signer: witnessSigner,
+                ledgerPath: closeDrainLedger,
+                nodeClient: slowDrainNode,
+                log: () => {},
+            }),
+        /already held/,
+        'ledger lock must remain held while close() drains in-flight request',
+    );
+
+    releaseSlowSend();
+    const drainRes = await drainReqPromise;
+    assert.equal(drainRes.status, 200);
+    await closeP;
+    assert.equal(closeSettled, true);
+    assert.equal(JSON.parse(fs.readFileSync(closeDrainLedger, 'utf8')).payments['drain-pay-1']?.status, 'committed');
+    assert.equal(fs.lstatSync(symDrainLedger).isSymbolicLink(), true, 'symlinked --ledger must stay a symlink');
+
+    const drainSrvReopen = await startWitnessServer({
+        host: '127.0.0.1',
+        port: 0,
+        priceMicroCcd: '0',
+        signer: witnessSigner,
+        ledgerPath: closeDrainLedger,
+        nodeClient: multiNode,
+        fetchCard: async () => baseNode.card.bytes,
+        log: () => {},
+    });
+    cleanups.push(() => drainSrvReopen.close());
+    await drainSrvReopen.close();
 
     await srv1.close();
     // Re-opening after close succeeds cleanly
@@ -2893,4 +2996,359 @@ test('validateAndSponsorSetMetadata enforces accountCredentials unconditionally 
     node.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: WITNESS_2 });
     await worker.tick();
     assert.ok(historyScans > scansAfterClear, 'external witness activation must invalidate idle fast path even when witnessUrl is null');
+});
+
+test('unsigned 402 equivocation 409, facilitator settlement-tx & legacy dedup, withSignerLock revocation 409, and CLI payment recovery hint', async () => {
+    const dir = makeTempDir();
+    const ownerSigner = await makeRealSigner(OWNER_A);
+    const witnessSigner = await makeRealSigner(WITNESS_1);
+
+    // 1. Unsigned 402 equivocation + facilitator settlement-tx dedup (including conflicting binding rejection)
+    const node = createWitnessMockNode({
+        owner: OWNER_A,
+        accountVerifyKeys: new Map([
+            [OWNER_A, ownerSigner.verifyKey],
+            [WITNESS_1, witnessSigner.verifyKey],
+        ]),
+    });
+    node.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: WITNESS_1 });
+
+    let currentSettleTx = 'fac-settled-tx-1';
+    const facSrv = https.createServer({ key: TEST_KEY_PEM, cert: TEST_CERT_PEM }, (req, res) => {
+        if (req.url === '/verify') {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ isValid: true, payer: PAYER_3 }));
+        } else if (req.url === '/settle') {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(
+                JSON.stringify({
+                    success: true,
+                    transaction: currentSettleTx,
+                    network: CONCORDIUM_TESTNET_CAIP2,
+                    payer: PAYER_3,
+                }),
+            );
+        }
+    });
+    await new Promise((r) => facSrv.listen(0, '127.0.0.1', r));
+    cleanups.push(async () => {
+        facSrv.closeAllConnections?.();
+        await new Promise((r) => facSrv.close(r));
+    });
+
+    const facVerifier = createFacilitatorVerifier({
+        facilitatorUrl: `https://127.0.0.1:${facSrv.address().port}`,
+        allowPrivate: true,
+        ca: Buffer.from(TEST_CERT_PEM),
+    });
+    const srv = await startWitnessServer({
+        host: '127.0.0.1',
+        port: 0,
+        signer: witnessSigner,
+        ledgerPath: path.join(dir, 'fac-dedup-ledger.json'),
+        nodeClient: node,
+        verifier: facVerifier,
+        fetchCard: async () => node.card.bytes,
+        log: () => {},
+    });
+    cleanups.push(() => srv.close());
+
+    const commitA = 'a'.repeat(64);
+    const commitB = 'b'.repeat(64);
+    const sigA1 = encodeX402Header({ x402Version: 2, payload: { envelope: 'A1' } });
+    const sigA2 = encodeX402Header({ x402Version: 2, payload: { envelope: 'A2' } });
+    const sigConflict = encodeX402Header({ x402Version: 2, payload: { envelope: 'A3' } });
+
+    const r1 = await fetch(`${srv.url}/v1/anchor`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [HEADER_PAYMENT_SIGNATURE]: sigA1 },
+        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 1, commitment: commitA, prevAnchorTx: null }),
+    });
+    assert.equal(r1.status, 200);
+    const b1 = await r1.json();
+    const rdAfterR1 = node.submitted.filter((t) => t.payload.type === AccountTransactionType.RegisterData).length;
+    assert.equal(rdAfterR1, 1);
+
+    // Distinct envelope settling to same transaction MUST return cached 200 without second RegisterData broadcast
+    const r2 = await fetch(`${srv.url}/v1/anchor`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [HEADER_PAYMENT_SIGNATURE]: sigA2 },
+        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 1, commitment: commitA, prevAnchorTx: null }),
+    });
+    assert.equal(r2.status, 200);
+    const b2 = await r2.json();
+    assert.equal(b2.txHash, b1.txHash);
+    assert.equal(decodeX402Header(r2.headers.get(HEADER_PAYMENT_RESPONSE)).cached, true);
+    assert.equal(node.submitted.filter((t) => t.payload.type === AccountTransactionType.RegisterData).length, 1);
+
+    // Unsigned POST for a conflicting commitment at the same predecessor MUST reject 409 BEFORE issuing 402
+    const unsignedEq = await fetch(`${srv.url}/v1/anchor`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 1, commitment: commitB, prevAnchorTx: null }),
+    });
+    assert.equal(unsignedEq.status, 409);
+    const unsignedEqBody = await unsignedEq.json();
+    assert.match(unsignedEqBody.error, /equivocating anchor request/i);
+
+    // Move ANCHOR_KEY forward and send a different binding whose /settle returns the same settled transaction -> 409,
+    // without releasing or overwriting the original committed entry
+    node.addSetMetadata({ sender: OWNER_A, key: ANCHOR_KEY, value: b1.txHash });
+    const rConflict = await fetch(`${srv.url}/v1/anchor`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [HEADER_PAYMENT_SIGNATURE]: sigConflict },
+        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 2, commitment: commitB, prevAnchorTx: b1.txHash }),
+    });
+    assert.equal(rConflict.status, 409);
+    assert.equal(node.submitted.filter((t) => t.payload.type === AccountTransactionType.RegisterData).length, 1);
+    await srv.close();
+
+    // 2. Legacy facilitator:<network>:<transaction> ledger key dedup on retry after upgrade
+    const legacyNode = createWitnessMockNode({
+        owner: OWNER_A,
+        accountVerifyKeys: new Map([
+            [OWNER_A, ownerSigner.verifyKey],
+            [WITNESS_1, witnessSigner.verifyKey],
+        ]),
+    });
+    legacyNode.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: WITNESS_1 });
+    const legacyTxHash = txHashFor('legacy-anchor-rd');
+    const legacyKey = `facilitator:${CONCORDIUM_TESTNET_CAIP2}:fac-legacy-99`;
+    const legacyLedgerPath = path.join(dir, 'legacy-ledger.json');
+    fs.writeFileSync(
+        legacyLedgerPath,
+        JSON.stringify({
+            version: 1,
+            payments: {
+                [legacyKey]: {
+                    paymentId: legacyKey,
+                    status: 'committed',
+                    binding: { tokenId: TOKEN_ID, toSeq: 1, commitment: commitA, prevAnchorTx: null },
+                    settled: { payer: PAYER_3, transaction: 'fac-legacy-99', network: CONCORDIUM_TESTNET_CAIP2 },
+                    txHash: legacyTxHash,
+                    expiryEpochSeconds: null,
+                    result: {
+                        txHash: legacyTxHash,
+                        witnessAccount: WITNESS_1,
+                        blockTime: '2023-11-14T22:13:20.000Z',
+                        blockHeight: 1500,
+                        sponsorAvailable: true,
+                    },
+                    createdAt: new Date().toISOString(),
+                    updatedAt: new Date().toISOString(),
+                },
+            },
+            sponsorPointers: {},
+        }) + '\n',
+        { mode: 0o600 },
+    );
+    currentSettleTx = 'fac-legacy-99';
+    const legacySrv = await startWitnessServer({
+        host: '127.0.0.1',
+        port: 0,
+        signer: witnessSigner,
+        ledgerPath: legacyLedgerPath,
+        nodeClient: legacyNode,
+        verifier: facVerifier,
+        fetchCard: async () => legacyNode.card.bytes,
+        log: () => {},
+    });
+    cleanups.push(() => legacySrv.close());
+
+    const rLegacy = await fetch(`${legacySrv.url}/v1/anchor`, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            [HEADER_PAYMENT_SIGNATURE]: encodeX402Header({ x402Version: 2, payload: { upgrade: 1 } }),
+        },
+        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 1, commitment: commitA, prevAnchorTx: null }),
+    });
+    assert.equal(rLegacy.status, 200);
+    const bLegacy = await rLegacy.json();
+    assert.equal(bLegacy.txHash, legacyTxHash);
+    assert.equal(decodeX402Header(rLegacy.headers.get(HEADER_PAYMENT_RESPONSE)).cached, true);
+    assert.equal(legacyNode.submitted.filter((t) => t.payload.type === AccountTransactionType.RegisterData).length, 0);
+    await legacySrv.close();
+
+    // 3. Witness cleared while second token waits in withSignerLock -> 409 and 0 RegisterData broadcasts for revoked token
+    const TOKEN_2 = '1316';
+    const baseRevNode = createWitnessMockNode({
+        owner: OWNER_A,
+        accountVerifyKeys: new Map([
+            [OWNER_A, ownerSigner.verifyKey],
+            [WITNESS_1, witnessSigner.verifyKey],
+        ]),
+    });
+    baseRevNode.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: WITNESS_1 });
+    const card2 = makeCardBytes({ badge: encodeBadge(TOKEN_2), ownerAccount: OWNER_A });
+    const agent2 = {
+        tokenId: TOKEN_2,
+        ownerAccount: OWNER_A,
+        agentUri: 'https://agent2.example/card.json',
+        metadataHashHex: card2.hashHex,
+        status: 'Active',
+        registeredAtMs: baseRevNode.timeForHeight(1000n),
+    };
+    const meta2 = { 'unitares.agent_uuid': AGENT_UUID, [WITNESS_KEY]: WITNESS_1 };
+    baseRevNode.state.txsByHeight.get(1000n).push({
+        height: 1000n,
+        hash: txHashFor('mint-rev-2'),
+        sender: OWNER_A,
+        contractEvents: [evMint(TOKEN_2, OWNER_A), evMetadataSet(TOKEN_2, WITNESS_KEY, WITNESS_1)],
+    });
+
+    let enterFirstRd;
+    const enteredFirstRd = new Promise((r) => {
+        enterFirstRd = r;
+    });
+    let releaseFirstRd;
+    const holdFirstRd = new Promise((r) => {
+        releaseFirstRd = r;
+    });
+    let holdOnce = true;
+    const revNode = Object.assign(Object.create(baseRevNode), {
+        async invokeContract(ctx, bh) {
+            const method = ctx.method.value ?? String(ctx.method);
+            const p = Buffer.from(ctx.parameter.buffer);
+            const reqTid = p.length >= 9 ? p.readBigUInt64LE(1).toString() : null;
+            if (reqTid === TOKEN_2) {
+                if (method === 'CIS-8004.agentOf') {
+                    return {
+                        tag: 'success',
+                        usedEnergy: { value: 1000n },
+                        returnValue: ReturnValue.fromBuffer(encodeAgentOfReturn(agent2)),
+                    };
+                }
+                if (method === 'CIS-8004.getMetadata') {
+                    const klen = p.readUInt32LE(9);
+                    const key = p.subarray(13, 13 + klen).toString('utf8');
+                    return {
+                        tag: 'success',
+                        usedEnergy: { value: 1000n },
+                        returnValue: ReturnValue.fromBuffer(encodeGetMetadataReturn(meta2[key] ?? null)),
+                    };
+                }
+            }
+            return baseRevNode.invokeContract(ctx, bh);
+        },
+        async sendTransaction(finalized) {
+            if (finalized.payload.type === AccountTransactionType.RegisterData && holdOnce) {
+                holdOnce = false;
+                enterFirstRd();
+                await holdFirstRd;
+            }
+            return baseRevNode.sendTransaction(finalized);
+        },
+    });
+
+    let t1Verified;
+    const t1VerifiedPromise = new Promise((r) => {
+        t1Verified = r;
+    });
+    const revSrv = await startWitnessServer({
+        host: '127.0.0.1',
+        port: 0,
+        priceMicroCcd: '0',
+        signer: witnessSigner,
+        ledgerPath: path.join(dir, 'rev-ledger.json'),
+        nodeClient: revNode,
+        verifier: {
+            async verify({ header }) {
+                const env = decodeX402Header(header);
+                if (env.payload.id === 'pay-t1') t1Verified();
+                return { paymentId: env.payload.id, payer: PAYER_3 };
+            },
+        },
+        fetchCard: async (uri) => (uri.includes('agent2') ? card2.bytes : baseRevNode.card.bytes),
+        log: () => {},
+    });
+    cleanups.push(() => revSrv.close());
+
+    const pT2 = fetch(`${revSrv.url}/v1/anchor`, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            [HEADER_PAYMENT_SIGNATURE]: encodeX402Header({ x402Version: 2, payload: { id: 'pay-t2' } }),
+        },
+        body: JSON.stringify({ tokenId: TOKEN_2, toSeq: 1, commitment: commitA, prevAnchorTx: null }),
+    });
+    await enteredFirstRd;
+
+    const pT1 = fetch(`${revSrv.url}/v1/anchor`, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            [HEADER_PAYMENT_SIGNATURE]: encodeX402Header({ x402Version: 2, payload: { id: 'pay-t1' } }),
+        },
+        body: JSON.stringify({ tokenId: TOKEN_ID, toSeq: 1, commitment: commitB, prevAnchorTx: null }),
+    });
+    await t1VerifiedPromise;
+    await new Promise((r) => setTimeout(r, 20));
+    revNode.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: '' });
+    releaseFirstRd();
+
+    const [resRevT2, resRevT1] = await Promise.all([pT2, pT1]);
+    assert.equal(resRevT2.status, 200);
+    assert.equal(resRevT1.status, 409);
+    assert.match((await resRevT1.json()).error, /witness authorization changed/i);
+    assert.equal(baseRevNode.submitted.filter((t) => t.payload.type === AccountTransactionType.RegisterData).length, 1);
+    await revSrv.close();
+
+    // 4. cli.mjs anchor preserves retry --payment-signature hint when verifyWitnessAnchorOnChain throws
+    const cliNode = createWitnessMockNode({
+        owner: OWNER_A,
+        accountVerifyKeys: new Map([
+            [OWNER_A, ownerSigner.verifyKey],
+            [WITNESS_1, witnessSigner.verifyKey],
+        ]),
+    });
+    cliNode.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: WITNESS_1 });
+    const cliFixtures = makeTrailFixtures(1);
+    const cliTrail = path.join(dir, 'cli-recovery.jsonl');
+    writeTrail(cliTrail, cliFixtures.header, cliFixtures.records);
+
+    const errLogs = [];
+    const origConsoleError = console.error;
+    console.error = (...args) => errLogs.push(args.map(String).join(' '));
+    try {
+        await assert.rejects(
+            () =>
+                commands.anchor({
+                    trail: cliTrail,
+                    state: path.join(dir, 'cli-recovery.state.json'),
+                    who: ownerSigner,
+                    nodeClient: cliNode,
+                    witnessUrl: 'https://witness.example',
+                    maxPriceMicroCcd: '1000000',
+                    fetchWitnessHealthFn: async () => ({
+                        witnessAccount: WITNESS_1,
+                        payTo: WITNESS_1,
+                        priceMicroCcd: '1000',
+                        sponsorPointer: false,
+                    }),
+                    requestWitnessAnchorFn: async ({ payFn, tokenId, toSeq, commitment, prevAnchorTx }) => {
+                        const prReq = createPaymentRequirements({
+                            payTo: WITNESS_1,
+                            amountMicroCcd: '1000',
+                            resource: 'https://witness.example/v1/anchor',
+                            tokenId,
+                            toSeq,
+                            commitment,
+                            prevAnchorTx,
+                            witnessAccount: WITNESS_1,
+                        }).accepts[0];
+                        await payFn(prReq);
+                        return { txHash: 'f'.repeat(64) };
+                    },
+                }),
+            /absent|not finalized|not found|registerData/i,
+        );
+    } finally {
+        console.error = origConsoleError;
+    }
+    assert.equal(cliNode.submitted.length, 1, 'payment transfer must have been sent before verification failure');
+    assert.ok(
+        errLogs.some((line) => /witness request failed after payment .* finalized; retry with --payment-signature [A-Za-z0-9+/=_-]+/.test(line)),
+        `expected recovery hint in stderr, got: ${errLogs.join('\n')}`,
+    );
 });

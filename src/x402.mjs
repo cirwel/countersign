@@ -277,6 +277,22 @@ export class PaymentLedger {
         return this.payments.get(paymentId) ?? null;
     }
 
+    findBySettlementTx({ network = CONCORDIUM_TESTNET_CAIP2, transaction } = {}) {
+        if (typeof transaction !== 'string' || transaction.length === 0) return null;
+        const legacyKey = `facilitator:${network}:${transaction}`;
+        const direct = this.payments.get(legacyKey);
+        if (direct) return direct;
+        for (const entry of this.payments.values()) {
+            if (
+                entry.settled?.transaction === transaction &&
+                (entry.settled?.network ?? CONCORDIUM_TESTNET_CAIP2) === network
+            ) {
+                return entry;
+            }
+        }
+        return null;
+    }
+
     assertNoEquivocation(binding, currentPaymentId = null) {
         const normBinding = normalizeBinding(binding);
         for (const e of this.payments.values()) {
