@@ -160,9 +160,10 @@ function assertNoPendingStateFiles(
             throw new Error(`corrupt anchor state file ${stateFile}: ${err.message}`);
         }
         if (parsedState?.pendingAnchor) {
-            const hint = trail
-                ? `finish it with "countersign anchor --trail ${trail} --tx ${parsedState.pendingAnchor.txHash}" or "countersign watch --once"`
-                : `finish or clear it with "countersign watch --once"`;
+            const hint =
+                callerCommand === 'set-witness'
+                    ? `reconcile it with "countersign watch --once" using the same --trail, --state, and --witness-url (if configured) options`
+                    : `finish it with "countersign anchor --trail ${trail} --tx ${parsedState.pendingAnchor.txHash}" or "countersign watch --once"`;
             throw new Error(
                 `pending anchor ${parsedState.pendingAnchor.txHash} exists in ${stateFile}; ${hint} before running "countersign ${callerCommand}"`,
             );
@@ -519,7 +520,7 @@ export const commands = {
     },
 
     /** Authorize or clear a separate witness account (`countersign.witness`) for a registry token. */
-    async 'set-witness'({ token, tokenId, witness, clear, trail, node, nodeClient, who: providedWho, ...opts }) {
+    async 'set-witness'({ token, tokenId, witness, clear, trail, force, node, nodeClient, who: providedWho, ...opts }) {
         const resolvedToken = token ?? tokenId;
         if (!/^(?:0|[1-9][0-9]*)$/.test(resolvedToken !== undefined && resolvedToken !== null ? String(resolvedToken) : '')) {
             throw new Error('--token <id> is required');
@@ -543,6 +544,16 @@ export const commands = {
         }
 
         const explicitState = opts.state ?? opts.statePath ?? null;
+        const forceRotate = Boolean(force);
+        if (forceRotate && (trail || explicitState !== null)) {
+            throw new Error('cannot combine --force with --trail or --state');
+        }
+        if (!forceRotate && !trail && explicitState === null) {
+            throw new Error(
+                'pass --trail <path> or --state <path> to verify no pending anchor/payment exists before rotating, or pass --force explicitly',
+            );
+        }
+
         const runSetWitness = async () => {
             const nodeInsecure = Boolean(opts.nodeInsecure ?? opts['node-insecure']);
             applyNodeOptions(node, nodeInsecure);
@@ -583,11 +594,12 @@ export const commands = {
             const { targetTrail, resolvedStatePath, legacyStatePath, trailLock, stateCandidates } =
                 resolveTrailStateContext(trail, explicitState);
             return withFileLock(trailLock, async () => {
-                if (fs.existsSync(targetTrail)) {
-                    const { header } = readTrail(targetTrail);
-                    if (String(header.token_id) !== tokenStr) {
-                        throw new Error(`trail ${trail} belongs to token ${header.token_id}, not ${tokenStr}`);
-                    }
+                if (!fs.existsSync(targetTrail)) {
+                    throw new Error(`trail file ${trail} does not exist; pass --force if rotating without local trail/state`);
+                }
+                const { header } = readTrail(targetTrail);
+                if (String(header.token_id) !== tokenStr) {
+                    throw new Error(`trail ${trail} belongs to token ${header.token_id}, not ${tokenStr}`);
                 }
                 return withFileLock(tokenLockPath(tokenStr, { tokenLockDir: opts.tokenLockDir }), async () => {
                     assertNoPendingStateFiles(stateCandidates, {
@@ -602,8 +614,14 @@ export const commands = {
         }
 
         return withFileLock(tokenLockPath(tokenStr, { tokenLockDir: opts.tokenLockDir }), async () => {
-            if (explicitState !== null) {
-                assertNoPendingStateFiles([canonicalTrailPath(explicitState)], { callerCommand: 'set-witness' });
+            if (!forceRotate && explicitState !== null) {
+                const canonicalState = canonicalTrailPath(explicitState);
+                if (!fs.existsSync(canonicalState)) {
+                    throw new Error(
+                        `state file ${explicitState} does not exist; pass --force if rotating without local trail/state`,
+                    );
+                }
+                assertNoPendingStateFiles([canonicalState], { callerCommand: 'set-witness' });
             }
             return await runSetWitness();
         });
@@ -1054,6 +1072,7 @@ if (isMainEntry()) {
         'once',
         'dry-run',
         'clear',
+        'force',
         'require-witness',
         'sponsor-pointer',
         'no-sponsor-pointer',

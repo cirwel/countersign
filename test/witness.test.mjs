@@ -1479,10 +1479,10 @@ test('cli.mjs set-witness, cli.mjs anchor --witness-url, and AnchorWorker witnes
 
     // 1. set-witness rejects self-witnessing and sets/clears cleanly
     await assert.rejects(
-        () => commands['set-witness']({ token: TOKEN_ID, witness: OWNER_A, who: ownerSigner, nodeClient: node }),
+        () => commands['set-witness']({ token: TOKEN_ID, witness: OWNER_A, force: true, who: ownerSigner, nodeClient: node }),
         /cannot be the same as token owner/,
     );
-    await runQuiet(() => commands['set-witness']({ token: TOKEN_ID, witness: WITNESS_1, who: ownerSigner, nodeClient: node }));
+    await runQuiet(() => commands['set-witness']({ token: TOKEN_ID, witness: WITNESS_1, force: true, who: ownerSigner, nodeClient: node }));
     assert.equal(node.state.metadata[WITNESS_KEY], WITNESS_1);
 
     // Start witness server via cli.mjs witness command
@@ -1641,15 +1641,15 @@ test('cli.mjs set-witness, cli.mjs anchor --witness-url, and AnchorWorker witnes
     // Verify clear witness via cli.mjs set-witness --clear and guard against non-finalized nonce / alias
     node.state.allFinal = false;
     await assert.rejects(
-        () => commands['set-witness']({ token: TOKEN_ID, clear: true, who: ownerSigner, nodeClient: node }),
+        () => commands['set-witness']({ token: TOKEN_ID, clear: true, force: true, who: ownerSigner, nodeClient: node }),
         /unfinalized/,
     );
     node.state.allFinal = true;
     await assert.rejects(
-        () => commands['set-witness']({ token: TOKEN_ID, clear: true, who: { ...ownerSigner, address: OWNER_A_ALIAS }, nodeClient: node }),
+        () => commands['set-witness']({ token: TOKEN_ID, clear: true, force: true, who: { ...ownerSigner, address: OWNER_A_ALIAS }, nodeClient: node }),
         /must exactly match registered owner/,
     );
-    await runQuiet(() => commands['set-witness']({ token: TOKEN_ID, clear: true, who: ownerSigner, nodeClient: node }));
+    await runQuiet(() => commands['set-witness']({ token: TOKEN_ID, clear: true, trail: workerTrail, who: ownerSigner, nodeClient: node }));
     assert.equal(node.state.metadata[WITNESS_KEY], '');
     assert.equal(currentHist.owner, OWNER_A);
 
@@ -3936,7 +3936,55 @@ test('witness rotation clears stale-signer pendingAnchor safely without wedging 
         { mode: 0o600 },
     );
 
-    // 1. set-witness rejects when pendingAnchor or pendingPayment exists in guarded state file
+    // 1. set-witness requires --trail/--state/--force, rejects --force combined or missing files, and refuses on pendingAnchor/pendingPayment
+    await assert.rejects(
+        () =>
+            commands['set-witness']({
+                token: TOKEN_ID,
+                witness: WITNESS_1,
+                who: ownerSigner,
+                nodeClient: node,
+                tokenLockDir,
+            }),
+        /pass --trail <path> or --state <path>.*--force/,
+    );
+    await assert.rejects(
+        () =>
+            commands['set-witness']({
+                token: TOKEN_ID,
+                witness: WITNESS_1,
+                trail: tPath,
+                force: true,
+                who: ownerSigner,
+                nodeClient: node,
+                tokenLockDir,
+            }),
+        /cannot combine --force/,
+    );
+    await assert.rejects(
+        () =>
+            commands['set-witness']({
+                token: TOKEN_ID,
+                witness: WITNESS_1,
+                trail: path.join(dir, 'missing-trail.jsonl'),
+                who: ownerSigner,
+                nodeClient: node,
+                tokenLockDir,
+            }),
+        /does not exist/,
+    );
+    await assert.rejects(
+        () =>
+            commands['set-witness']({
+                token: TOKEN_ID,
+                witness: WITNESS_1,
+                state: path.join(dir, 'missing-state.json'),
+                who: ownerSigner,
+                nodeClient: node,
+                tokenLockDir,
+            }),
+        /does not exist/,
+    );
     await assert.rejects(
         () =>
             commands['set-witness']({
@@ -3948,7 +3996,10 @@ test('witness rotation clears stale-signer pendingAnchor safely without wedging 
                 nodeClient: node,
                 tokenLockDir,
             }),
-        /pending anchor .* exists.*countersign set-witness/,
+        (err) =>
+            /pending anchor .* exists.*countersign watch --once/.test(err.message) &&
+            /countersign set-witness/.test(err.message) &&
+            !/anchor --tx/.test(err.message),
     );
     fs.writeFileSync(
         ppStatePath,
@@ -3978,6 +4029,7 @@ test('witness rotation clears stale-signer pendingAnchor safely without wedging 
                 commands['set-witness']({
                     token: TOKEN_ID,
                     witness: WITNESS_1,
+                    force: true,
                     who: ownerSigner,
                     nodeClient: node,
                     tokenLockDir,
@@ -4111,4 +4163,59 @@ test('witness rotation clears stale-signer pendingAnchor safely without wedging 
     });
     await assert.rejects(() => workerFail3.tick(), /disagrees with current trail\/owner state/);
     assert.equal(JSON.parse(fs.readFileSync(sPath, 'utf8')).pendingAnchor?.txHash, thirdPartyRd3.hash);
+
+    // 6. Later witness appointment + removal must NOT validate an earlier tx finalized before appointment
+    const earlyWitnessRd3 = node.addRegisterData({
+        sender: WITNESS_2,
+        data: encodeAnchor({ tokenId: TOKEN_ID, toSeq: 3, commitment: c3, prevAnchorTx: ptrAfter2 }),
+    });
+    node.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: WITNESS_2 });
+    node.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: '' });
+    sAfter2.pendingAnchor = {
+        txHash: earlyWitnessRd3.txHash,
+        toSeq: 3,
+        commitment: c3.toString('hex'),
+        prevAnchorTx: ptrAfter2,
+        sender: WITNESS_2,
+        expiryEpochSeconds: Math.floor(Date.now() / 1000) + 300,
+    };
+    fs.writeFileSync(sPath, JSON.stringify(sAfter2) + '\n', { mode: 0o600 });
+    await assert.rejects(() => workerFail3.tick(), /disagrees with current trail\/owner state/);
+    assert.equal(JSON.parse(fs.readFileSync(sPath, 'utf8')).pendingAnchor?.txHash, earlyWitnessRd3.txHash);
+
+    // 7. In-flight witness tx finalizing AFTER revocation STILL clears as orphaned when appointed beforehand
+    node.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: WITNESS_1 });
+    node.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: '' });
+    const inFlightRd3 = await sendRegisterData(
+        encodeAnchor({ tokenId: TOKEN_ID, toSeq: 3, commitment: c3, prevAnchorTx: ptrAfter2 }),
+        witnessSigner,
+        node,
+    );
+    sAfter2.pendingAnchor = {
+        txHash: inFlightRd3.hash,
+        toSeq: 3,
+        commitment: c3.toString('hex'),
+        prevAnchorTx: ptrAfter2,
+        sender: WITNESS_1,
+        expiryEpochSeconds: Math.floor(Date.now() / 1000) + 300,
+    };
+    fs.writeFileSync(sPath, JSON.stringify(sAfter2) + '\n', { mode: 0o600 });
+    const workerLive3 = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath: tPath,
+        statePath: sPath,
+        tokenLockDir,
+        everyRecords: 1,
+        once: true,
+        nodeClient: node,
+        signer: ownerSigner,
+        source: () => [],
+        log: () => {},
+    });
+    const liveRes3 = await workerLive3.tick();
+    assert.equal(liveRes3.anchored, true);
+    assert.equal(liveRes3.anchoredSeq, 3);
+    assert.equal(JSON.parse(fs.readFileSync(sPath, 'utf8')).pendingAnchor, null);
+    assert.equal(node.state.registerDataByHash.get(node.state.metadata[ANCHOR_KEY])?.sender, OWNER_A);
 });

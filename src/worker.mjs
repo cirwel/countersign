@@ -364,6 +364,38 @@ export async function withFileLock(
     }
 }
 
+/**
+ * Returns true if `sender` was authorized at some block in `[max(regHeight, prevBlockHeight), rdBlockHeight]`,
+ * preventing later witness appointments from validating earlier transactions while still recognizing in-flight
+ * transactions finalized shortly after revocation.
+ */
+function wasSignerAuthorizedInWindow({
+    sender,
+    rdBlockHeight,
+    ownerAccount,
+    regHeight,
+    transitions = [],
+}) {
+    const rdH = BigInt(rdBlockHeight);
+    const minH = BigInt(regHeight);
+    if (rdH < minH) return false;
+    let active = null;
+    for (const t of transitions) {
+        if (BigInt(t.blockHeight) <= minH) {
+            active = t.witness;
+        }
+    }
+    const authorized = [active ?? ownerAccount];
+    for (const t of transitions) {
+        const th = BigInt(t.blockHeight);
+        if (th > minH && th <= rdH) {
+            active = t.witness;
+            authorized.push(active ?? ownerAccount);
+        }
+    }
+    return authorized.some((acct) => isSameAccount(sender, acct));
+}
+
 /** Pure policy predicate determining whether unanchored records meet record-count or monotonic time thresholds. */
 export function shouldAnchor({ localSeq, anchoredSeq, lastAnchorMs, nowMs, everyRecords, everySeconds }) {
     if (localSeq <= anchoredSeq) return false;
@@ -1698,11 +1730,13 @@ export class AnchorWorker {
                         const activeWitness = witnessStateAtTip.currentWitness;
                         const expectedAnchorSender = activeWitness ?? agent.ownerAccount;
                         const senderAuthorizedNow = isSameAccount(rd.sender, expectedAnchorSender);
-                        const wasHistoricallyAuthorizedSigner =
-                            isSameAccount(rd.sender, agent.ownerAccount) ||
-                            witnessStateAtTip.transitions.some(
-                                (t) => t.witness !== null && isSameAccount(rd.sender, t.witness),
-                            );
+                        const wasHistoricallyAuthorizedSigner = wasSignerAuthorizedInWindow({
+                            sender: rd.sender,
+                            rdBlockHeight: rd.blockHeight,
+                            ownerAccount: agent.ownerAccount,
+                            regHeight: history.regHeight,
+                            transitions: witnessStateAtTip.transitions,
+                        });
                         const integrityOk =
                             d.tokenId === this.tokenId &&
                             d.toSeq === pending.toSeq &&
