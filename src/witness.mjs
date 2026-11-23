@@ -90,22 +90,23 @@ async function readJsonBody(req, res, maxBodyBytes, activeUploads = null) {
         let total = 0;
         let finished = false;
         let abortUpload = null;
+        const cleanup = () => {
+            req.off('data', onData);
+            req.off('end', onEnd);
+            req.off('error', onError);
+            req.off('aborted', onAborted);
+            req.off('close', onClose);
+            if (abortUpload) activeUploads?.delete(abortUpload);
+        };
         const finish = (val) => {
             if (finished) return;
             finished = true;
-            if (abortUpload) activeUploads?.delete(abortUpload);
+            cleanup();
             resolve(val);
         };
-        abortUpload = () => {
-            if (finished) return;
-            if (!res.headersSent && !res.destroyed && !res.writableEnded) {
-                sendJson(res, 503, { error: 'witness server is shutting down' }, { connection: 'close' });
-            }
-            req.destroy();
-            finish(null);
-        };
+        abortUpload = () => finish(null);
         activeUploads?.add(abortUpload);
-        req.on('data', (chunk) => {
+        const onData = (chunk) => {
             if (finished) return;
             const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
             total += b.byteLength;
@@ -116,8 +117,8 @@ async function readJsonBody(req, res, maxBodyBytes, activeUploads = null) {
                 return;
             }
             chunks.push(b);
-        });
-        req.on('end', () => {
+        };
+        const onEnd = () => {
             if (finished) return;
             let parsed;
             try {
@@ -134,17 +135,22 @@ async function readJsonBody(req, res, maxBodyBytes, activeUploads = null) {
                 return;
             }
             finish(parsed);
-        });
-        req.on('error', (err) => {
+        };
+        const onError = (err) => {
             if (!finished && !res.headersSent) {
                 sendJson(res, 400, { error: `request stream error: ${err.message}` });
             }
             finish(null);
-        });
-        req.on('aborted', () => finish(null));
-        req.on('close', () => {
+        };
+        const onAborted = () => finish(null);
+        const onClose = () => {
             if (!req.complete) finish(null);
-        });
+        };
+        req.on('data', onData);
+        req.on('end', onEnd);
+        req.on('error', onError);
+        req.on('aborted', onAborted);
+        req.on('close', onClose);
     });
 }
 
@@ -446,6 +452,14 @@ export async function createWitnessServer(opts = {}) {
 
     let server;
     const activeUploads = new Set();
+    let closing = false;
+    const abortIfDisconnected = (res, isDisconnected) => {
+        if (!isDisconnected()) return false;
+        if (closing && !res.headersSent && !res.destroyed && !res.writableEnded) {
+            sendJson(res, 503, { error: 'witness server is shutting down' }, { connection: 'close' });
+        }
+        return true;
+    };
     const getConfiguredOrigin = () => {
         if (configuredPublicOrigin) return configuredPublicOrigin;
         const addr = server?.listening ? server.address() : null;
@@ -456,12 +470,12 @@ export async function createWitnessServer(opts = {}) {
 
     const handleAnchor = async (req, res, reqUrl, isDisconnected) => {
         const rawBody = await readJsonBody(req, res, maxBodyBytes, activeUploads);
-        if (!rawBody || isDisconnected()) return;
+        if (!rawBody || abortIfDisconnected(res, isDisconnected)) return;
         const { tokenId, toSeq, commitment, prevAnchorTx } = validateAnchorRequestBody(rawBody);
         const binding = { tokenId, toSeq, commitment, prevAnchorTx };
 
         await withTokenLock(tokenId, async () => {
-            if (isDisconnected()) return;
+            if (abortIfDisconnected(res, isDisconnected)) return;
             const { tipBlockHash, agent, currentAnchor, prev } = await loadVerifiedTokenState(tokenId, { checkCard: true });
             if (prevAnchorTx !== (prev?.txHash ?? null) || currentAnchor !== (prev?.txHash ?? null)) {
                 throw new HttpError(
@@ -660,6 +674,20 @@ export async function createWitnessServer(opts = {}) {
             let broadcastStarted = false;
             let claimedPaymentId = null;
             let pendingAliasFrom = null;
+            const claimOrReconcile = async () => {
+                const claimRes = ledger.claim(paymentId, binding);
+                paymentId = claimRes.entry.paymentId;
+                if (claimRes.action === 'return_cached') {
+                    claimedPaymentId = null;
+                    reconciled = await reconcileExistingEntry(paymentId);
+                    if (reconciled?.handled) return true;
+                    alreadySettled = true;
+                    paymentResult = { paymentId, ...(claimRes.entry.settled ?? {}) };
+                    return false;
+                }
+                claimedPaymentId = paymentId;
+                return false;
+            };
             try {
                 if (!alreadySettled) {
                     const preSettledAlias = paymentResult?.transaction
@@ -683,49 +711,49 @@ export async function createWitnessServer(opts = {}) {
                 }
                 if (!alreadySettled) {
                     ledger.assertNoEquivocation(binding, paymentId);
-                    ledger.claim(paymentId, binding);
-                    claimedPaymentId = paymentId;
-                    const latestAnchor = await readMetadataText(tokenId, ANCHOR_KEY, { nodeClient: c });
-                    if (latestAnchor !== (prev?.txHash ?? null)) {
-                        throw new HttpError(409, 'countersign.anchor moved concurrently; refusing to anchor');
-                    }
-                    if (isDisconnected()) {
-                        throw new HttpError(499, 'client disconnected before payment settlement');
-                    }
-                    if (typeof verifier.settle === 'function') {
-                        const settled = await verifier.settle({
-                            header: rawPaymentSig,
-                            requirements: paymentRequired.accepts[0],
-                            expectedMemoHex,
-                        });
-                        const settledNet = settled?.network ?? CONCORDIUM_TESTNET_CAIP2;
-                        const settledTx = settled?.transaction ?? null;
-                        const settledAlias = settledTx
-                            ? ledger.findBySettlementTx({ network: settledNet, transaction: settledTx })
-                            : null;
-                        if (settledAlias && settledAlias.paymentId !== paymentId) {
-                            const aliasFrom = paymentId;
-                            ledger.releasePreBroadcast(aliasFrom);
-                            claimedPaymentId = null;
-                            paymentId = settledAlias.paymentId;
-                            reconciled = await reconcileExistingEntry(paymentId, { aliasFrom });
-                            if (reconciled?.handled) return;
-                            if (reconciled?.alreadySettled) {
-                                alreadySettled = true;
-                                paymentResult = { paymentId, ...(reconciled.settledInfo ?? {}) };
-                            } else {
-                                ledger.claim(paymentId, binding);
-                                claimedPaymentId = paymentId;
-                                pendingAliasFrom = aliasFrom;
-                            }
+                    if (await claimOrReconcile()) return;
+                    if (!alreadySettled) {
+                        const latestAnchor = await readMetadataText(tokenId, ANCHOR_KEY, { nodeClient: c });
+                        if (latestAnchor !== (prev?.txHash ?? null)) {
+                            throw new HttpError(409, 'countersign.anchor moved concurrently; refusing to anchor');
                         }
-                        if (!alreadySettled) {
-                            paymentResult = {
-                                ...paymentResult,
-                                payer: settled?.payer ?? paymentResult?.payer ?? null,
-                                transaction: settledTx,
-                                network: settledNet,
-                            };
+                        if (isDisconnected()) {
+                            throw new HttpError(499, 'client disconnected before payment settlement');
+                        }
+                        if (typeof verifier.settle === 'function') {
+                            const settled = await verifier.settle({
+                                header: rawPaymentSig,
+                                requirements: paymentRequired.accepts[0],
+                                expectedMemoHex,
+                            });
+                            const settledNet = settled?.network ?? CONCORDIUM_TESTNET_CAIP2;
+                            const settledTx = settled?.transaction ?? null;
+                            const settledAlias = settledTx
+                                ? ledger.findBySettlementTx({ network: settledNet, transaction: settledTx })
+                                : null;
+                            if (settledAlias && settledAlias.paymentId !== paymentId) {
+                                const aliasFrom = paymentId;
+                                ledger.releasePreBroadcast(aliasFrom);
+                                claimedPaymentId = null;
+                                paymentId = settledAlias.paymentId;
+                                reconciled = await reconcileExistingEntry(paymentId, { aliasFrom });
+                                if (reconciled?.handled) return;
+                                if (reconciled?.alreadySettled) {
+                                    alreadySettled = true;
+                                    paymentResult = { paymentId, ...(reconciled.settledInfo ?? {}) };
+                                } else {
+                                    if (await claimOrReconcile()) return;
+                                    pendingAliasFrom = aliasFrom;
+                                }
+                            }
+                            if (!alreadySettled) {
+                                paymentResult = {
+                                    ...paymentResult,
+                                    payer: settled?.payer ?? paymentResult?.payer ?? null,
+                                    transaction: settledTx,
+                                    network: settledNet,
+                                };
+                            }
                         }
                     }
                     if (!alreadySettled) {
@@ -833,12 +861,12 @@ export async function createWitnessServer(opts = {}) {
             return;
         }
         const rawBody = await readJsonBody(req, res, maxBodyBytes, activeUploads);
-        if (!rawBody || isDisconnected()) return;
+        if (!rawBody || abortIfDisconnected(res, isDisconnected)) return;
         const { tokenId, anchorTxHash, transactionJson } = validateSponsorRequestBody(rawBody);
         const requestHash = crypto.createHash('sha256').update(transactionJson, 'utf8').digest('hex');
 
         await withTokenLock(tokenId, async () => {
-            if (isDisconnected()) return;
+            if (abortIfDisconnected(res, isDisconnected)) return;
             const { tipBlockHash, agent, prev } = await loadVerifiedTokenState(tokenId, { checkCard: false });
 
             const existingSponsor = ledger.getSponsor(tokenId, anchorTxHash);
@@ -952,7 +980,6 @@ export async function createWitnessServer(opts = {}) {
     };
 
     const inFlightRequests = new Set();
-    let closing = false;
     server = http.createServer((req, res) => {
         let task = null;
         let done = false;
@@ -1017,6 +1044,21 @@ export async function createWitnessServer(opts = {}) {
                     );
                 }
             } finally {
+                if (closing && req.complete && res.headersSent && !res.writableFinished && !res.destroyed) {
+                    await new Promise((resolve) => {
+                        let doneWait = false;
+                        const finishWait = () => {
+                            if (doneWait) return;
+                            doneWait = true;
+                            res.off('finish', finishWait);
+                            res.off('close', finishWait);
+                            resolve();
+                        };
+                        res.on('finish', finishWait);
+                        res.on('close', finishWait);
+                        if (res.writableFinished || res.destroyed) finishWait();
+                    });
+                }
                 done = true;
                 if (task) inFlightRequests.delete(task);
             }

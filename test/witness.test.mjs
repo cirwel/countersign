@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { after, afterEach, test } from 'node:test';
@@ -3509,4 +3510,138 @@ test('unsigned 402 equivocation 409, facilitator settlement-tx & legacy dedup, w
     assert.equal(tipRaced, true, 'test should have simulated tip advancement during withSignerLock checks');
     assert.equal(baseTipNode.submitted.filter((t) => t.payload.type === AccountTransactionType.RegisterData).length, 0);
     await tipRaceSrv.close();
+
+    // 7. HTTP/1.1 pipelined partial upload behind in-flight Req 1 aborts reader without dropping Req 1's 200 response
+    const basePipeNode = createWitnessMockNode({
+        owner: OWNER_A,
+        accountVerifyKeys: new Map([
+            [OWNER_A, ownerSigner.verifyKey],
+            [WITNESS_1, witnessSigner.verifyKey],
+        ]),
+    });
+    basePipeNode.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: WITNESS_1 });
+
+    let enterPipeReq1;
+    const enteredPipeReq1 = new Promise((r) => {
+        enterPipeReq1 = r;
+    });
+    let releasePipeReq1;
+    const holdPipeReq1 = new Promise((r) => {
+        releasePipeReq1 = r;
+    });
+    const pipeNode = Object.assign(Object.create(basePipeNode), {
+        async sendTransaction(finalized) {
+            if (finalized.payload.type === AccountTransactionType.RegisterData) {
+                enterPipeReq1();
+                await holdPipeReq1;
+            }
+            return basePipeNode.sendTransaction(finalized);
+        },
+    });
+    const pipeLedgerPath = path.join(dir, 'pipe-ledger.json');
+    const pipeSrv = await startWitnessServer({
+        host: '127.0.0.1',
+        port: 0,
+        priceMicroCcd: '0',
+        signer: witnessSigner,
+        ledgerPath: pipeLedgerPath,
+        nodeClient: pipeNode,
+        verifier: { async verify() { return { paymentId: 'pipe-pay-1', payer: PAYER_3 }; } },
+        fetchCard: async () => basePipeNode.card.bytes,
+        log: () => {},
+    });
+    cleanups.push(() => pipeSrv.close());
+
+    let pipeReqCount = 0;
+    let markReq2Seen;
+    const req2Seen = new Promise((r) => {
+        markReq2Seen = r;
+    });
+    pipeSrv.server.on('request', () => {
+        pipeReqCount += 1;
+        if (pipeReqCount >= 2) markReq2Seen();
+    });
+
+    const pipeSock = net.connect(pipeSrv.port, '127.0.0.1');
+    cleanups.push(() => pipeSock.destroy());
+    let pipeReceived = '';
+    pipeSock.on('data', (chunk) => {
+        pipeReceived += chunk.toString('utf8');
+    });
+    const pipeSockClosed = new Promise((r) => pipeSock.once('close', r));
+
+    const bodyPipe1 = JSON.stringify({ tokenId: TOKEN_ID, toSeq: 1, commitment: commitA, prevAnchorTx: null });
+    const sigPipe1 = encodeX402Header({ x402Version: 2, payload: { pipe: 1 } });
+    pipeSock.write(
+        `POST /v1/anchor HTTP/1.1\r\n` +
+            `Host: 127.0.0.1:${pipeSrv.port}\r\n` +
+            `Content-Type: application/json\r\n` +
+            `${HEADER_PAYMENT_SIGNATURE}: ${sigPipe1}\r\n` +
+            `Content-Length: ${Buffer.byteLength(bodyPipe1)}\r\n\r\n` +
+            bodyPipe1 +
+            `POST /v1/anchor HTTP/1.1\r\n` +
+            `Host: 127.0.0.1:${pipeSrv.port}\r\n` +
+            `Content-Type: application/json\r\n` +
+            `Content-Length: 120\r\n\r\n` +
+            `{"tokenId":`,
+    );
+
+    await enteredPipeReq1;
+    await req2Seen;
+    await new Promise((r) => setTimeout(r, 20));
+
+    let pipeCloseSettled = false;
+    const pipeCloseP = pipeSrv.close().then(() => {
+        pipeCloseSettled = true;
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(pipeCloseSettled, false, 'close() must still wait for pipelined Req 1 to finish committing');
+
+    releasePipeReq1();
+    let pipeHangTimer;
+    try {
+        await Promise.race([
+            pipeCloseP,
+            new Promise((_, reject) => {
+                pipeHangTimer = setTimeout(() => reject(new Error('close() hung on pipelined partial upload')), 1500);
+            }),
+        ]);
+    } finally {
+        clearTimeout(pipeHangTimer);
+    }
+    await pipeSockClosed;
+
+    const pipeLedgerEntry = JSON.parse(fs.readFileSync(pipeLedgerPath, 'utf8')).payments['pipe-pay-1'];
+    assert.equal(pipeLedgerEntry?.status, 'committed');
+    assert.ok(pipeReceived.startsWith('HTTP/1.1 200 '), `expected HTTP 200 response for Req 1, got: ${pipeReceived}`);
+    assert.ok(pipeReceived.includes(pipeLedgerEntry.txHash), 'pipelined Req 1 client must receive committed txHash before close');
+
+    // 8. PaymentLedger enforces alias claim invariants and rolls back in-memory alias on _persist() failure
+    const aliasUnitPath = path.join(dir, 'alias-unit-ledger.json');
+    const unitLedger = new PaymentLedger(aliasUnitPath);
+    const unitBindingA = { tokenId: TOKEN_ID, toSeq: 1, commitment: commitA, prevAnchorTx: null };
+    const unitBindingB = { tokenId: TOKEN_ID, toSeq: 1, commitment: commitB, prevAnchorTx: null };
+    const canonTxHash = txHashFor('canon-rd-unit');
+    assert.equal(unitLedger.claim('pay-canon', unitBindingA).action, 'proceed');
+    unitLedger.markSettled('pay-canon', { payer: PAYER_3, transaction: 'tx-canon', network: CONCORDIUM_TESTNET_CAIP2 });
+    unitLedger.commit('pay-canon', { txHash: canonTxHash, witnessAccount: WITNESS_1 });
+    unitLedger.recordAlias('pay-alias-1', 'pay-canon');
+
+    const aliasClaimSame = unitLedger.claim('pay-alias-1', unitBindingA);
+    assert.equal(aliasClaimSame.action, 'return_cached');
+    assert.equal(aliasClaimSame.entry.paymentId, 'pay-canon');
+    assert.equal(unitLedger.payments.size, 1, 'claiming aliased ID must not insert a duplicate entry');
+    assert.throws(() => unitLedger.claim('pay-alias-1', unitBindingB), { statusCode: 409 });
+    assert.equal(unitLedger.payments.size, 1);
+
+    unitLedger._persist = () => {
+        throw new Error('simulated disk full');
+    };
+    assert.throws(() => unitLedger.recordAlias('pay-alias-fail', 'pay-canon'), /simulated disk full/);
+    assert.equal(unitLedger.paymentAliases.has('pay-alias-fail'), false, 'failed _persist must roll back in-memory alias');
+    assert.equal(unitLedger.resolvePaymentId('pay-alias-fail'), 'pay-alias-fail');
+    delete unitLedger._persist;
+    unitLedger.recordAlias('pay-alias-fail', 'pay-canon');
+    assert.equal(unitLedger.resolvePaymentId('pay-alias-fail'), 'pay-canon');
+    assert.equal(JSON.parse(fs.readFileSync(aliasUnitPath, 'utf8')).paymentAliases['pay-alias-fail'], 'pay-canon');
 });

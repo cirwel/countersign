@@ -324,7 +324,12 @@ export class PaymentLedger {
             throw conflictError(`cannot alias existing payment entry ${aliasPaymentId} to ${target}`);
         }
         this.paymentAliases.set(aliasPaymentId, target);
-        this._persist();
+        try {
+            this._persist();
+        } catch (err) {
+            this.paymentAliases.delete(aliasPaymentId);
+            throw err;
+        }
     }
 
     get(paymentId) {
@@ -350,8 +355,9 @@ export class PaymentLedger {
 
     assertNoEquivocation(binding, currentPaymentId = null) {
         const normBinding = normalizeBinding(binding);
+        const resolvedCurrentId = currentPaymentId !== null ? this.resolvePaymentId(currentPaymentId) : null;
         for (const e of this.payments.values()) {
-            if (currentPaymentId !== null && e.paymentId === currentPaymentId) continue;
+            if (resolvedCurrentId !== null && e.paymentId === resolvedCurrentId) continue;
             if (e.status !== 'settled' && e.status !== 'broadcasted' && e.status !== 'committed') continue;
             if (!isPlainObject(e.binding)) continue;
             if (
@@ -371,6 +377,7 @@ export class PaymentLedger {
         if (typeof paymentId !== 'string' || paymentId.trim().length === 0) {
             throw new Error('paymentId must be a non-empty string');
         }
+        paymentId = this.resolvePaymentId(paymentId);
         const normBinding = normalizeBinding(binding);
         const existing = this.payments.get(paymentId);
         if (existing) {
@@ -397,11 +404,17 @@ export class PaymentLedger {
             updatedAt: now,
         };
         this.payments.set(paymentId, entry);
-        this._persist();
+        try {
+            this._persist();
+        } catch (err) {
+            this.payments.delete(paymentId);
+            throw err;
+        }
         return { action: 'proceed', entry };
     }
 
     markSettled(paymentId, settledInfo = {}) {
+        paymentId = this.resolvePaymentId(paymentId);
         const entry = this.payments.get(paymentId);
         if (!entry) throw new Error(`unknown paymentId ${paymentId} in markSettled`);
         if (entry.status !== 'claimed' && entry.status !== 'settled') {
@@ -416,6 +429,7 @@ export class PaymentLedger {
     }
 
     markBroadcast(paymentId, { txHash, expiryEpochSeconds = null } = {}) {
+        paymentId = this.resolvePaymentId(paymentId);
         const entry = this.payments.get(paymentId);
         if (!entry) throw new Error(`unknown paymentId ${paymentId} in markBroadcast`);
         if (entry.status !== 'claimed' && entry.status !== 'settled') {
@@ -434,6 +448,8 @@ export class PaymentLedger {
     }
 
     releaseBroadcastKeepSettled(paymentId) {
+        if (typeof paymentId !== 'string' || paymentId.length === 0) return false;
+        paymentId = this.resolvePaymentId(paymentId);
         const entry = this.payments.get(paymentId);
         if (!entry || entry.status !== 'broadcasted') return false;
         entry.status = 'settled';
@@ -445,6 +461,7 @@ export class PaymentLedger {
     }
 
     commit(paymentId, result) {
+        paymentId = this.resolvePaymentId(paymentId);
         const entry = this.payments.get(paymentId);
         if (!entry) throw new Error(`unknown paymentId ${paymentId} in commit`);
         if (entry.status !== 'claimed' && entry.status !== 'settled' && entry.status !== 'broadcasted') {
@@ -463,6 +480,7 @@ export class PaymentLedger {
 
     releasePreBroadcast(paymentId) {
         if (typeof paymentId !== 'string' || paymentId.length === 0) return false;
+        paymentId = this.resolvePaymentId(paymentId);
         const entry = this.payments.get(paymentId);
         if (!entry || entry.status !== 'claimed') return false;
         this.payments.delete(paymentId);
