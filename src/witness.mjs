@@ -981,6 +981,8 @@ export async function createWitnessServer(opts = {}) {
 
     const inFlightRequests = new Set();
     server = http.createServer((req, res) => {
+        const sock = req.socket ?? res.socket ?? null;
+        const isSockClosed = () => Boolean(sock && (sock.destroyed || sock.closed));
         let task = null;
         let done = false;
         const p = (async () => {
@@ -996,7 +998,7 @@ export async function createWitnessServer(opts = {}) {
                 req.on('aborted', markDisconnected);
                 res.on('close', markDisconnected);
                 const isDisconnected = () =>
-                    Boolean(closing || clientDisconnected || res.destroyed || res.writableEnded || res.socket?.destroyed);
+                    Boolean(closing || clientDisconnected || res.destroyed || res.writableEnded || res.socket?.destroyed || isSockClosed());
 
                 try {
                     const reqUrl = new URL(req.url ?? '/', 'http://localhost');
@@ -1044,7 +1046,14 @@ export async function createWitnessServer(opts = {}) {
                     );
                 }
             } finally {
-                if (closing && req.complete && res.headersSent && !res.writableFinished && !res.destroyed) {
+                if (
+                    closing &&
+                    req.complete &&
+                    res.headersSent &&
+                    !res.writableFinished &&
+                    !res.destroyed &&
+                    !isSockClosed()
+                ) {
                     await new Promise((resolve) => {
                         let doneWait = false;
                         const finishWait = () => {
@@ -1052,11 +1061,13 @@ export async function createWitnessServer(opts = {}) {
                             doneWait = true;
                             res.off('finish', finishWait);
                             res.off('close', finishWait);
+                            sock?.off('close', finishWait);
                             resolve();
                         };
                         res.on('finish', finishWait);
                         res.on('close', finishWait);
-                        if (res.writableFinished || res.destroyed) finishWait();
+                        sock?.on('close', finishWait);
+                        if (res.writableFinished || res.destroyed || isSockClosed()) finishWait();
                     });
                 }
                 done = true;

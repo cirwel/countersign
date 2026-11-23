@@ -3644,4 +3644,98 @@ test('unsigned 402 equivocation 409, facilitator settlement-tx & legacy dedup, w
     unitLedger.recordAlias('pay-alias-fail', 'pay-canon');
     assert.equal(unitLedger.resolvePaymentId('pay-alias-fail'), 'pay-canon');
     assert.equal(JSON.parse(fs.readFileSync(aliasUnitPath, 'utf8')).paymentAliases['pay-alias-fail'], 'pay-canon');
+
+    // 9. Pipelined two-complete-request shutdown unblocks promptly when peer destroys socket mid-drain
+    const basePipe2Node = createWitnessMockNode({
+        owner: OWNER_A,
+        accountVerifyKeys: new Map([
+            [OWNER_A, ownerSigner.verifyKey],
+            [WITNESS_1, witnessSigner.verifyKey],
+        ]),
+    });
+    basePipe2Node.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: WITNESS_1 });
+    let enterPipe2Req1;
+    const enteredPipe2Req1 = new Promise((r) => {
+        enterPipe2Req1 = r;
+    });
+    let releasePipe2Req1;
+    const holdPipe2Req1 = new Promise((r) => {
+        releasePipe2Req1 = r;
+    });
+    const pipe2Node = Object.assign(Object.create(basePipe2Node), {
+        async sendTransaction(finalized) {
+            if (finalized.payload.type === AccountTransactionType.RegisterData) {
+                enterPipe2Req1();
+                await holdPipe2Req1;
+            }
+            return basePipe2Node.sendTransaction(finalized);
+        },
+    });
+    const pipe2LedgerPath = path.join(dir, 'pipe2-ledger.json');
+    const pipe2Srv = await startWitnessServer({
+        host: '127.0.0.1',
+        port: 0,
+        priceMicroCcd: '0',
+        signer: witnessSigner,
+        ledgerPath: pipe2LedgerPath,
+        nodeClient: pipe2Node,
+        verifier: { async verify() { return { paymentId: 'pipe2-pay-1', payer: PAYER_3 }; } },
+        fetchCard: async () => basePipe2Node.card.bytes,
+        log: () => {},
+    });
+    cleanups.push(() => pipe2Srv.close());
+
+    let pipe2ReqCount = 0;
+    let markPipe2Req2;
+    const pipe2Req2Seen = new Promise((r) => {
+        markPipe2Req2 = r;
+    });
+    pipe2Srv.server.on('request', () => {
+        pipe2ReqCount += 1;
+        if (pipe2ReqCount >= 2) markPipe2Req2();
+    });
+
+    const pipe2Sock = net.connect(pipe2Srv.port, '127.0.0.1');
+    cleanups.push(() => pipe2Sock.destroy());
+    pipe2Sock.write(
+        `POST /v1/anchor HTTP/1.1\r\n` +
+            `Host: 127.0.0.1:${pipe2Srv.port}\r\n` +
+            `Content-Type: application/json\r\n` +
+            `${HEADER_PAYMENT_SIGNATURE}: ${encodeX402Header({ x402Version: 2, payload: { pipe2: 1 } })}\r\n` +
+            `Content-Length: ${Buffer.byteLength(bodyPipe1)}\r\n\r\n` +
+            bodyPipe1 +
+            `GET /health HTTP/1.1\r\nHost: 127.0.0.1:${pipe2Srv.port}\r\n\r\n`,
+    );
+
+    await enteredPipe2Req1;
+    await pipe2Req2Seen;
+    await new Promise((r) => setTimeout(r, 20));
+    const close2P = pipe2Srv.close();
+    pipe2Sock.destroy();
+    await new Promise((r) => setTimeout(r, 20));
+    releasePipe2Req1();
+    let pipe2Timer;
+    try {
+        await Promise.race([
+            close2P,
+            new Promise((_, reject) => {
+                pipe2Timer = setTimeout(() => reject(new Error('close() hung after pipelined socket disconnect')), 1500);
+            }),
+        ]);
+    } finally {
+        clearTimeout(pipe2Timer);
+    }
+
+    const pipe2Reopen = await startWitnessServer({
+        host: '127.0.0.1',
+        port: 0,
+        priceMicroCcd: '0',
+        signer: witnessSigner,
+        ledgerPath: pipe2LedgerPath,
+        nodeClient: basePipe2Node,
+        fetchCard: async () => basePipe2Node.card.bytes,
+        log: () => {},
+    });
+    cleanups.push(() => pipe2Reopen.close());
+    await pipe2Reopen.close();
 });
