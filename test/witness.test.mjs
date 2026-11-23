@@ -45,7 +45,7 @@ import { commands } from '../src/cli.mjs';
 import { REGISTRY, REGISTRY_MODULE_REF } from '../src/registry.mjs';
 import { commitments, decodeAnchor, encodeAnchor, writeTrail } from '../src/trail.mjs';
 import { createWitnessServer, startWitnessServer } from '../src/witness.mjs';
-import { AnchorWorker } from '../src/worker.mjs';
+import { AnchorWorker, tokenLockPath, withFileLock } from '../src/worker.mjs';
 import {
     CONCORDIUM_TESTNET_CAIP2,
     HEADER_PAYMENT_REQUIRED,
@@ -3871,4 +3871,244 @@ test('unsigned 402 equivocation 409, facilitator settlement-tx & legacy dedup, w
     });
     cleanups.push(() => detachedReopen.close());
     await detachedReopen.close();
+});
+
+test('witness rotation clears stale-signer pendingAnchor safely without wedging and set-witness honors token lock & pending state guards', async () => {
+    const dir = makeTempDir();
+    const tokenLockDir = makeTempDir();
+    const ownerSigner = await makeRealSigner(OWNER_A);
+    const witnessSigner = await makeRealSigner(WITNESS_1);
+    const thirdPartySigner = await makeRealSigner(PAYER_3);
+
+    const node = createWitnessMockNode({
+        owner: OWNER_A,
+        accountVerifyKeys: new Map([
+            [OWNER_A, ownerSigner.verifyKey],
+            [WITNESS_1, witnessSigner.verifyKey],
+            [PAYER_3, thirdPartySigner.verifyKey],
+        ]),
+    });
+
+    const srv = await startWitnessServer({
+        host: '127.0.0.1',
+        port: 0,
+        priceMicroCcd: '0',
+        signer: witnessSigner,
+        ledgerPath: path.join(dir, 'rotate-ledger.json'),
+        nodeClient: node,
+        fetchCard: async () => node.card.bytes,
+        log: () => {},
+    });
+    cleanups.push(() => srv.close());
+
+    const { header, records } = makeTrailFixtures(3);
+    const tPath = path.join(dir, 'rotate.jsonl');
+    const sPath = path.join(dir, 'rotate.state.json');
+    const ppStatePath = path.join(dir, 'pp-guard.state.json');
+    writeTrail(tPath, header, records.slice(0, 1));
+
+    const c1 = commitments(header, records.slice(0, 1)).last;
+    const ownerRd1 = await sendRegisterData(
+        encodeAnchor({ tokenId: TOKEN_ID, toSeq: 1, commitment: c1, prevAnchorTx: null }),
+        ownerSigner,
+        node,
+    );
+    fs.writeFileSync(
+        sPath,
+        JSON.stringify({
+            version: 1,
+            tokenId: TOKEN_ID,
+            agentUuid: AGENT_UUID,
+            lastAnchoredSeq: 0,
+            lastAnchoredTxHash: null,
+            lastAnchoredCommitment: null,
+            lastAnchoredAt: null,
+            pendingAnchor: {
+                txHash: ownerRd1.hash,
+                toSeq: 1,
+                commitment: c1.toString('hex'),
+                prevAnchorTx: null,
+                sender: OWNER_A,
+                expiryEpochSeconds: Math.floor(Date.now() / 1000) + 300,
+            },
+            pendingPayment: null,
+        }) + '\n',
+        { mode: 0o600 },
+    );
+
+    // 1. set-witness rejects when pendingAnchor or pendingPayment exists in guarded state file
+    await assert.rejects(
+        () =>
+            commands['set-witness']({
+                token: TOKEN_ID,
+                witness: WITNESS_1,
+                trail: tPath,
+                state: sPath,
+                who: ownerSigner,
+                nodeClient: node,
+                tokenLockDir,
+            }),
+        /pending anchor .* exists.*countersign set-witness/,
+    );
+    fs.writeFileSync(
+        ppStatePath,
+        JSON.stringify({
+            version: 1,
+            pendingPayment: { paymentTxHash: txHashFor('pp-set-witness'), witnessUrl: srv.url },
+        }) + '\n',
+        { mode: 0o600 },
+    );
+    await assert.rejects(
+        () =>
+            commands['set-witness']({
+                token: TOKEN_ID,
+                witness: WITNESS_1,
+                state: ppStatePath,
+                who: ownerSigner,
+                nodeClient: node,
+                tokenLockDir,
+            }),
+        /pending payment .* exists.*countersign watch --once --witness-url/,
+    );
+
+    // 2. set-witness acquires token lock and rejects concurrent in-process lock holder
+    await withFileLock(tokenLockPath(TOKEN_ID, { tokenLockDir }), async () => {
+        await assert.rejects(
+            () =>
+                commands['set-witness']({
+                    token: TOKEN_ID,
+                    witness: WITNESS_1,
+                    who: ownerSigner,
+                    nodeClient: node,
+                    tokenLockDir,
+                }),
+            /already held/,
+        );
+    });
+
+    // 3. Owner pendingAnchor -> witness enabled on chain -> dryRun plans clear, live tick clears & witness-anchors seq 1
+    node.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: WITNESS_1 });
+    const dryLogs1 = [];
+    const workerDry1 = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath: tPath,
+        statePath: sPath,
+        tokenLockDir,
+        everyRecords: 1,
+        once: true,
+        dryRun: true,
+        nodeClient: node,
+        signer: ownerSigner,
+        witnessUrl: srv.url,
+        allowPrivateWitness: true,
+        source: () => [],
+        log: (m) => dryLogs1.push(m),
+    });
+    const dryRes1 = await workerDry1.tick();
+    assert.equal(dryRes1.dryRun, true);
+    assert.equal(dryRes1.plan?.action, 'clear_orphaned_pending_anchor');
+    assert.equal(dryRes1.plan?.reason, 'witness_changed');
+    assert.equal(JSON.parse(fs.readFileSync(sPath, 'utf8')).pendingAnchor?.txHash, ownerRd1.hash, 'dryRun must not mutate disk');
+
+    const liveLogs1 = [];
+    const workerLive1 = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath: tPath,
+        statePath: sPath,
+        tokenLockDir,
+        everyRecords: 1,
+        once: true,
+        nodeClient: node,
+        signer: ownerSigner,
+        witnessUrl: srv.url,
+        allowPrivateWitness: true,
+        source: () => [],
+        log: (m) => liveLogs1.push(m),
+    });
+    const liveRes1 = await workerLive1.tick();
+    assert.equal(liveRes1.anchored, true);
+    assert.equal(liveRes1.anchoredSeq, 1);
+    assert.ok(liveLogs1.some((m) => /no longer authorized under current signer/.test(m)));
+    const ptrAfter1 = node.state.metadata[ANCHOR_KEY];
+    assert.ok(ptrAfter1 && ptrAfter1 !== ownerRd1.hash);
+    assert.equal(node.state.registerDataByHash.get(ptrAfter1)?.sender, WITNESS_1);
+    assert.equal(JSON.parse(fs.readFileSync(sPath, 'utf8')).pendingAnchor, null);
+
+    // 4. Mirror case: witness-signed pendingAnchor -> witness cleared -> live tick clears orphan & owner anchors seq 2
+    writeTrail(tPath, header, records.slice(0, 2));
+    const c2 = commitments(header, records.slice(0, 2)).last;
+    const witnessRd2 = await sendRegisterData(
+        encodeAnchor({ tokenId: TOKEN_ID, toSeq: 2, commitment: c2, prevAnchorTx: ptrAfter1 }),
+        witnessSigner,
+        node,
+    );
+    const sAfter1 = JSON.parse(fs.readFileSync(sPath, 'utf8'));
+    sAfter1.pendingAnchor = {
+        txHash: witnessRd2.hash,
+        toSeq: 2,
+        commitment: c2.toString('hex'),
+        prevAnchorTx: ptrAfter1,
+        sender: WITNESS_1,
+        expiryEpochSeconds: Math.floor(Date.now() / 1000) + 300,
+    };
+    fs.writeFileSync(sPath, JSON.stringify(sAfter1) + '\n', { mode: 0o600 });
+
+    node.addSetMetadata({ sender: OWNER_A, key: WITNESS_KEY, value: '' });
+    const workerLive2 = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath: tPath,
+        statePath: sPath,
+        tokenLockDir,
+        everyRecords: 1,
+        once: true,
+        nodeClient: node,
+        signer: ownerSigner,
+        source: () => [],
+        log: () => {},
+    });
+    const liveRes2 = await workerLive2.tick();
+    assert.equal(liveRes2.anchored, true);
+    assert.equal(liveRes2.anchoredSeq, 2);
+    const ptrAfter2 = node.state.metadata[ANCHOR_KEY];
+    assert.ok(ptrAfter2 && ptrAfter2 !== witnessRd2.hash);
+    assert.equal(node.state.registerDataByHash.get(ptrAfter2)?.sender, OWNER_A);
+    assert.equal(JSON.parse(fs.readFileSync(sPath, 'utf8')).pendingAnchor, null);
+
+    // 5. Unrelated third-party sender on pendingAnchor STILL fails closed (never auto-cleared)
+    writeTrail(tPath, header, records.slice(0, 3));
+    const c3 = commitments(header, records.slice(0, 3)).last;
+    const thirdPartyRd3 = await sendRegisterData(
+        encodeAnchor({ tokenId: TOKEN_ID, toSeq: 3, commitment: c3, prevAnchorTx: ptrAfter2 }),
+        thirdPartySigner,
+        node,
+    );
+    const sAfter2 = JSON.parse(fs.readFileSync(sPath, 'utf8'));
+    sAfter2.pendingAnchor = {
+        txHash: thirdPartyRd3.hash,
+        toSeq: 3,
+        commitment: c3.toString('hex'),
+        prevAnchorTx: ptrAfter2,
+        sender: PAYER_3,
+        expiryEpochSeconds: Math.floor(Date.now() / 1000) + 300,
+    };
+    fs.writeFileSync(sPath, JSON.stringify(sAfter2) + '\n', { mode: 0o600 });
+
+    const workerFail3 = new AnchorWorker({
+        uuid: AGENT_UUID,
+        tokenId: TOKEN_ID,
+        trailPath: tPath,
+        statePath: sPath,
+        tokenLockDir,
+        everyRecords: 1,
+        once: true,
+        nodeClient: node,
+        signer: ownerSigner,
+        source: () => [],
+        log: () => {},
+    });
+    await assert.rejects(() => workerFail3.tick(), /disagrees with current trail\/owner state/);
+    assert.equal(JSON.parse(fs.readFileSync(sPath, 'utf8')).pendingAnchor?.txHash, thirdPartyRd3.hash);
 });

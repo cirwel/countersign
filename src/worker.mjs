@@ -1697,6 +1697,12 @@ export class AnchorWorker {
                         const expectedCommitment = this.trail.commitmentsBySeq.get(d.toSeq)?.toString('hex');
                         const activeWitness = witnessStateAtTip.currentWitness;
                         const expectedAnchorSender = activeWitness ?? agent.ownerAccount;
+                        const senderAuthorizedNow = isSameAccount(rd.sender, expectedAnchorSender);
+                        const wasHistoricallyAuthorizedSigner =
+                            isSameAccount(rd.sender, agent.ownerAccount) ||
+                            witnessStateAtTip.transitions.some(
+                                (t) => t.witness !== null && isSameAccount(rd.sender, t.witness),
+                            );
                         const integrityOk =
                             d.tokenId === this.tokenId &&
                             d.toSeq === pending.toSeq &&
@@ -1704,7 +1710,7 @@ export class AnchorWorker {
                             Boolean(expectedCommitment) &&
                             d.commitment === expectedCommitment &&
                             d.commitment === pending.commitment &&
-                            isSameAccount(rd.sender, expectedAnchorSender) &&
+                            wasHistoricallyAuthorizedSigner &&
                             (!pending.sender || isSameAccount(rd.sender, pending.sender));
                         if (!integrityOk) {
                             throw new Error(
@@ -1719,6 +1725,36 @@ export class AnchorWorker {
                         if (superseded) {
                             this.log(
                                 `orphaned pending anchor ${pending.txHash} (seq 1..${d.toSeq}) superseded by chain pointer ${expectedPrevTx ?? 'none'} (seq ${prev?.toSeq ?? 0}); clearing pending state`,
+                            );
+                            clearPending({
+                                lastAnchoredSeq: prev?.toSeq ?? 0,
+                                lastAnchoredTxHash: prev?.txHash ?? null,
+                                lastAnchoredCommitment: prev?.commitment ?? null,
+                                lastAnchoredAt: prev?.blockTime ?? null,
+                            });
+                        } else if (!senderAuthorizedNow) {
+                            if (this.dryRun) {
+                                const plan = {
+                                    action: 'clear_orphaned_pending_anchor',
+                                    reason: 'witness_changed',
+                                    tokenId: this.tokenId,
+                                    txHash: pending.txHash,
+                                    toSeq: d.toSeq,
+                                    sender: rd.sender,
+                                    expectedSender: expectedAnchorSender,
+                                };
+                                this.log(`[dry-run] pending anchor recovery plan ${JSON.stringify(plan)}`);
+                                return {
+                                    synced: syncResult.added,
+                                    localSeq,
+                                    anchoredSeq: prev?.toSeq ?? 0,
+                                    anchored: false,
+                                    dryRun: true,
+                                    plan,
+                                };
+                            }
+                            this.log(
+                                `orphaned pending anchor ${pending.txHash} (seq 1..${d.toSeq}) signed by ${rd.sender} is no longer authorized under current signer ${expectedAnchorSender}; clearing pending state`,
                             );
                             clearPending({
                                 lastAnchoredSeq: prev?.toSeq ?? 0,

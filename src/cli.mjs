@@ -115,6 +115,66 @@ function resolveSponsorPointerOpt(opts, defaultVal = true) {
     return defaultVal;
 }
 
+function resolveTrailStateContext(trail, explicitState) {
+    const targetTrail = canonicalTrailPath(trail);
+    const resolvedStatePath = canonicalStatePath(targetTrail, explicitState);
+    const legacyStatePath =
+        explicitState === undefined || explicitState === null
+            ? legacySidecarPath(trail, resolvedStatePath)
+            : null;
+    const trailLock = trailLockPath(targetTrail);
+    if (
+        resolvedStatePath === targetTrail ||
+        resolvedStatePath === trailLock ||
+        (legacyStatePath && (legacyStatePath === targetTrail || legacyStatePath === trailLock))
+    ) {
+        throw new Error(`statePath (${resolvedStatePath}) must not collide with trailPath or lockPath`);
+    }
+    const stateCandidates = legacyStatePath ? [resolvedStatePath, legacyStatePath] : [resolvedStatePath];
+    return { targetTrail, resolvedStatePath, legacyStatePath, trailLock, stateCandidates };
+}
+
+function assertNoPendingStateFiles(
+    stateCandidates,
+    { legacyStatePath = null, resolvedStatePath = null, trail = null, callerCommand = 'anchor', checkPending = true } = {},
+) {
+    if (legacyStatePath && fs.existsSync(legacyStatePath) && fs.existsSync(resolvedStatePath)) {
+        const stLegacy = fs.statSync(legacyStatePath);
+        const stCanon = fs.statSync(resolvedStatePath);
+        if (
+            (stLegacy.dev !== stCanon.dev || stLegacy.ino !== stCanon.ino) &&
+            Buffer.compare(fs.readFileSync(legacyStatePath), fs.readFileSync(resolvedStatePath)) !== 0
+        ) {
+            throw new Error(
+                `conflicting anchor state files exist at both legacy path (${legacyStatePath}) and canonical path (${resolvedStatePath}); resolve manually`,
+            );
+        }
+    }
+    if (!checkPending) return;
+    for (const stateFile of stateCandidates) {
+        if (!fs.existsSync(stateFile)) continue;
+        let parsedState;
+        try {
+            parsedState = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+        } catch (err) {
+            throw new Error(`corrupt anchor state file ${stateFile}: ${err.message}`);
+        }
+        if (parsedState?.pendingAnchor) {
+            const hint = trail
+                ? `finish it with "countersign anchor --trail ${trail} --tx ${parsedState.pendingAnchor.txHash}" or "countersign watch --once"`
+                : `finish or clear it with "countersign watch --once"`;
+            throw new Error(
+                `pending anchor ${parsedState.pendingAnchor.txHash} exists in ${stateFile}; ${hint} before running "countersign ${callerCommand}"`,
+            );
+        }
+        if (parsedState?.pendingPayment) {
+            throw new Error(
+                `pending payment ${parsedState.pendingPayment.paymentTxHash} exists in ${stateFile}; finish it with "countersign watch --once --witness-url ${parsedState.pendingPayment.witnessUrl ?? '<witness-url>'}" before running "countersign ${callerCommand}"`,
+            );
+        }
+    }
+}
+
 export const commands = {
     /** Mint a registry entry whose on-chain metadata names the agent's UNITARES UUID. */
     async register({ uuid }) {
@@ -197,20 +257,10 @@ export const commands = {
     async anchor({ trail, tx, node, nodeClient, who: providedWho, ...opts }) {
         if (!trail) throw new Error('--trail <path> is required');
         const explicitState = opts.state ?? opts.statePath;
-        const targetTrail = canonicalTrailPath(trail);
-        const resolvedStatePath = canonicalStatePath(targetTrail, explicitState);
-        const legacyStatePath =
-            explicitState === undefined || explicitState === null
-                ? legacySidecarPath(trail, resolvedStatePath)
-                : null;
-        const trailLock = trailLockPath(targetTrail);
-        if (
-            resolvedStatePath === targetTrail ||
-            resolvedStatePath === trailLock ||
-            (legacyStatePath && (legacyStatePath === targetTrail || legacyStatePath === trailLock))
-        ) {
-            throw new Error(`statePath (${resolvedStatePath}) must not collide with trailPath or lockPath`);
-        }
+        const { targetTrail, resolvedStatePath, legacyStatePath, trailLock, stateCandidates } = resolveTrailStateContext(
+            trail,
+            explicitState,
+        );
         return withFileLock(trailLock, async () => {
             const nodeInsecure = Boolean(opts.nodeInsecure ?? opts['node-insecure']);
             applyNodeOptions(node, nodeInsecure);
@@ -218,40 +268,13 @@ export const commands = {
             const { header, records } = readTrail(targetTrail);
             const tokenId = header.token_id;
             return withFileLock(tokenLockPath(tokenId, { tokenLockDir: opts.tokenLockDir }), async () => {
-                if (legacyStatePath && fs.existsSync(legacyStatePath) && fs.existsSync(resolvedStatePath)) {
-                    const stLegacy = fs.statSync(legacyStatePath);
-                    const stCanon = fs.statSync(resolvedStatePath);
-                    if (
-                        (stLegacy.dev !== stCanon.dev || stLegacy.ino !== stCanon.ino) &&
-                        Buffer.compare(fs.readFileSync(legacyStatePath), fs.readFileSync(resolvedStatePath)) !== 0
-                    ) {
-                        throw new Error(
-                            `conflicting anchor state files exist at both legacy path (${legacyStatePath}) and canonical path (${resolvedStatePath}); resolve manually`,
-                        );
-                    }
-                }
-                if (!tx) {
-                    const stateCandidates = legacyStatePath ? [resolvedStatePath, legacyStatePath] : [resolvedStatePath];
-                    for (const stateFile of stateCandidates) {
-                        if (!fs.existsSync(stateFile)) continue;
-                        let parsedState;
-                        try {
-                            parsedState = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-                        } catch (err) {
-                            throw new Error(`corrupt anchor state file ${stateFile}: ${err.message}`);
-                        }
-                        if (parsedState?.pendingAnchor) {
-                            throw new Error(
-                                `pending anchor ${parsedState.pendingAnchor.txHash} exists in ${stateFile}; finish it with "countersign anchor --trail ${trail} --tx ${parsedState.pendingAnchor.txHash}" or "countersign watch --once" before broadcasting a new registerData`,
-                            );
-                        }
-                        if (parsedState?.pendingPayment) {
-                            throw new Error(
-                                `pending payment ${parsedState.pendingPayment.paymentTxHash} exists in ${stateFile}; finish it with "countersign watch --once --witness-url ${parsedState.pendingPayment.witnessUrl ?? '<witness-url>'}" before running "countersign anchor"`,
-                            );
-                        }
-                    }
-                }
+                assertNoPendingStateFiles(stateCandidates, {
+                    legacyStatePath,
+                    resolvedStatePath,
+                    trail,
+                    callerCommand: 'anchor',
+                    checkPending: !tx,
+                });
 
                 const c = nodeClient ?? (await client());
                 await assertTestnet(c);
@@ -496,7 +519,7 @@ export const commands = {
     },
 
     /** Authorize or clear a separate witness account (`countersign.witness`) for a registry token. */
-    async 'set-witness'({ token, tokenId, witness, clear, node, nodeClient, who: providedWho, ...opts }) {
+    async 'set-witness'({ token, tokenId, witness, clear, trail, node, nodeClient, who: providedWho, ...opts }) {
         const resolvedToken = token ?? tokenId;
         if (!/^(?:0|[1-9][0-9]*)$/.test(resolvedToken !== undefined && resolvedToken !== null ? String(resolvedToken) : '')) {
             throw new Error('--token <id> is required');
@@ -519,39 +542,71 @@ export const commands = {
             valueUtf8 = witness;
         }
 
-        const nodeInsecure = Boolean(opts.nodeInsecure ?? opts['node-insecure']);
-        applyNodeOptions(node, nodeInsecure);
-        const who = providedWho ?? loadSigner();
-        const c = nodeClient ?? (await client());
-        await assertTestnet(c);
+        const explicitState = opts.state ?? opts.statePath ?? null;
+        const runSetWitness = async () => {
+            const nodeInsecure = Boolean(opts.nodeInsecure ?? opts['node-insecure']);
+            applyNodeOptions(node, nodeInsecure);
+            const who = providedWho ?? loadSigner();
+            const c = nodeClient ?? (await client());
+            await assertTestnet(c);
 
-        const cs = await withRpcRetry(() => c.getConsensusStatus());
-        const tipBlockHash = cs.lastFinalizedBlock;
-        const agent = await readAgentOf(tokenStr, { blockHash: tipBlockHash, nodeClient: c });
-        if (!agent) throw new Error(`registry token ${tokenStr} is not registered`);
-        if (agent.status !== 'Active') {
-            throw new Error(`registry token ${tokenStr} status is ${agent.status}`);
-        }
-        if (who.address !== agent.ownerAccount) {
-            throw new Error(
-                `signer ${who.address} must exactly match registered owner ${agent.ownerAccount} (CIS-8004.setMetadata rejects account aliases)`,
+            const cs = await withRpcRetry(() => c.getConsensusStatus());
+            const tipBlockHash = cs.lastFinalizedBlock;
+            const agent = await readAgentOf(tokenStr, { blockHash: tipBlockHash, nodeClient: c });
+            if (!agent) throw new Error(`registry token ${tokenStr} is not registered`);
+            if (agent.status !== 'Active') {
+                throw new Error(`registry token ${tokenStr} status is ${agent.status}`);
+            }
+            if (who.address !== agent.ownerAccount) {
+                throw new Error(
+                    `signer ${who.address} must exactly match registered owner ${agent.ownerAccount} (CIS-8004.setMetadata rejects account aliases)`,
+                );
+            }
+            if (!doClear && isSameAccount(valueUtf8, agent.ownerAccount)) {
+                throw new Error(`witness account ${valueUtf8} cannot be the same as token owner ${agent.ownerAccount}`);
+            }
+
+            const next = await withRpcRetry(() => c.getNextAccountNonce(who.sender));
+            if (next.allFinal !== true) {
+                throw new Error(`owner ${who.address} has unfinalized transactions (allFinal=${next.allFinal}); retry after finalization`);
+            }
+            const expectedNonce = BigInt(next.nonce?.value ?? next.nonce);
+            const res = await sendSetMetadata(tokenStr, WITNESS_KEY, valueUtf8, who, c, { expectedNonce });
+            console.log(
+                doClear ? `cleared ${WITNESS_KEY}:` : `set ${WITNESS_KEY} to ${valueUtf8}:`,
+                EXPLORER_TX(res.hash),
             );
-        }
-        if (!doClear && isSameAccount(valueUtf8, agent.ownerAccount)) {
-            throw new Error(`witness account ${valueUtf8} cannot be the same as token owner ${agent.ownerAccount}`);
+            return { hash: res.hash, witness: doClear ? null : valueUtf8 };
+        };
+
+        if (trail) {
+            const { targetTrail, resolvedStatePath, legacyStatePath, trailLock, stateCandidates } =
+                resolveTrailStateContext(trail, explicitState);
+            return withFileLock(trailLock, async () => {
+                if (fs.existsSync(targetTrail)) {
+                    const { header } = readTrail(targetTrail);
+                    if (String(header.token_id) !== tokenStr) {
+                        throw new Error(`trail ${trail} belongs to token ${header.token_id}, not ${tokenStr}`);
+                    }
+                }
+                return withFileLock(tokenLockPath(tokenStr, { tokenLockDir: opts.tokenLockDir }), async () => {
+                    assertNoPendingStateFiles(stateCandidates, {
+                        legacyStatePath,
+                        resolvedStatePath,
+                        trail,
+                        callerCommand: 'set-witness',
+                    });
+                    return await runSetWitness();
+                });
+            });
         }
 
-        const next = await withRpcRetry(() => c.getNextAccountNonce(who.sender));
-        if (next.allFinal !== true) {
-            throw new Error(`owner ${who.address} has unfinalized transactions (allFinal=${next.allFinal}); retry after finalization`);
-        }
-        const expectedNonce = BigInt(next.nonce?.value ?? next.nonce);
-        const res = await sendSetMetadata(tokenStr, WITNESS_KEY, valueUtf8, who, c, { expectedNonce });
-        console.log(
-            doClear ? `cleared ${WITNESS_KEY}:` : `set ${WITNESS_KEY} to ${valueUtf8}:`,
-            EXPLORER_TX(res.hash),
-        );
-        return { hash: res.hash, witness: doClear ? null : valueUtf8 };
+        return withFileLock(tokenLockPath(tokenStr, { tokenLockDir: opts.tokenLockDir }), async () => {
+            if (explicitState !== null) {
+                assertNoPendingStateFiles([canonicalTrailPath(explicitState)], { callerCommand: 'set-witness' });
+            }
+            return await runSetWitness();
+        });
     },
 
     /** Run the standalone x402-paid Countersign witness HTTP service. */
