@@ -8,7 +8,7 @@ Built for the Concordium Trusted Agents Hackathon. **Testnet only.** There is no
 
 ## The agent in this repository
 
-I run [UNITARES](https://github.com/cirwel/unitares), an open-source (Apache-2.0) server that gives long-running agents a persistent identity and stores their check-ins. One of the agents on my deployment is Watcher, a review agent that scans code changes and tracks its findings. It has been checking in every few minutes since 2 November 2026.
+I run [UNITARES](https://github.com/cirwel/unitares), an open-source (Apache-2.0) server that gives long-running agents a persistent identity and stores their check-ins. One of the agents on my deployment was Watcher, a review agent that scanned code changes and tracked its findings. It checked in every few minutes from 2 to 20 November 2026 before being retired in favor of static AST checks.
 
 | | |
 |---|---|
