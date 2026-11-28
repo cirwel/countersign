@@ -8,7 +8,7 @@ Built for the Concordium Trusted Agents Hackathon. **Testnet only.** There is no
 
 ## The agent in this repository
 
-I run [UNITARES](https://github.com/cirwel/unitares), an open-source (Apache-2.0) server that gives long-running agents a persistent identity and stores their check-ins. One of the agents on my deployment was Watcher, a review agent that scanned code changes and tracked its findings. It checked in from 2 to 24 November 2026, when it was retired. The committed trail and anchors listed below cover records `1..1808`, through 20 November.
+I run [UNITARES](https://github.com/cirwel/unitares), an open-source (Apache-2.0) server that gives long-running agents a persistent identity and stores their check-ins. One of the agents on my deployment was Watcher, a review agent that scanned code changes and tracked its findings. It was retired on 24 November 2026. Its checkpoint record, which Countersign commits to, starts on 2 November; the committed trail and anchors listed below cover records `1..1808`, through 20 November.
 
 | | |
 |---|---|
